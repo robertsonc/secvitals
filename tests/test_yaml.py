@@ -82,19 +82,17 @@ class TestYaml(unittest.TestCase):
     def test_real_config_files(self):
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         settings = sv.yaml_load_file(os.path.join(here, "config", "settings.yaml"))
-        self.assertEqual(settings["server"]["host"], "127.0.0.1")
-        self.assertEqual(settings["server"]["port"], 8787)
+        self.assertEqual(settings["run"]["control_host"], "1.1.1.1")
         self.assertFalse(settings["enable_live_suspect_hosts"])
-        self.assertIn("raw.githubusercontent.com", settings["tmnids"]["url"])
+        self.assertIn("SecOps-Institute", settings["webcc"]["tor_list_url"])
 
         catalog = sv.yaml_load_file(os.path.join(here, "config", "catalog.yaml"))
         self.assertIsInstance(catalog, list)
         uid = catalog[0]
         self.assertEqual(uid["id"], "ns-uid")
-        self.assertEqual(uid["argv"], ["tmNIDS", "-1"])
+        self.assertEqual(uid["runner"], "curl")
+        self.assertEqual(uid["commands"][0][0], "curl")
         self.assertEqual(uid["flags"], ["needs_internet", "needs_et_ruleset"])
-        self.assertEqual(uid["expected_on_allow"], {"rc": 0, "body_contains": "uid=0"})
-        self.assertEqual(uid["expected_on_block"], {"rc_nonzero": True})
 
 
 if __name__ == "__main__":

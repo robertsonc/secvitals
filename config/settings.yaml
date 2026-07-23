@@ -3,31 +3,21 @@
 # hand on the SE laptop; loaded once at startup. Anything security-relevant that a
 # presenter might need to change lives here, not in code.
 
-server:
-  host: "127.0.0.1"        # loopback only — this app executes local commands; it is NOT a LAN service
-  port: 8787
-  open_browser: true       # best-effort; the URL is always printed for the Windows browser
-
 # Live suspect-infrastructure gate.
 # Triggers flagged `hits_live_suspect_hosts` reach REAL suspect hosts / live Tor
-# nodes (Winnti-adjacent domains, thepiratebay, hidemyass, Tor relays). Disabled by
-# default so the console can run on a customer-adjacent network without originating
-# awkward traffic / SIEM entries. Flip to true only in a lab you control.
+# nodes (bad-cert hosts, thepiratebay, .onion / Tor relays). Disabled by default so the
+# console can run on a customer-adjacent network without originating awkward traffic /
+# SIEM entries. Flip to true only in a lab you control.
 enable_live_suspect_hosts: false
-
-tmnids:
-  url: "https://raw.githubusercontent.com/3CORESec/testmynids.org/master/tmNIDS"
-  cache_path: ""           # empty => default under the per-user cache dir (never re-downloaded per click)
-  sha256: ""               # overrides the built-in pin; empty = use the pinned default (verification is ALWAYS on, fail closed)
-  download_timeout_s: 20
 
 run:
   default_timeout_s: 30
   # Control egress probe — how the console tells a genuine inline drop (blocked) from a
-  # broken environment (error) for tmNIDS triggers. Before deciding a trigger was
-  # BLOCKED, it confirms general egress by TCP-connecting to this known-good host; if the
-  # control fails, the result is `error`, never a false `blocked`. Set control_host to ""
-  # to disable and fall back to the catalog's expected_on_block predicate.
+  # broken environment (error) for the native dns / tcp probes. Before deciding such a
+  # probe was BLOCKED, it confirms general egress by TCP-connecting to this known-good
+  # host; if the control fails, the result is `error`, never a false `blocked`. (curl
+  # triggers don't need this — curl's own exit code separates a drop from an env failure.)
+  # Set control_host to "" to disable.
   control_host: "1.1.1.1"
   control_port: 443
 

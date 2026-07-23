@@ -11,6 +11,86 @@ an observed fact about the source material or a recorded build decision.
 
 ---
 
+## 0. Revisions (newest first)
+
+### 0b. Native execution — WSL removed (supersedes §0a's WSL-worker bridge)
+
+**Date:** 2026-07-23 (same day, after the Tkinter+WSL build was pushed as PR #4).
+
+The presenter asked: *"Is WSL a requirement? Windows has curl and python natively — all we
+need is the packets on the wire with the right signatures."* Correct. Reading the upstream
+[tmNIDS](https://github.com/3CORESec/testmynids.org) script confirmed it is **33 `curl`
+calls** plus a few `dig` / `nc` / `openssl s_client`. So:
+
+- **curl** → `curl.exe` (Windows 10 1803+), identical flags + exit codes;
+- **dig** → a built-in stdlib UDP DNS query (`dns` runner);
+- **nc** (SSH banner / Tor connect) → a stdlib TCP connect (`tcp` runner) / the existing
+  `iprep` probe;
+- **openssl s_client** (bad-cert / SNI) → `curl -k https://…` (the handshake + SNI still
+  cross the wire, which is what the sensor sees).
+
+**Decision:** drop WSL entirely and run **100% natively** on Windows (and on Linux for
+dev). This is *better* than the WSL bridge on every axis that matters: one self-contained
+process per app with its own taskbar icon; Windows-origin traffic (more representative);
+**no download-and-execute of a third-party binary** (the tmNIDS SHA-pin machinery is gone);
+and a simpler install (no distro provisioning).
+
+- **Catalog:** the 15 IDS signatures are reproduced natively as `commands` (a list of
+  argv-lists per trigger, so multi-request tests like the 5 malware UAs fire in full).
+  Runners are now `curl` / `dns` / `tcp` / `iprep`. The `{devnull}` token maps to the OS
+  null device. Fidelity of each reproduced request to its ET/Suricata SID is verified on
+  the EdgeConnect dashboard (the one thing not checkable from a dev box).
+- **Removed:** the Worker/Runner/WSL bridge, `TmnidsCache` + the tmNIDS binary pin + the
+  `tmnids`/`wsl` settings, `expected_on_allow/block` predicates. Multi-request triggers
+  **aggregate honestly** — `blocked` only when every reachable request was dropped; the
+  split is always shown. Execution is back **in-process** (`App.run` on a background
+  thread). Installer re-based on netvitals' model with **no** WSL step; taskbar icon wired
+  via `iconbitmap` + an AppUserModelID.
+
+Non-negotiables still hold: fixed catalog, argv list + no shell, per-trigger timeout,
+three-state classifier (`blocked` ≠ `error`, disambiguated by the control probe for
+dns/tcp), live-suspect gate, signed fail-closed update. "No network surface" (§0a) is
+now joined by "no shell, no WSL, no third-party binary."
+
+### 0a. Pivot to a native Tkinter window (supersedes §2a's web-app decision)
+
+**Date:** 2026-07-23 (post Phases 0–3, after the web build shipped and merged).
+
+The presenter asked: *"Does it have to run in a browser? The Tkinter-contained UI is
+preferred."* Confirmed direction: **Windows Tkinter (like NetVitals)** — a self-contained
+window on Windows Python, no browser and no local server, working on any Windows + WSL
+(no WSLg required).
+
+This resolves the tension §2a flagged: the original non-negotiables read as a web app
+(*"bind the local server to loopback"*), but netvitals' actual form factor is a native
+Tkinter window, and that is what the presenter wanted. The literal "loopback server"
+language is **superseded** — a native window has **no network surface at all**, which is
+strictly stronger than a loopback bind + CSRF token.
+
+**New architecture (see README / INSTALL):**
+
+- **Console:** a Tkinter window on **Windows Python** (mirrors netvitals' `run_gui` form
+  factor: HPE palette, EKG heartbeat, dark cards). Same palette constants as §2b.
+- **Execution:** each fired trigger runs a short-lived **worker in WSL** —
+  `wsl.exe -e python3 - worker <base64url-spec>`, this script streamed on stdin — so the
+  Linux tooling and SD-WAN egress do the real work and **nothing is installed in the
+  distro**. `-e python3 -` uses no login shell; the spec is one base64url token, so no
+  shell-quoting layer exists to mangle (the class of bug the installer hit in PR #3).
+  On Linux / WSLg the worker runs in-process.
+- **Engine unchanged:** the catalog loader, `run_trigger`, three-state classifier,
+  control-egress probe, iprep ratio, tmNIDS SHA-256 pin, and signed updater are the exact
+  Phase 1–3 code, now driven by the worker instead of the HTTP handler. The worker
+  **re-validates** every catalog entry it receives (`Trigger.from_dict`) before running.
+- **Removed:** `http.server`, the request `Handler`, the CSRF token, the embedded
+  `INDEX_HTML`, `webbrowser`. **Installer** re-based on netvitals' model (Windows Python +
+  Tkinter, `pythonw` shortcut, Add/Remove Programs) plus a WSL-worker provisioning step.
+
+Every non-negotiable below still holds; the loopback/CSRF item (§9) is replaced by
+"no network surface," and the two reuse pillars (§2) are now satisfied **literally**
+(the form factor *is* netvitals' Tkinter window; the self-update is the ported channel).
+
+---
+
 ## 1. What Security Vitals is
 
 A local, single-host demo console. The host already sits behind HPE Aruba
@@ -303,8 +383,11 @@ so the schema doesn't paint us into a corner:
   **fail closed**.
 - [x] tmNIDS binary cached (no per-click re-download) **and pinned** — mandatory
   SHA-256 verification, bounded download, https enforced, fail closed.
-- [x] Server bound to **loopback only** (refuses non-loopback); + CSRF token,
-  Host-rebinding + Origin checks, request-body draining, socket timeout, strict CSP.
+- [x] ~~Server bound to **loopback only**~~ → **superseded (§0):** the console is a native
+  Tkinter window with **no network surface at all** (no HTTP server, no listening socket) —
+  strictly stronger than a loopback bind. Execution is in-process and **native** (§0b): no
+  shell (`curl.exe` exec'd directly; dns/tcp are stdlib probes), no WSL, no third-party
+  binary. Commands come only from the fixed catalog.
 - [x] `local` mode excluded from the buttons.
 - [x] Config (catalog + endpoints) separated from logic, in config files.
 - [x] `blocked` vs `error` never collapse — three-state classifier; the tmNIDS path
@@ -332,5 +415,11 @@ hardening, curl-code honesty, and dropping the unimplemented `tcp443` runner).
 - **Phase 3 — WebCC + IP reputation** (last phase): category/web-rep/ip-rep
   triggers, three-state classifier, control probe, Deny-prerequisite notice.
   **E/W deferred — not started.**
+- **Phase 4 — Native Tkinter window** (§0a): replace the loopback web UI with a
+  self-contained Tkinter window on Windows Python; re-base the installer on netvitals'
+  Windows-Python/pythonw model. ✅
+- **Phase 5 — Native execution** (§0b): reproduce the tmNIDS catalog as native
+  `curl` / `dns` / `tcp` commands, drop WSL and the tmNIDS binary, run in-process, add the
+  taskbar icon. ✅
 
 One commit per logical change, noting reused vs added.

@@ -1,163 +1,151 @@
-"""Tests for the runner: argv construction (allowlist) and subprocess execution."""
+"""Tests for the native runner: command building (allowlist + {devnull}), curl execution
+via a stub interpreter, and the dns / tcp stdlib probes with control-probe honesty."""
 import os
 import socket
-import stat
 import sys
-import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import secvitals as sv  # noqa: E402
 
 
-def mk_trigger(**kw):
+def mk_trigger(runner="curl", commands=None, params=None, **kw):
     base = dict(
-        id="t", label="t", cls="ns-ids", runner="tmnids", argv=["tmNIDS", "-1"],
+        id="t", label="t", cls="ns-ids", runner=runner,
+        commands=commands or [["curl", "http://x"]],
         flags=[], severity="info", threat_class="", expected_fire="", talking_point="",
-        expected_on_allow={"rc": 0, "body_contains": "uid=0"},
-        expected_on_block={"rc_nonzero": True}, params=[], timeout=30.0,
+        expected_on_allow={}, expected_on_block={}, params=params or [], timeout=15.0,
     )
     base.update(kw)
     return sv.Trigger(**base)
 
 
-class FakeCache:
-    def __init__(self, path=None, err=None):
-        self._path = path
-        self._err = err
+class TestBuildCommand(unittest.TestCase):
+    def test_devnull_substituted(self):
+        argv = sv.build_command(["curl", "-o", sv.DEVNULL_TOKEN, "http://x"], {})
+        self.assertEqual(argv, ["curl", "-o", os.devnull, "http://x"])
 
-    def ensure(self):
-        if self._err:
-            raise sv.TmnidsError(self._err)
-        return self._path
-
-
-class TestBuildArgv(unittest.TestCase):
-    def test_fixed_argv_no_params(self):
-        t = mk_trigger(argv=["tmNIDS", "-1"], params=[])
-        self.assertEqual(sv.build_argv(t, {}), ["tmNIDS", "-1"])
-
-    def test_allowlist_param(self):
-        t = mk_trigger(runner="curl", argv=["curl", "{target}"],
+    def test_resolve_allowlist(self):
+        t = mk_trigger(runner="curl", commands=[["curl", "{target}"]],
                        params=[{"name": "target", "allow": ["a.example", "b.example"]}])
-        self.assertEqual(sv.build_argv(t, {"target": "a.example"}), ["curl", "a.example"])
+        resolved = sv._resolve_params(t, {"target": "a.example"})
+        self.assertEqual(sv.build_command(t.commands[0], resolved), ["curl", "a.example"])
         with self.assertRaises(sv.ParamError):
-            sv.build_argv(t, {"target": "evil.example"})
+            sv._resolve_params(t, {"target": "evil.example"})
 
-    def test_pattern_param(self):
-        t = mk_trigger(runner="tmnids", argv=["tmNIDS", "{sel}"],
+    def test_resolve_pattern(self):
+        t = mk_trigger(runner="curl", commands=[["curl", "{sel}"]],
                        params=[{"name": "sel", "pattern": r"-\d+"}])
-        self.assertEqual(sv.build_argv(t, {"sel": "-3"}), ["tmNIDS", "-3"])
+        self.assertEqual(sv.build_command(t.commands[0], sv._resolve_params(t, {"sel": "-3"})),
+                         ["curl", "-3"])
         with self.assertRaises(sv.ParamError):
-            sv.build_argv(t, {"sel": "; rm -rf /"})
+            sv._resolve_params(t, {"sel": "; rm -rf /"})
 
-    def test_missing_required_param(self):
-        t = mk_trigger(runner="curl", argv=["curl", "{target}"],
+    def test_missing_required(self):
+        t = mk_trigger(commands=[["curl", "{target}"]],
                        params=[{"name": "target", "allow": ["a"]}])
         with self.assertRaises(sv.ParamError):
-            sv.build_argv(t, {})
+            sv._resolve_params(t, {})
 
-    def test_unknown_param_rejected(self):
-        t = mk_trigger(params=[])
+    def test_unknown_param(self):
         with self.assertRaises(sv.ParamError):
-            sv.build_argv(t, {"surprise": "x"})
+            sv._resolve_params(mk_trigger(params=[]), {"surprise": "x"})
 
-    def test_non_string_param_rejected(self):
-        t = mk_trigger(runner="curl", argv=["curl", "{target}"],
-                       params=[{"name": "target", "allow": ["a"]}])
+    def test_non_string_param(self):
+        t = mk_trigger(commands=[["curl", "{target}"]], params=[{"name": "target", "allow": ["a"]}])
         with self.assertRaises(sv.ParamError):
-            sv.build_argv(t, {"target": 5})
+            sv._resolve_params(t, {"target": 5})
+
+    def test_unresolved_token_refused(self):
+        with self.assertRaises(sv.ParamError):
+            sv.build_command(["curl", "{missing}"], {})
 
 
-class TestRunTrigger(unittest.TestCase):
-    def _stub(self, body, code):
-        fd, path = tempfile.mkstemp(prefix="stub-", suffix=".py")
-        os.close(fd)
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write("#!/usr/bin/env python3\n")
-            fh.write("import sys\n")
-            fh.write("sys.stdout.write(%r)\n" % body)
-            fh.write("sys.exit(%d)\n" % code)
-        os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC | stat.S_IRUSR)
-        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
-        return path
+def _curl_stub(code, out=""):
+    # A fake "curl": prints the -w line, exits with `code`. Used as the command's argv[0..].
+    return [sys.executable, "-c", "import sys; sys.stdout.write(%r); sys.exit(%d)" % (out, code)]
 
-    def test_tmnids_allowed(self):
-        stub = self._stub("uid=0(root) gid=0(root)\n", 0)
-        t = mk_trigger(runner="tmnids", argv=["tmNIDS", "-1"])
-        r = sv.run_trigger(t, {}, sv.Settings(raw={}), FakeCache(path=stub))
-        self.assertEqual(r.rc, 0)
-        self.assertIn("uid=0", r.stdout)
-        self.assertEqual(sv.classify(t, r)[0], sv.ALLOWED)
-        # the resolved argv[0] is the stub, not the literal "tmNIDS"
-        self.assertEqual(r.argv[0], stub)
 
-    def test_tmnids_blocked_predicate_fallback(self):
-        # control disabled => deterministic fallback to expected_on_block {rc_nonzero}.
-        stub = self._stub("", 7)
-        t = mk_trigger(runner="tmnids", argv=["tmNIDS", "-1"])
-        noctrl = sv.Settings(raw={"run": {"control_host": ""}})
-        r = sv.run_trigger(t, {}, noctrl, FakeCache(path=stub))
-        self.assertEqual(r.rc, 7)
-        self.assertIsNone(r.control_ok)   # probe not run
-        self.assertEqual(sv.classify(t, r)[0], sv.BLOCKED)
+class TestRunCurl(unittest.TestCase):
+    def _run(self, code, out="", settings=None):
+        t = mk_trigger("curl", commands=[_curl_stub(code, out)])
+        return t, sv.run_trigger(t, {}, settings or sv.Settings(raw={}))
 
-    def test_tmnids_binary_unavailable_is_error(self):
-        t = mk_trigger(runner="tmnids", argv=["tmNIDS", "-1"])
-        r = sv.run_trigger(t, {}, sv.Settings(raw={}), FakeCache(err="download failed"))
-        self.assertIsNotNone(r.error_reason)
-        self.assertEqual(sv.classify(t, r)[0], sv.ERROR)
-
-    def test_tmnids_selector_guard(self):
-        t = mk_trigger(runner="tmnids", argv=["tmNIDS", "-999"])
-        r = sv.run_trigger(t, {}, sv.Settings(raw={}), FakeCache(path="/nonexistent"))
-        self.assertEqual(sv.classify(t, r)[0], sv.ERROR)
-
-    def test_curl_http_code_parsed(self):
-        t = mk_trigger(runner="curl", argv=[sys.executable, "-c", "print('200|12|http://x')"],
-                       expected_on_allow={}, expected_on_block={})
-        r = sv.run_trigger(t, {}, sv.Settings(raw={}), FakeCache())
-        self.assertEqual(r.http_code, 200)
+    def test_http_code_parsed_and_allowed(self):
+        t, r = self._run(0, "200|12|http://x")
+        self.assertEqual(r.subs[0].http_code, 200)
         self.assertEqual(sv.classify(t, r)[0], sv.ALLOWED)
 
-    def test_curl_blocked_rc(self):
-        t = mk_trigger(runner="curl", argv=[sys.executable, "-c", "import sys;sys.exit(28)"],
-                       expected_on_allow={}, expected_on_block={})
-        r = sv.run_trigger(t, {}, sv.Settings(raw={}), FakeCache())
-        self.assertEqual(r.rc, 28)
+    def test_blocked_rc(self):
+        t, r = self._run(28)
+        self.assertEqual(r.subs[0].rc, 28)
         self.assertEqual(sv.classify(t, r)[0], sv.BLOCKED)
 
-    def test_curl_broken_rc_is_error(self):
-        t = mk_trigger(runner="curl", argv=[sys.executable, "-c", "import sys;sys.exit(6)"],
-                       expected_on_allow={}, expected_on_block={})
-        r = sv.run_trigger(t, {}, sv.Settings(raw={}), FakeCache())
+    def test_broken_rc_is_error(self):
+        t, r = self._run(6)
         self.assertEqual(sv.classify(t, r)[0], sv.ERROR)
 
-    def test_env_error_signature_forces_error(self):
-        # tmNIDS stub that "fails to resolve" and exits nonzero must be error, not blocked.
-        fd, path = tempfile.mkstemp(prefix="stub-", suffix=".py")
-        os.close(fd)
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write("#!/usr/bin/env python3\nimport sys\n")
-            fh.write("sys.stderr.write('curl: (6) Could not resolve host: testmynids.org\\n')\n")
-            fh.write("sys.exit(6)\n")
-        os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC)
-        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
-        t = mk_trigger(runner="tmnids", argv=["tmNIDS", "-1"])
-        r = sv.run_trigger(t, {}, sv.Settings(raw={}), FakeCache(path=path))
-        self.assertIsNotNone(r.error_reason)
+    def test_missing_binary_is_error(self):
+        t = mk_trigger("curl", commands=[["/nonexistent/curl-xyz", "http://x"]])
+        r = sv.run_trigger(t, {}, sv.Settings(raw={}))
+        self.assertIsNotNone(r.subs[0].error_reason)
         self.assertEqual(sv.classify(t, r)[0], sv.ERROR)
 
-    def test_executable_not_found_is_error(self):
-        t = mk_trigger(runner="curl", argv=["/nonexistent/binary-xyz"],
-                       expected_on_allow={}, expected_on_block={})
-        r = sv.run_trigger(t, {}, sv.Settings(raw={}), FakeCache())
-        self.assertIsNotNone(r.error_reason)
-        self.assertEqual(sv.classify(t, r)[0], sv.ERROR)
+    def test_multi_command_all_run(self):
+        t = mk_trigger("curl", commands=[_curl_stub(0, "200|"), _curl_stub(0, "204|"), _curl_stub(0, "302|")])
+        r = sv.run_trigger(t, {}, sv.Settings(raw={}))
+        self.assertEqual(len(r.subs), 3)
+        self.assertEqual(sv.classify(t, r)[0], sv.ALLOWED)
+
+
+class TestDnsProbe(unittest.TestCase):
+    def test_no_response_needs_control(self):
+        # 192.0.2.1 is TEST-NET-1 (RFC5737) — guaranteed no DNS reply, so the probe times
+        # out. With egress control OK that reads as blocked; with control broken, error.
+        t = mk_trigger("dns", commands=[["dns", "example.com", "@192.0.2.1"]], timeout=2.0)
+        orig = sv._tcp_probe
+        try:
+            sv._tcp_probe = lambda h, p, to: True                 # egress control OK
+            self.assertEqual(sv.classify(t, sv.run_trigger(t, {}, sv.Settings(raw={})))[0], sv.BLOCKED)
+            sv._tcp_probe = lambda h, p, to: False                # egress broken
+            self.assertEqual(sv.classify(t, sv.run_trigger(t, {}, sv.Settings(raw={})))[0], sv.ERROR)
+        finally:
+            sv._tcp_probe = orig
+
+    def test_control_disabled_no_probe(self):
+        t = mk_trigger("dns", commands=[["dns", "example.com", "@192.0.2.1"]], timeout=2.0)
+        r = sv.run_trigger(t, {}, sv.Settings(raw={"run": {"control_host": ""}}))
+        self.assertIsNone(r.control_ok)
 
 
 class TestTcpProbe(unittest.TestCase):
-    def test_open_port_true(self):
+    def test_connect_reached_is_allowed(self):
+        ls = socket.socket()
+        ls.bind(("127.0.0.1", 0))
+        ls.listen(1)
+        port = ls.getsockname()[1]
+        try:
+            t = mk_trigger("tcp", commands=[["tcp-connect", "127.0.0.1", str(port)]])
+            r = sv.run_trigger(t, {}, sv.Settings(raw={}))
+            self.assertTrue(r.subs[0].ok)
+            self.assertEqual(sv.classify(t, r)[0], sv.ALLOWED)
+        finally:
+            ls.close()
+
+    def test_refused_needs_control(self):
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        t = mk_trigger("tcp", commands=[["tcp-connect", "127.0.0.1", str(port)]])
+        orig = sv._tcp_probe
+        try:
+            sv._tcp_probe = lambda h, p, to: True
+            self.assertEqual(sv.classify(t, sv.run_trigger(t, {}, sv.Settings(raw={})))[0], sv.BLOCKED)
+        finally:
+            sv._tcp_probe = orig
+
+    def test_tcp_probe_helper(self):
         ls = socket.socket()
         ls.bind(("127.0.0.1", 0))
         ls.listen(1)
@@ -166,13 +154,6 @@ class TestTcpProbe(unittest.TestCase):
             self.assertTrue(sv._tcp_probe("127.0.0.1", port, 2))
         finally:
             ls.close()
-
-    def test_closed_port_false(self):
-        s = socket.socket()
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-        s.close()   # nothing listening on `port` now
-        self.assertFalse(sv._tcp_probe("127.0.0.1", port, 1))
 
 
 if __name__ == "__main__":

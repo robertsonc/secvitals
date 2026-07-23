@@ -8,18 +8,24 @@ Secure Web Gateway / BrightCloud WebCC. This app polls no management API — the
 presenter verifies on the Orchestrator/EC dashboard already on screen.
 
 Design (see CONFIRMED.md):
-  * Single code artifact, stdlib only. UI served over a loopback-bound http.server
-    and opened in the browser. Runs inside WSL (native bash; no wsl.exe shelling).
-  * Fixed server-side catalog (config/catalog.yaml). The UI sends a trigger id; a
-    command is NEVER built from client input. subprocess with an argv list, no
-    shell=True, per-trigger timeout, captured stdout/stderr/returncode.
-  * Three-state classifier: `blocked` and `error` never collapse.
+  * Single code artifact, stdlib only. Self-contained Tkinter window (no browser, no
+    local server). Everything runs NATIVELY — no WSL: curl commands go through the
+    system curl (curl.exe on Windows 10 1803+), and `dns` / `tcp` triggers use small
+    stdlib socket probes. Each trigger reproduces the exact requests a tmNIDS test
+    sends, so the same EdgeConnect / Suricata signatures trip without shelling any
+    third-party binary.
+  * Fixed catalog (config/catalog.yaml). A trigger's commands are FIXED there; nothing
+    is built from free text. subprocess with an argv list, no shell=True, per-trigger
+    timeout, captured stdout/stderr/returncode. A trigger may fire several requests.
+  * Three-state classifier: `blocked` and `error` never collapse. A native probe that
+    doesn't complete is disambiguated by a control egress probe, so a broken environment
+    reports `error`, never a false `blocked`.
 
-This module is import-safe: importing it starts nothing (everything is behind
-main()). The self-update mechanism is added in a later commit.
+This module is import-safe: importing it starts nothing (everything is behind main()).
 """
 
 import argparse
+import base64
 import dataclasses
 import hashlib
 import hmac
@@ -27,16 +33,14 @@ import json
 import logging
 import os
 import re
-import secrets
 import socket
+import struct
 import subprocess
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
-import webbrowser
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 __version__ = "0.1.0"
 APP_NAME = "Security Vitals"
@@ -64,22 +68,25 @@ MwIDAQAB
 -----END PUBLIC KEY-----
 """
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+_THIS_FILE = os.path.abspath(__file__)          # used by the updater to replace this file
+HERE = os.path.dirname(_THIS_FILE)
 DEFAULT_CONFIG_DIR = os.path.join(HERE, "config")
 DEFAULT_ASSETS_DIR = os.path.join(HERE, "assets")
 
 # Known catalog vocabularies (fixed allowlists).
 CLASSES = {"ns-ids", "ns-webcc", "ns-iprep", "ew"}   # `ew` reserved / deferred
-RUNNERS = {"tmnids", "curl", "iprep"}                 # `iprep` = built-in IP-reputation probe
+# All runners execute NATIVELY (Windows or Linux) — no WSL, no download-and-execute:
+#   curl = curl.exe / curl (ships with Windows 10 1803+); dns / tcp = built-in stdlib
+#   probes; iprep = built-in IP-reputation probe. A trigger reproduces the exact requests
+#   a tmNIDS test sends (curl URLs/headers/UAs, a DNS query, a TCP connect), so it trips
+#   the same EdgeConnect / Suricata signatures without shelling a third-party binary.
+RUNNERS = {"curl", "dns", "tcp", "iprep"}
 FLAGS = {"needs_internet", "needs_et_ruleset", "hits_live_suspect_hosts"}
 SEVERITIES = {"info", "warn", "crit"}
 
-# tmNIDS is a download-and-execute channel, so its bytes are pinned by default and
-# verification is MANDATORY (fail closed). If 3CORESec updates tmNIDS upstream, verify
-# the new binary out-of-band, recompute its SHA-256, and set tmnids.sha256 in
-# settings.yaml (which overrides this constant). See docs/UPDATE_SECURITY.md.
-TMNIDS_SHA256 = "7016952b1713d09aac0b17bc05d1cc9c589c5ab1ed441233b9413717494fa0c4"
-TMNIDS_MAX_BYTES = 4 * 1024 * 1024
+# Windows has no /dev/null; catalog commands use the {devnull} token, substituted to
+# os.devnull at run time (see build_command). It is a fixed safe value, never client input.
+DEVNULL_TOKEN = "{devnull}"
 
 # UI result states — `blocked` and `error` MUST stay distinct.
 ALLOWED, BLOCKED, ERROR, INVALID = "allowed", "blocked", "error", "invalid"
@@ -348,18 +355,6 @@ class Settings:
     raw: dict
 
     @property
-    def host(self):
-        return str(_dget(self.raw, "server.host", "127.0.0.1"))
-
-    @property
-    def port(self):
-        return int(_dget(self.raw, "server.port", 8787))
-
-    @property
-    def open_browser(self):
-        return bool(_dget(self.raw, "server.open_browser", True))
-
-    @property
     def enable_live_suspect_hosts(self):
         return bool(_dget(self.raw, "enable_live_suspect_hosts", False))
 
@@ -405,25 +400,6 @@ class Settings:
     def node_probe_timeout(self):
         return float(_dget(self.raw, "webcc.node_probe_timeout_s", 5))
 
-    @property
-    def tmnids_url(self):
-        return str(_dget(self.raw, "tmnids.url", ""))
-
-    @property
-    def tmnids_cache_path(self):
-        p = _dget(self.raw, "tmnids.cache_path", "") or ""
-        return p or os.path.join(_cache_dir(), "tmNIDS")
-
-    @property
-    def tmnids_sha256(self):
-        # Config overrides the built-in pin; the pin is never empty, so verification
-        # is always mandatory (fail closed).
-        return ((_dget(self.raw, "tmnids.sha256", "") or "").strip() or TMNIDS_SHA256)
-
-    @property
-    def tmnids_timeout(self):
-        return float(_dget(self.raw, "tmnids.download_timeout_s", 20))
-
 
 @dataclasses.dataclass
 class Trigger:
@@ -431,7 +407,7 @@ class Trigger:
     label: str
     cls: str
     runner: str
-    argv: list
+    commands: list          # list of argv-lists — a trigger may fire several requests
     flags: list
     severity: str
     threat_class: str
@@ -455,9 +431,18 @@ class Trigger:
         runner = d.get("runner")
         if runner not in RUNNERS:
             raise ConfigError(f"{tid}: runner must be one of {sorted(RUNNERS)}, got {runner!r}")
-        argv = d.get("argv")
-        if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
-            raise ConfigError(f"{tid}: argv must be a non-empty list of strings, got {argv!r}")
+        # Accept `commands: [[...], [...]]` (multi-request) or `argv: [...]` (single); the
+        # iprep runner needs neither (its probe is built in).
+        commands = d.get("commands")
+        if commands is None and d.get("argv") is not None:
+            commands = [d.get("argv")]
+        if commands is None and runner == "iprep":
+            commands = [["iprep"]]
+        if not isinstance(commands, list) or not commands:
+            raise ConfigError(f"{tid}: needs a non-empty 'commands' (list of argv lists)")
+        for cmd in commands:
+            if not isinstance(cmd, list) or not cmd or not all(isinstance(a, str) for a in cmd):
+                raise ConfigError(f"{tid}: each command must be a non-empty list of strings, got {cmd!r}")
         flags = d.get("flags") or []
         if not isinstance(flags, list) or any(f not in FLAGS for f in flags):
             raise ConfigError(f"{tid}: flags must be a subset of {sorted(FLAGS)}, got {flags!r}")
@@ -471,13 +456,13 @@ class Trigger:
         _validate_predicate(tid, "expected_on_allow", allow)
         _validate_predicate(tid, "expected_on_block", block)
         params = d.get("params") or []
-        _validate_params(tid, params, argv)
+        _validate_params(tid, params, commands)
         return Trigger(
             id=tid,
             label=str(d.get("label", tid)),
             cls=cls,
             runner=runner,
-            argv=list(argv),
+            commands=[list(c) for c in commands],
             flags=list(flags),
             severity=sev,
             threat_class=str(d.get("threat_class", "")),
@@ -504,6 +489,7 @@ class Trigger:
             "threat_class": self.threat_class,
             "expected_fire": self.expected_fire,
             "talking_point": self.talking_point,
+            "request_count": len(self.commands),
             "params": [{"name": p["name"],
                         "allow": p.get("allow"),
                         "required": p.get("required", True)} for p in self.params],
@@ -533,7 +519,10 @@ def _validate_predicate(tid, name, pred):
             raise ConfigError(f"{tid}: {name}.{key} must be a list of integers")
 
 
-def _validate_params(tid, params, argv):
+_BUILTIN_TOKENS = {"devnull"}   # substituted by build_command, not catalog params
+
+
+def _validate_params(tid, params, commands):
     if not isinstance(params, list):
         raise ConfigError(f"{tid}: params must be a list")
     names = set()
@@ -556,10 +545,11 @@ def _validate_params(tid, params, argv):
             except re.error as e:
                 raise ConfigError(f"{tid}: param {name} has an invalid regex pattern: {e}") from e
         names.add(name)
-    used = {tok[1:-1] for tok in argv if isinstance(tok, str) and tok.startswith("{") and tok.endswith("}")}
-    missing = used - names
+    used = {tok[1:-1] for cmd in commands for tok in cmd
+            if isinstance(tok, str) and tok.startswith("{") and tok.endswith("}")}
+    missing = used - names - _BUILTIN_TOKENS
     if missing:
-        raise ConfigError(f"{tid}: argv references undeclared params {sorted(missing)}")
+        raise ConfigError(f"{tid}: commands reference undeclared params {sorted(missing)}")
 
 
 def load_settings(config_dir):
@@ -593,88 +583,6 @@ def load_catalog(config_dir, settings):
     return triggers
 
 
-# ===========================================================================
-# tmNIDS binary cache (download once; never re-download per click)
-# ===========================================================================
-class TmnidsError(Exception):
-    """Raised when the tmNIDS binary cannot be made available."""
-
-
-class TmnidsCache:
-    def __init__(self, url, cache_path, sha256, timeout):
-        self.url = url
-        self.path = cache_path
-        self.sha256 = (sha256 or "").lower()
-        self.timeout = timeout
-        self._lock = threading.Lock()
-
-    def ensure(self):
-        """Return the path to a ready-to-exec tmNIDS binary, downloading it once if
-        needed. Verification against the SHA-256 pin is MANDATORY and fails closed —
-        the binary is downloaded and executed, so TLS host auth alone is not enough
-        (a TLS-terminating SWG is in-path). Raises TmnidsError (→ `error`, never
-        `blocked`)."""
-        with self._lock:
-            if not self.sha256:
-                raise TmnidsError("no tmNIDS SHA-256 pin configured — refusing to run")
-            if os.path.exists(self.path) and os.access(self.path, os.X_OK):
-                self._verify_file(self.path)          # re-verify the cached binary each time
-                return self.path
-            if not self.url:
-                raise TmnidsError("no tmnids.url configured")
-            if not self.url.lower().startswith("https:"):
-                raise TmnidsError(f"tmnids.url must be https, got {self.url!r}")
-            data = self._download()
-            got = hashlib.sha256(data).hexdigest()
-            if not hmac.compare_digest(got, self.sha256):
-                raise TmnidsError(
-                    f"tmNIDS sha256 mismatch — refusing (pinned {self.sha256[:12]}…, got {got[:12]}…). "
-                    "If 3CORESec updated tmNIDS, verify the new binary and set tmnids.sha256 in settings.yaml.")
-            os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-            tmp = self.path + ".dl"
-            try:
-                with open(tmp, "wb") as fh:
-                    fh.write(data)
-                os.chmod(tmp, 0o755)
-                os.replace(tmp, self.path)
-            except OSError as e:
-                _quiet_remove(tmp)
-                raise TmnidsError(f"could not install binary: {e}") from e
-            log.info("tmNIDS cached at %s (%d bytes, sha256 verified)", self.path, len(data))
-            return self.path
-
-    def _verify_file(self, path):
-        try:
-            with open(path, "rb") as fh:
-                got = hashlib.sha256(fh.read()).hexdigest()
-        except OSError as e:
-            raise TmnidsError(f"could not read cached binary: {e}") from e
-        if not hmac.compare_digest(got, self.sha256):
-            raise TmnidsError("cached binary fails the pinned sha256 — refusing to run")
-
-    def _download(self):
-        req = urllib.request.Request(self.url, headers={"User-Agent": "secvitals/%s" % __version__})
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                final = getattr(resp, "url", None) or self.url
-                if not final.lower().startswith("https:"):   # no http, no https->http redirect
-                    raise TmnidsError(f"refusing non-https download URL {final}")
-                data = resp.read(TMNIDS_MAX_BYTES + 1)        # bounded — no memory DoS
-        except (urllib.error.URLError, OSError) as e:
-            raise TmnidsError(f"download failed: {e}") from e
-        if len(data) > TMNIDS_MAX_BYTES:
-            raise TmnidsError("tmNIDS download exceeds the size limit — refusing")
-        if not data:
-            raise TmnidsError("download was empty")
-        return data
-
-
-def _cache_dir():
-    if sys.platform == "win32":
-        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-        return os.path.join(base, "SecurityVitals", "cache")
-    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
-    return os.path.join(base, "secvitals")
 
 
 def _quiet_remove(path):
@@ -725,42 +633,45 @@ def _parse_tor_ips(text):
 
 
 # ===========================================================================
-# Runner  —  subprocess with an argv list, no shell=True, per-trigger timeout
+# Runner  —  native execution: curl.exe / stdlib probes, argv lists, no shell
 # ===========================================================================
+# Every trigger runs NATIVELY (Windows or Linux): curl commands go through curl.exe /
+# curl; `dns` and `tcp` triggers use small stdlib socket probes. A trigger may fire
+# several requests (Trigger.commands) — e.g. the five malware User-Agents — reproducing
+# exactly what the corresponding tmNIDS test sends so the same signatures trip, without
+# shelling any third-party binary. `blocked` and `error` still never collapse.
 @dataclasses.dataclass
-class RunResult:
-    argv: list = dataclasses.field(default_factory=list)
+class SubResult:
+    argv: list = dataclasses.field(default_factory=list)   # command as displayed
     rc: int = None
+    http_code: int = None
     stdout: str = ""
     stderr: str = ""
-    http_code: int = None
-    duration_s: float = 0.0
+    ok: bool = None            # dns/tcp probe: did the expected thing happen?
+    error_reason: str = None   # environment failure for THIS request (→ error)
     timed_out: bool = False
-    error_reason: str = None   # set => classified as `error`
-    control_ok: bool = None    # egress control probe (tmnids); None = not run
+
+
+@dataclasses.dataclass
+class RunResult:
+    subs: list = dataclasses.field(default_factory=list)
+    duration_s: float = 0.0
+    control_ok: bool = None    # egress control probe (dns/tcp only); None = not run
+    error_reason: str = None   # trigger-level error (e.g. param error) → error
 
 
 class ParamError(Exception):
-    """Raised when client-supplied params fail per-trigger validation."""
+    """Raised when supplied params fail per-trigger validation."""
 
 
-# curl exit codes (see CONFIRMED.md §5)
+# curl exit codes (see CONFIRMED.md §5) — identical on Windows and Linux curl.
 BLOCKED_RC = {28, 7, 56}          # timeout, connection refused, recv reset — consistent with a drop
 BROKEN_RC = {6, 5, 35, 60, 77}    # DNS, proxy DNS, TLS handshake, cert — environment, not policy
 
-_ENV_ERR_SIGS = (
-    "could not resolve", "couldn't resolve", "name or service not known",
-    "temporary failure in name resolution", "no address associated",
-    "no route to host", "network is unreachable", "connection refused by proxy",
-    "ssl certificate problem", "certificate verify failed",
-)
 
-_TMNIDS_SELECTOR = re.compile(r"-([1-9]|1[0-5]|99)$")
-
-
-def build_argv(trigger, params):
-    """Build the exact argv from the FIXED catalog template plus validated params.
-    A command is never constructed from raw client input."""
+def _resolve_params(trigger, params):
+    """Validate supplied params against the per-trigger allowlist/pattern once; the same
+    resolved values fill every command. Commands are never built from free text."""
     params = params or {}
     if not isinstance(params, dict):
         raise ParamError("params must be an object")
@@ -794,70 +705,155 @@ def build_argv(trigger, params):
         else:
             raise ParamError(f"param {name!r} has no allowlist or pattern")  # fail closed
         resolved[name] = val
+    return resolved
+
+
+def build_command(template, resolved):
+    """Resolve one fixed command template into a concrete argv: the {devnull} token plus
+    any validated params. Anything in braces that isn't a resolved param is refused."""
     argv = []
-    for tok in trigger.argv:
-        if isinstance(tok, str) and tok.startswith("{") and tok.endswith("}"):
+    for tok in template:
+        if tok == DEVNULL_TOKEN:
+            argv.append(os.devnull)
+        elif isinstance(tok, str) and tok.startswith("{") and tok.endswith("}"):
             nm = tok[1:-1]
             if nm not in resolved:
-                raise ParamError(f"unresolved argv token {tok}")
+                raise ParamError(f"unresolved token {tok}")
             argv.append(resolved[nm])
         else:
             argv.append(tok)
     return argv
 
 
-def run_trigger(trigger, params, settings, tmnids_cache):
-    """Execute one trigger and return a RunResult. Never raises for expected
-    failure modes — those become error_reason (→ `error`)."""
+def run_trigger(trigger, params, settings):
+    """Run every command of one trigger natively and return a RunResult. Never raises for
+    expected failure modes — those become per-request error_reason (→ `error`)."""
     try:
-        argv = build_argv(trigger, params)
+        resolved = _resolve_params(trigger, params)
     except ParamError as e:
         return RunResult(error_reason=f"invalid parameters: {e}")
 
-    if trigger.runner == "tmnids":
-        if len(argv) < 2 or not _TMNIDS_SELECTOR.fullmatch(argv[1]):
-            return RunResult(argv=argv, error_reason=f"tmnids selector not allowed: {argv[1:]!r}")
-        try:
-            binpath = tmnids_cache.ensure()
-        except TmnidsError as e:
-            return RunResult(argv=argv, error_reason=f"tmNIDS binary unavailable: {e}")
-        argv = [binpath] + list(argv[1:])
-
     start = time.monotonic()
-    try:
-        proc = subprocess.run(argv, capture_output=True, timeout=trigger.timeout, check=False)
-    except FileNotFoundError as e:
-        return RunResult(argv=argv, error_reason=f"executable not found: {e}",
-                         duration_s=time.monotonic() - start)
-    except PermissionError as e:
-        return RunResult(argv=argv, error_reason=f"permission denied: {e}",
-                         duration_s=time.monotonic() - start)
-    except subprocess.TimeoutExpired as e:
-        return RunResult(argv=argv, rc=None, timed_out=True,
-                         stdout=_dec(e.stdout), stderr=_dec(e.stderr),
-                         duration_s=time.monotonic() - start)
-    except OSError as e:
-        return RunResult(argv=argv, error_reason=f"could not execute: {e}",
-                         duration_s=time.monotonic() - start)
+    subs, need_control = [], False
+    for template in trigger.commands:
+        try:
+            argv = build_command(template, resolved)
+        except ParamError as e:
+            subs.append(SubResult(argv=list(template), error_reason=f"invalid parameters: {e}"))
+            continue
+        if trigger.runner == "curl":
+            subs.append(_run_curl(argv, trigger.timeout))
+        elif trigger.runner == "dns":
+            s = _run_dns(argv, trigger.timeout)
+            subs.append(s)
+            need_control = need_control or (s.ok is False and not s.error_reason)
+        elif trigger.runner == "tcp":
+            s = _run_tcp(argv, trigger.timeout)
+            subs.append(s)
+            need_control = need_control or (s.ok is False and not s.error_reason)
+        else:
+            subs.append(SubResult(argv=argv, error_reason=f"unsupported runner {trigger.runner!r}"))
 
-    dur = time.monotonic() - start
-    out, err = _dec(proc.stdout), _dec(proc.stderr)
-    res = RunResult(argv=argv, rc=proc.returncode, stdout=out, stderr=err, duration_s=dur)
-    if trigger.runner == "curl":
-        res.http_code = _parse_http_code(out)
-    else:
-        # Non-curl (tmNIDS): distinguish a genuine inline drop (`blocked`) from a broken
-        # environment (`error`), and never report a false `blocked`.
-        if _env_error_signature(err):
-            res.error_reason = "environment error (name resolution / route / TLS): " + _first_line(err)
-        elif not _pred_match(trigger.expected_on_allow, res) and settings.control_enabled:
-            # The expected response did not come back. A control egress probe to a known-
-            # good host tells us whether general egress works (=> this specific flow was
-            # dropped => blocked) or the whole environment is broken (=> error). This is
-            # reliable where a hardcoded English stderr blocklist is not.
-            res.control_ok = _tcp_probe(settings.control_host, settings.control_port,
-                                        min(6.0, trigger.timeout))
+    res = RunResult(subs=subs, duration_s=time.monotonic() - start)
+    # A native probe (dns/tcp) that didn't complete could be an inline drop OR a broken
+    # environment — a control egress probe to a known-good host tells the two apart, so a
+    # broken environment is `error`, never a false `blocked`. curl doesn't need this: its
+    # own exit code already separates a drop (7/28/56) from an environment failure (60/…).
+    if need_control and settings.control_enabled:
+        res.control_ok = _tcp_probe(settings.control_host, settings.control_port,
+                                    min(6.0, trigger.timeout))
     return res
+
+
+def _run_curl(argv, timeout):
+    try:
+        proc = subprocess.run(argv, capture_output=True, timeout=timeout, check=False)
+    except FileNotFoundError as e:
+        return SubResult(argv=argv, error_reason=f"curl not found ({e}) — Windows 10 1803+ ships curl.exe")
+    except subprocess.TimeoutExpired as e:
+        return SubResult(argv=argv, timed_out=True, stdout=_dec(e.stdout), stderr=_dec(e.stderr))
+    except OSError as e:
+        return SubResult(argv=argv, error_reason=f"could not execute curl: {e}")
+    out, err = _dec(proc.stdout), _dec(proc.stderr)
+    return SubResult(argv=argv, rc=proc.returncode, http_code=_parse_http_code(out),
+                     stdout=out, stderr=err)
+
+
+def _run_dns(argv, timeout):
+    """`dns` command: ["dns", "<name>", "@<server>"] — a native A-record query."""
+    qname, server = None, "8.8.8.8"
+    for a in argv[1:]:
+        if a.startswith("@"):
+            server = a[1:] or server
+        elif qname is None:
+            qname = a
+    if not qname:
+        return SubResult(argv=argv, error_reason="dns: no query name in command")
+    ok, detail, err = _dns_query(qname, server, min(float(timeout), 8.0))
+    if err:
+        return SubResult(argv=argv, ok=False, error_reason=err)
+    return SubResult(argv=argv, ok=ok, stdout=detail)
+
+
+def _run_tcp(argv, timeout):
+    """`tcp` command: ["tcp-connect", "<host>", "<port>"] — a native TCP connect/banner."""
+    if len(argv) < 3:
+        return SubResult(argv=argv, error_reason="tcp: command needs a host and port")
+    host, port = argv[1], argv[2]
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return SubResult(argv=argv, error_reason=f"tcp: bad port {port!r}")
+    ok, detail, err = _tcp_banner(host, port, min(float(timeout), 8.0))
+    if err:
+        return SubResult(argv=argv, ok=False, error_reason=err)
+    return SubResult(argv=argv, ok=ok, stdout=detail)
+
+
+def _dns_query(qname, server="8.8.8.8", timeout=5.0):
+    """Send a minimal DNS A-query over UDP and wait for a response. Returns
+    (ok, detail, err): ok True if ANY response came back (the query crossed the wire and
+    the resolver was reachable), ok False on timeout (no response — possibly a policy
+    drop), err set only for a local/environment failure."""
+    try:
+        labels = qname.rstrip(".").split(".")
+        q = b"".join(bytes([len(p)]) + p.encode("ascii") for p in labels) + b"\x00"
+        packet = struct.pack(">HHHHHH", 0x1337, 0x0100, 1, 0, 0, 0) + q + struct.pack(">HH", 1, 1)
+    except (UnicodeError, ValueError) as e:
+        return (False, "", f"dns: bad query name {qname!r}: {e}")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.settimeout(timeout)
+        sock.sendto(packet, (server, 53))
+        data, _ = sock.recvfrom(4096)
+        rcode = data[3] & 0x0F if len(data) >= 4 else -1
+        answers = struct.unpack(">H", data[6:8])[0] if len(data) >= 8 else 0
+        return (True, f"DNS {qname} @{server}: response (rcode={rcode}, answers={answers})", None)
+    except socket.timeout:
+        return (False, f"DNS {qname} @{server}: no response (timeout)", None)
+    except OSError as e:
+        return (False, "", f"dns: {e}")
+    finally:
+        sock.close()
+
+
+def _tcp_banner(host, port, timeout):
+    """Connect and read any greeting banner. Returns (ok, detail, err): ok True if the
+    TCP connection established, ok False on refuse/timeout (possibly a policy drop), err
+    set only for name-resolution / local failures (environment, not policy)."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            sock.settimeout(min(timeout, 3.0))
+            try:
+                banner = sock.recv(128)
+            except OSError:
+                banner = b""
+        txt = banner.decode("latin-1", "replace").strip()
+        return (True, f"TCP {host}:{port} connected" + (f" — {txt[:80]!r}" if txt else ""), None)
+    except socket.gaierror as e:
+        return (False, "", f"tcp: could not resolve {host}: {e}")
+    except (socket.timeout, ConnectionRefusedError, OSError) as e:
+        return (False, f"TCP {host}:{port}: {e.__class__.__name__}", None)
 
 
 def _tcp_probe(host, port, timeout):
@@ -884,11 +880,6 @@ def _first_line(s):
     return ""
 
 
-def _env_error_signature(stderr):
-    low = (stderr or "").lower()
-    return any(sig in low for sig in _ENV_ERR_SIGS)
-
-
 def _parse_http_code(stdout):
     """curl is invoked with -w '%{http_code}|...' as the LAST stdout line."""
     for line in reversed((stdout or "").splitlines()):
@@ -899,7 +890,7 @@ def _parse_http_code(stdout):
 
 
 # ===========================================================================
-# Classifier  —  three states that never collapse
+# Classifier  —  three states that never collapse; multi-request triggers aggregate
 # ===========================================================================
 def classify_curl(rc, http_code):
     if rc == 0:
@@ -913,62 +904,59 @@ def classify_curl(rc, http_code):
     return ERROR   # unknown rc is an error, not a block — fail toward honest
 
 
-def _pred_match(pred, result):
-    if not pred:
-        return False
-    if "rc" in pred and result.rc != pred["rc"]:
-        return False
-    if pred.get("rc_nonzero") and (result.rc is None or result.rc == 0):
-        return False
-    if "body_contains" in pred and pred["body_contains"] not in (result.stdout or ""):
-        return False
-    if "http_code" in pred and result.http_code != pred["http_code"]:
-        return False
-    if "http_code_in" in pred and result.http_code not in (pred.get("http_code_in") or []):
-        return False
-    return True
+def _classify_sub(trigger, s, control_ok):
+    if s.error_reason:
+        return ERROR, s.error_reason
+    if s.timed_out:
+        return ERROR, f"timed out after {trigger.timeout:g}s"
+    if trigger.runner == "curl":
+        return classify_curl(s.rc, s.http_code), f"curl rc={s.rc}, http={s.http_code}"
+    # dns / tcp native probe
+    if s.ok:
+        return ALLOWED, s.stdout or "reached"
+    if control_ok is True:
+        return BLOCKED, "egress control OK but the probe did not complete — dropped inline"
+    if control_ok is False:
+        return ERROR, "egress control probe failed — environment, not policy"
+    return ERROR, "probe did not complete and egress control was unavailable"
 
 
 def classify(trigger, result):
-    """Return (state, reason). state ∈ {allowed, blocked, error}."""
+    """Return (state, reason). state ∈ {allowed, blocked, error}. For a multi-request
+    trigger, aggregate honestly: `blocked` only when every REACHABLE request was dropped,
+    `error` only when all failed on the environment; the split is always shown."""
     if result.error_reason:
         return ERROR, result.error_reason
-    if result.timed_out:
-        # Honest: a full-process timeout is more likely a hung environment than a
-        # clean inline drop (tmNIDS' own sub-request would self-time-out first).
-        return ERROR, f"timed out after {trigger.timeout:g}s"
-    if trigger.runner == "curl":
-        state = classify_curl(result.rc, result.http_code)
-        return state, f"curl rc={result.rc}, http={result.http_code}"
-    # tmNIDS / default: expectation-driven, with control-probe disambiguation.
-    if _pred_match(trigger.expected_on_allow, result):
-        return ALLOWED, "matched expected_on_allow"
-    if result.control_ok is True:
-        return BLOCKED, "egress control OK but the trigger's expected response did not return — dropped inline"
-    if result.control_ok is False:
-        return ERROR, "egress control probe failed — environment, not policy"
-    # No control signal (control probe disabled): fall back to the catalog's declared
-    # block predicate, as an operator-accepted, less-certain path.
-    if _pred_match(trigger.expected_on_block, result):
-        return BLOCKED, "matched expected_on_block (egress control disabled)"
-    return ERROR, f"result matched neither expected_on_allow nor expected_on_block (rc={result.rc})"
+    subs = result.subs or []
+    if not subs:
+        return ERROR, "no requests were run"
+    states = [_classify_sub(trigger, s, result.control_ok)[0] for s in subs]
+    if len(subs) == 1:
+        return states[0], _classify_sub(trigger, subs[0], result.control_ok)[1]
+    a, b, e = states.count(ALLOWED), states.count(BLOCKED), states.count(ERROR)
+    summary = f"{a} allowed / {b} blocked / {e} error across {len(subs)} requests"
+    reachable = a + b
+    if reachable == 0:
+        return ERROR, summary + " — all failed on the environment, not policy"
+    if b == reachable:
+        return BLOCKED, summary + " — every reachable request was dropped inline"
+    if a == reachable:
+        return ALLOWED, summary
+    return (BLOCKED if b > a else ALLOWED), summary + " (mixed — see details)"
 
 
 # ===========================================================================
 # Application state
 # ===========================================================================
 class App:
-    def __init__(self, settings, triggers, config_dir):
+    def __init__(self, settings, triggers, config_dir=None):
         self.settings = settings
         self.triggers = triggers
         self.by_id = {t.id: t for t in triggers}
         self.config_dir = config_dir
-        self.token = secrets.token_urlsafe(32)
-        self.tmnids = TmnidsCache(settings.tmnids_url, settings.tmnids_cache_path,
-                                  settings.tmnids_sha256, settings.tmnids_timeout)
         self.tor_cache = TorNodeCache(settings.tor_list_url, settings.tor_list_ttl)
         self._run_lock = threading.Lock()   # serialize triggers — clean before/after on stage
-        self._last_run_end = 0.0            # for server-side rate limiting
+        self._last_run_end = 0.0            # rate limiting between runs
 
     def run(self, trigger_id, params):
         trigger = self.by_id.get(trigger_id)
@@ -986,26 +974,27 @@ class App:
         try:
             gap = self.settings.min_run_interval - (time.monotonic() - self._last_run_end)
             if gap > 0:
-                time.sleep(min(gap, 5.0))       # server-side rate limiting (spacing)
+                time.sleep(min(gap, 5.0))       # rate limiting (spacing between runs)
             log.info("run start id=%s", trigger_id)
             if trigger.runner == "iprep":
                 out = self._run_iprep(trigger)
                 log.info("run done id=%s state=%s", trigger_id, out.get("state"))
                 return trigger, out
-            result = run_trigger(trigger, params, self.settings, self.tmnids)
+            result = run_trigger(trigger, params, self.settings)
             state, reason = classify(trigger, result)
-            log.info("run done id=%s state=%s rc=%s dur=%.2fs argv=%s",
-                     trigger_id, state, result.rc, result.duration_s, _redact(result.argv))
+            log.info("run done id=%s state=%s reqs=%d dur=%.2fs",
+                     trigger_id, state, len(result.subs), result.duration_s)
+            first = result.subs[0] if result.subs else None
             return trigger, {
                 "state": state,
                 "reason": reason,
-                "rc": result.rc,
-                "http_code": result.http_code,
+                "rc": (first.rc if first else None),
+                "http_code": (first.http_code if first else None),
                 "duration_s": round(result.duration_s, 3),
                 "expected_fire": trigger.expected_fire,
-                "stdout": _clip(result.stdout, 4000),
-                "stderr": _clip(result.stderr, 4000),
-                "argv": _redact(result.argv),
+                "requests": len(result.subs),
+                "stdout": _clip(_format_subs(result.subs), 6000),
+                "stderr": "",
             }
         finally:
             self._last_run_end = time.monotonic()
@@ -1067,413 +1056,556 @@ def _redact(argv):
     return out
 
 
+def _format_subs(subs):
+    """Render each of a trigger's requests + its outcome for the details pane."""
+    lines = []
+    for i, s in enumerate(subs or [], 1):
+        head = f"[{i}] $ " + " ".join(_redact(s.argv))
+        meta = []
+        if s.rc is not None:
+            meta.append(f"rc={s.rc}")
+        if s.http_code is not None:
+            meta.append(f"http={s.http_code}")
+        if s.ok is not None:
+            meta.append("reached" if s.ok else "no-response")
+        if s.timed_out:
+            meta.append("timed-out")
+        if s.error_reason:
+            meta.append(f"error: {s.error_reason}")
+        if meta:
+            head += "\n      " + "   ".join(meta)
+        probe = _first_line(s.stdout) if s.ok is not None else ""
+        if probe:
+            head += "\n      " + probe
+        err = _first_line(s.stderr)
+        if err:
+            head += "\n      [stderr] " + err
+        lines.append(head)
+    return "\n".join(lines)
+
+
 # ===========================================================================
-# HTTP server (loopback only) + request handler
+# Tkinter console  —  self-contained window (no browser, no local server)
 # ===========================================================================
-def _is_loopback(host):
-    if host in ("localhost", "127.0.0.1", "::1"):
-        return True
+# HPE visual identity mirrored from netvitals: same palette, EKG heartbeat, dark
+# cards. Trigger cards are rendered from the fixed local catalog; a click fires the
+# trigger in-process (App.run on a background thread) and renders the three honest states
+# (allowed / blocked / error, plus the iprep ratio) — blocked is the product win, error is
+# the environment, and the two never collapse.
+GUI_BG = "#1a1d21"
+GUI_SURFACE = "#23272e"
+GUI_PANEL = "#2c313a"
+GUI_PANEL_HI = "#333a44"
+GUI_GRID = "#363b44"
+GUI_INK = "#f2f4f5"
+GUI_DIM = "#9aa3ad"
+GUI_FAINT = "#6f787c"
+GUI_HPE = "#01A982"
+GUI_HPE_DK = "#017a5e"
+GUI_INFO = "#00B0E6"
+GUI_WARN = "#FF8300"
+GUI_CRIT = "#E0574a"
+GUI_GOLD = "#FEC901"
+GUI_FONT = "Segoe UI"
+GUI_MONO = "Consolas"
+
+SEV_COLOR = {"info": GUI_INFO, "warn": GUI_WARN, "crit": GUI_CRIT}
+
+# state -> (foreground, pill text). blocked = product win (green); allowed = traffic
+# passed / detect-only (blue); error = environment, never a false block (red);
+# ratio = N-of-M (blue); invalid = gated off (amber).
+STATE_STYLE = {
+    ALLOWED: (GUI_INFO, "ALLOWED"),
+    BLOCKED: (GUI_HPE, "BLOCKED"),
+    ERROR:   (GUI_CRIT, "ERROR"),
+    INVALID: (GUI_GOLD, "DISABLED"),
+    RATIO:   (GUI_INFO, "RATIO"),
+    "running": (GUI_DIM, "running…"),
+    "idle":  (GUI_FAINT, "not run"),
+}
+CLASS_LABEL = {
+    "ns-ids":   "NORTH-SOUTH · IDS / IPS  (tmNIDS → ECOS Suricata v7)",
+    "ns-webcc": "NORTH-SOUTH · WEB CATEGORIES & REPUTATION  (WebCC / SWG)",
+    "ns-iprep": "NORTH-SOUTH · IP REPUTATION",
+    "ew":       "EAST-WEST",
+}
+
+
+def _draw_logo(cv):
+    """Padlock silhouette (shadow) crossed by an HPE-green EKG pulse — the same mark as
+    the web build's SVG, drawn on a 42x40 canvas."""
+    f = GUI_FAINT
+    cv.create_arc(14, 10, 26, 22, start=0, extent=180, style="arc", outline=f, width=2)  # shackle
+    cv.create_line(14, 16, 14, 21, fill=f, width=2)
+    cv.create_line(26, 16, 26, 21, fill=f, width=2)
+    cv.create_rectangle(10, 20, 30, 35, fill=GUI_PANEL, outline=f, width=1)              # body
+    cv.create_oval(18.5, 25, 21.5, 28, fill=f, outline=f)                                # keyhole
+    cv.create_line(20, 27, 20, 31, fill=f, width=2)
+    cv.create_line(1, 27, 14, 27, 17.5, 16, 22, 34, 25.5, 27, 41, 27,                    # EKG pulse
+                   fill=GUI_HPE, width=2, capstyle="round", joinstyle="round")
+
+
+def _set_window_icon(root):
+    """Give the window — and, on Windows, the taskbar — the lock+EKG icon. The
+    AppUserModelID makes Windows group the app under its OWN taskbar button/icon instead
+    of a generic pythonw one, so Security Vitals and Network Vitals each show their logo."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("HPEAruba.SecurityVitals")
+        except Exception:
+            pass
+        ico = os.path.join(DEFAULT_ASSETS_DIR, "secvitals.ico")
+        try:
+            if os.path.isfile(ico):
+                root.iconbitmap(default=ico)
+        except Exception:                      # non-fatal: a missing/bad icon just falls back
+            pass
+
+
+def _gui_button(parent, text, cmd, primary=False):
+    return tk.Button(parent, text=text, command=cmd,
+                     bg=(GUI_HPE if primary else GUI_PANEL),
+                     fg=("#04120e" if primary else GUI_INK),
+                     activebackground=GUI_HPE_DK, activeforeground="white",
+                     relief="flat", bd=0, highlightthickness=0, padx=14, pady=6,
+                     font=(GUI_FONT, 9, "bold"), cursor="hand2")
+
+
+def run_gui(settings, triggers, app, config_dir=None):
+    """Build and run the console window. Raises RuntimeError when no display is
+    available (headless without Xvfb / no X server)."""
+    global tk
+    import tkinter as tk
+    import queue
+
     try:
-        return socket.inet_aton(host)[0:1] == b"\x7f"   # 127.0.0.0/8
-    except OSError:
-        return False
+        root = tk.Tk()
+    except tk.TclError as e:
+        raise RuntimeError(f"no display available: {e}") from e
+    root.title(f"{APP_NAME} {__version__}")
+    root.geometry("980x700")
+    root.minsize(600, 440)
+    root.configure(bg=GUI_BG)
+    _set_window_icon(root)
 
+    by_id = {t.id: t for t in triggers}
+    cards = {}                                  # trigger id -> widget/var bundle
+    run_state = {"running": False, "stop": False}
+    ui_queue = queue.Queue()                    # background run threads -> main thread ONLY
 
-class Handler(BaseHTTPRequestHandler):
-    server_version = "SecVitals/" + __version__
-    protocol_version = "HTTP/1.1"
-    timeout = 15   # bound a stalled read so a slow client can't pin a daemon thread
-
-    @property
-    def app(self):
-        return self.server.app
-
-    def log_message(self, fmt, *args):
-        log.debug("http %s - %s", self.address_string(), fmt % args)
-
-    # ---- security gates ----
-    def _host_ok(self):
-        host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
-        return _is_loopback(host) if host else False
-
-    def _origin_ok(self):
-        origin = self.headers.get("Origin")
-        if not origin:
-            return True
-        m = re.match(r"^https?://([^/:]+)", origin)
-        return bool(m and _is_loopback(m.group(1)))
-
-    def _token_ok(self):
-        tok = self.headers.get("X-Secvitals-Token", "")
-        return hmac.compare_digest(tok, self.app.token)
-
-    # ---- responses ----
-    def _send(self, code, body, ctype="application/json; charset=utf-8", extra=None, close=False):
-        if isinstance(body, str):
-            body = body.encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Cache-Control", "no-store")
-        # Self-contained page: block any external resource load.
-        self.send_header("Content-Security-Policy",
-                         "default-src 'none'; style-src 'unsafe-inline'; img-src data:; "
-                         "script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'")
-        if close:
-            self.close_connection = True
-            self.send_header("Connection", "close")
-        for k, v in (extra or {}).items():
-            self.send_header(k, v)
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(body)
-
-    def _json(self, code, obj, close=False):
-        self._send(code, json.dumps(obj), "application/json; charset=utf-8", close=close)
-
-    def do_GET(self):
-        if not self._host_ok():
-            return self._json(421, {"error": "bad Host header"})
-        path = self.path.split("?", 1)[0]
-        if path == "/":
-            html = INDEX_HTML.replace("__TOKEN__", self.app.token).replace("__VERSION__", __version__)
-            return self._send(200, html, "text/html; charset=utf-8")
-        if path == "/api/catalog":
-            return self._json(200, {
-                "version": __version__,
-                "enable_live_suspect_hosts": self.app.settings.enable_live_suspect_hosts,
-                "triggers": [t.to_public(self.app.settings) for t in self.app.triggers],
-            })
-        if path == "/api/status":
-            return self._json(200, {"app": APP_NAME, "version": __version__, "ok": True})
-        if path == "/assets/hpe_logo.svg":
-            return self._serve_asset("hpe_logo.svg", "image/svg+xml")
-        return self._json(404, {"error": "not found"})
-
-    def do_HEAD(self):
-        self.do_GET()
-
-    def do_POST(self):
-        path = self.path.split("?", 1)[0]
-        # Always consume the request body first, so an early rejection does not leave
-        # unread bytes that corrupt the next request on a keep-alive connection.
+    def pump():
         try:
-            length = int(self.headers.get("Content-Length", "0") or "0")
-        except ValueError:
-            length = -1
-        if length < 0 or length > 64 * 1024:
-            return self._json(413, {"error": "request body missing or too large"}, close=True)
-        raw = self.rfile.read(length) if length else b""
-        if path != "/api/run":
-            return self._json(404, {"error": "not found"})
-        if not self._host_ok() or not self._origin_ok():
-            return self._json(421, {"error": "request origin not allowed"})
-        if not self._token_ok():
-            return self._json(403, {"error": "missing or invalid session token"})
+            while True:
+                fn = ui_queue.get_nowait()
+                try:
+                    fn()
+                except tk.TclError:
+                    return                       # window went away mid-update
+        except queue.Empty:
+            pass
         try:
-            body = json.loads(raw.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            return self._json(400, {"error": "invalid JSON body"})
-        if not isinstance(body, dict):
-            return self._json(400, {"error": "body must be a JSON object"})
-        trigger_id = body.get("id")
-        params = body.get("params") or {}
-        if not isinstance(trigger_id, str):
-            return self._json(400, {"error": "missing trigger id"})
-        if not isinstance(params, dict):
-            return self._json(400, {"error": "params must be an object"})
-        trigger, result = self.app.run(trigger_id, params)
-        if trigger is None:
-            return self._json(404, result)
-        return self._json(200, result)
+            root.after(80, pump)
+        except tk.TclError:
+            pass
 
-    def _serve_asset(self, name, ctype):
-        path = os.path.join(DEFAULT_ASSETS_DIR, name)
+    def _set_pill(tid, state):
+        c = cards.get(tid)
+        if not c:
+            return
+        fg, text = STATE_STYLE.get(state, (GUI_CRIT, str(state).upper()))
+        c["pill"].configure(text=text, fg=fg)
+        c["pillbox"].configure(highlightbackground=fg)
+
+    def set_result(tid, out):
+        c = cards.get(tid)
+        if not c:
+            return
+        state = out.get("state", ERROR)
+        fg, text = STATE_STYLE.get(state, (GUI_CRIT, str(state).upper()))
+        if state == RATIO:
+            r = out.get("ratio") or {}
+            text = f"{r.get('blocked', '?')}/{r.get('total', '?')} BLOCKED"
+        c["pill"].configure(text=text, fg=fg)
+        c["pillbox"].configure(highlightbackground=fg)
+        c["reason"].configure(text=out.get("reason", ""))
+        c["reason"].pack(anchor="w", fill="x", pady=(6, 0))
+        kv = []
+        if out.get("rc") is not None:
+            kv.append(f"rc={out['rc']}")
+        if out.get("http_code") is not None:
+            kv.append(f"http={out['http_code']}")
+        if out.get("duration_s") is not None:
+            kv.append(f"{out['duration_s']}s")
+        if out.get("requests", 1) > 1:
+            kv.append(f"{out['requests']} requests")
+        c["kv"].configure(text="    ".join(kv))
+        c["detail"] = (out.get("stdout") or "").strip()
+        if c["detail"]:
+            c["detail_btn"].pack(anchor="w", pady=(6, 0))
+        else:
+            c["detail_btn"].pack_forget()
+        c["fire"].configure(state="normal")
+
+    def fire(tid):
+        if run_state["running"]:
+            return
+        t = by_id.get(tid)
+        if t is None:
+            return
+        c = cards.get(tid)
+        if c:
+            c["fire"].configure(state="disabled")
+        _set_pill(tid, "running")
+
+        def work():
+            try:
+                _t, out = app.run(tid, {})
+            except Exception as e:                 # never let a run thread die silently
+                out = {"state": ERROR, "reason": f"{e.__class__.__name__}: {e}"}
+            ui_queue.put(lambda: set_result(tid, out))
+        threading.Thread(target=work, daemon=True).start()
+
+    def run_all_worker(ids):
+        n = len(ids)
+        for i, tid in enumerate(ids):
+            if run_state["stop"]:
+                break
+            try:
+                _t, out = app.run(tid, {})           # App.run rate-limits between runs itself
+            except Exception as e:
+                out = {"state": ERROR, "reason": f"{e.__class__.__name__}: {e}"}
+            ui_queue.put(lambda tid=tid, out=out: set_result(tid, out))
+            ui_queue.put(lambda i=i: status_var.set(f"Run all — {i + 1}/{n}"))
+        ui_queue.put(run_all_done)
+
+    def start_run_all():
+        if run_state["running"]:
+            return
+        ids = [t.id for t in triggers if not by_id[t.id].gated_disabled(settings)]
+        if not ids:
+            return
+        run_state["running"], run_state["stop"] = True, False
+        run_all_btn.pack_forget()
+        stop_btn.pack(side="left", pady=2)
+        for tid in ids:
+            c = cards.get(tid)
+            if c:
+                c["fire"].configure(state="disabled")
+            _set_pill(tid, "running")
+        threading.Thread(target=run_all_worker, args=(ids,), daemon=True).start()
+
+    def run_all_done():
+        run_state["running"] = False
+        stop_btn.pack_forget()
+        run_all_btn.pack(side="left", pady=2)
+        status_var.set("")
+        for tid in cards:
+            if not by_id[tid].gated_disabled(settings):
+                cards[tid]["fire"].configure(state="normal")
+
+    def stop_run_all():
+        run_state["stop"] = True
+        status_var.set("Stopping after the current trigger…")
+
+    # ---- header -----------------------------------------------------------
+    header = tk.Frame(root, bg=GUI_BG, padx=16, pady=12)
+    header.pack(fill="x", side="top")
+    logo = tk.Canvas(header, width=42, height=40, bg=GUI_BG, highlightthickness=0)
+    logo.pack(side="left", padx=(0, 12))
+    _draw_logo(logo)
+    titlebox = tk.Frame(header, bg=GUI_BG)
+    titlebox.pack(side="left", anchor="w")
+    tk.Label(titlebox, text="HPE ARUBA · EDGECONNECT DEMO TOOLBOX", fg=GUI_HPE, bg=GUI_BG,
+             font=(GUI_MONO, 8, "bold")).pack(anchor="w")
+    tk.Label(titlebox, text=APP_NAME, fg=GUI_INK, bg=GUI_BG,
+             font=(GUI_FONT, 20, "bold")).pack(anchor="w")
+    meta = tk.Frame(header, bg=GUI_BG)
+    meta.pack(side="right", anchor="e")
+    tk.Label(meta, text=f"v{__version__}", fg=GUI_DIM, bg=GUI_BG,
+             font=(GUI_MONO, 9)).pack(anchor="e")
+    tk.Label(meta, text=f"native · {'Windows' if sys.platform == 'win32' else sys.platform}",
+             fg=GUI_FAINT, bg=GUI_BG, font=(GUI_MONO, 9)).pack(anchor="e")
+
+    # ---- toolbar ----------------------------------------------------------
+    bar = tk.Frame(root, bg=GUI_BG, padx=16)
+    bar.pack(fill="x")
+    run_all_btn = _gui_button(bar, "▶  Run all enabled", start_run_all, primary=True)
+    run_all_btn.pack(side="left", pady=2)
+    stop_btn = _gui_button(bar, "■  Stop", stop_run_all)          # packed only while running
+    upd_btn = _gui_button(bar, "⟳  Check for updates", lambda: open_update_dialog(root))
+    upd_btn.pack(side="right", pady=2)
+    status_var = tk.StringVar(value="")
+    tk.Label(bar, textvariable=status_var, fg=GUI_DIM, bg=GUI_BG,
+             font=(GUI_MONO, 9)).pack(side="left", padx=14)
+
+    # ---- traffic-path strip ----------------------------------------------
+    path = tk.Frame(root, bg=GUI_BG, padx=16, pady=4)
+    path.pack(fill="x")
+
+    def node(text, sensor=False):
+        return tk.Label(path, text=text, fg=(GUI_HPE if sensor else GUI_DIM), bg=GUI_PANEL,
+                        font=(GUI_MONO, 8), padx=8, pady=3,
+                        highlightbackground=(GUI_HPE if sensor else GUI_GRID), highlightthickness=1)
+
+    node("Source · this host").pack(side="left")
+    tk.Label(path, text="→", fg=GUI_FAINT, bg=GUI_BG).pack(side="left", padx=5)
+    node("EdgeConnect · Suricata v7 / WebCC", sensor=True).pack(side="left")
+    tk.Label(path, text="→", fg=GUI_FAINT, bg=GUI_BG).pack(side="left", padx=5)
+    node("Internet").pack(side="left")
+    tk.Label(path, text="   verify on the Orchestrator / EC dashboard — this console polls no API",
+             fg=GUI_FAINT, bg=GUI_BG, font=(GUI_FONT, 9)).pack(side="left", padx=8)
+
+    # ---- live-infrastructure gate notice ---------------------------------
+    gated = [t for t in triggers if t.gated_disabled(settings)]
+    if gated:
+        tk.Label(root, bg=GUI_SURFACE, fg=GUI_DIM, justify="left", anchor="w",
+                 font=(GUI_FONT, 9), padx=12, pady=8, wraplength=920,
+                 highlightbackground=GUI_WARN, highlightthickness=1,
+                 text=(f"{len(gated)} trigger(s) reach LIVE suspect infrastructure / live Tor nodes and "
+                       "are disabled (enable_live_suspect_hosts is false in settings.yaml). Enable only "
+                       "in a lab you control.")).pack(fill="x", padx=16, pady=(6, 0))
+
+    # ---- scrollable card area --------------------------------------------
+    body = tk.Frame(root, bg=GUI_BG)
+    body.pack(fill="both", expand=True, padx=8, pady=(8, 8))
+    scroll = tk.Canvas(body, bg=GUI_BG, highlightthickness=0)
+    vbar = tk.Scrollbar(body, orient="vertical", command=scroll.yview)
+    inner = tk.Frame(scroll, bg=GUI_BG)
+    inner_id = scroll.create_window((0, 0), window=inner, anchor="nw")
+    scroll.configure(yscrollcommand=vbar.set)
+    scroll.pack(side="left", fill="both", expand=True)
+    vbar.pack(side="right", fill="y")
+    inner.bind("<Configure>", lambda e: scroll.configure(scrollregion=scroll.bbox("all")))
+    scroll.bind("<Configure>", lambda e: scroll.itemconfigure(inner_id, width=e.width))
+    scroll.bind_all("<MouseWheel>", lambda e: scroll.yview_scroll(int(-1 * (e.delta / 120)) if e.delta else 0, "units"))
+    scroll.bind_all("<Button-4>", lambda e: scroll.yview_scroll(-1, "units"))
+    scroll.bind_all("<Button-5>", lambda e: scroll.yview_scroll(1, "units"))
+
+    def build_card(t):
+        disabled = t.gated_disabled(settings)
+        wrap = tk.Frame(inner, bg=GUI_GRID)                       # 1px border via padding
+        wrap.pack(fill="x", padx=8, pady=5)
+        row = tk.Frame(wrap, bg=GUI_SURFACE)
+        row.pack(fill="x", padx=1, pady=1)
+        accent = tk.Frame(row, bg=SEV_COLOR.get(t.severity, GUI_FAINT), width=3)
+        accent.pack(side="left", fill="y")
+        card = tk.Frame(row, bg=GUI_SURFACE, padx=14, pady=12)
+        card.pack(side="left", fill="both", expand=True)
+
+        top = tk.Frame(card, bg=GUI_SURFACE)
+        top.pack(fill="x")
+        tk.Label(top, text=t.label, fg=(GUI_FAINT if disabled else GUI_INK), bg=GUI_SURFACE,
+                 font=(GUI_FONT, 12, "bold"), anchor="w", justify="left").pack(side="left")
+
+        pillbox = tk.Frame(top, bg=GUI_SURFACE, highlightbackground=GUI_FAINT, highlightthickness=1)
+        pillbox.pack(side="right")
+        pill = tk.Label(pillbox, text="not run", fg=GUI_FAINT, bg=GUI_SURFACE,
+                        font=(GUI_MONO, 9, "bold"), padx=8, pady=2)
+        pill.pack()
+
+        chips = tk.Frame(card, bg=GUI_SURFACE)
+        chips.pack(fill="x", pady=(6, 0))
+
+        def chip(text, fg, bd):
+            tk.Label(chips, text=text, fg=fg, bg=GUI_SURFACE, font=(GUI_MONO, 8),
+                     padx=6, pady=1, highlightbackground=bd, highlightthickness=1).pack(side="left", padx=(0, 5))
+
+        chip(t.cls, GUI_HPE, GUI_HPE_DK)
+        if t.threat_class:
+            chip(t.threat_class, GUI_DIM, GUI_GRID)
+        chip(t.severity, SEV_COLOR.get(t.severity, GUI_DIM), SEV_COLOR.get(t.severity, GUI_GRID))
+        if "hits_live_suspect_hosts" in t.flags:
+            chip("LIVE", GUI_WARN, GUI_WARN)
+
+        if t.expected_fire:
+            tk.Label(card, text=t.expected_fire, fg=GUI_DIM, bg=GUI_SURFACE, font=(GUI_MONO, 9),
+                     anchor="w", justify="left", wraplength=820).pack(fill="x", pady=(8, 0))
+        if t.talking_point:
+            tk.Label(card, text=t.talking_point, fg=GUI_FAINT, bg=GUI_SURFACE, font=(GUI_FONT, 9),
+                     anchor="w", justify="left", wraplength=820).pack(fill="x", pady=(4, 0))
+
+        actions = tk.Frame(card, bg=GUI_SURFACE)
+        actions.pack(fill="x", pady=(10, 0))
+        fire_btn = _gui_button(actions, "Fire", lambda tid=t.id: fire(tid), primary=True)
+        if disabled:
+            fire_btn.configure(state="disabled", text="Disabled (live)")
+        fire_btn.pack(side="left")
+        kv = tk.Label(actions, text="", fg=GUI_DIM, bg=GUI_SURFACE, font=(GUI_MONO, 9))
+        kv.pack(side="left", padx=12)
+
+        reason = tk.Label(card, text="", fg=GUI_INK, bg=GUI_SURFACE, font=(GUI_FONT, 9),
+                          anchor="w", justify="left", wraplength=860)
+
+        detail_state = {"open": False}
+        detail_btn = tk.Label(card, text="▸ details", fg=GUI_FAINT, bg=GUI_SURFACE,
+                              font=(GUI_MONO, 9), cursor="hand2")
+        detail_txt = tk.Text(card, height=8, bg=GUI_BG, fg=GUI_INK, insertbackground=GUI_INK,
+                             font=(GUI_MONO, 9), relief="flat", highlightthickness=1,
+                             highlightbackground=GUI_GRID, wrap="word", padx=8, pady=6)
+
+        def toggle_detail(_e=None):
+            detail_state["open"] = not detail_state["open"]
+            if detail_state["open"]:
+                detail_txt.configure(state="normal")
+                detail_txt.delete("1.0", "end")
+                detail_txt.insert("1.0", cards[t.id].get("detail", "") or "(no output)")
+                detail_txt.configure(state="disabled")
+                detail_txt.pack(fill="x", pady=(6, 0))
+                detail_btn.configure(text="▾ details")
+            else:
+                detail_txt.pack_forget()
+                detail_btn.configure(text="▸ details")
+        detail_btn.bind("<Button-1>", toggle_detail)
+
+        if disabled:
+            reason.configure(text=("Reaches live suspect infrastructure — enable "
+                                   "enable_live_suspect_hosts in a controlled lab to run it."),
+                             fg=GUI_GOLD)
+            reason.pack(anchor="w", fill="x", pady=(6, 0))
+            pill.configure(text="DISABLED", fg=GUI_GOLD)
+            pillbox.configure(highlightbackground=GUI_GOLD)
+
+        cards[t.id] = {"pill": pill, "pillbox": pillbox, "reason": reason, "kv": kv,
+                       "fire": fire_btn, "detail_btn": detail_btn, "detail": ""}
+
+    order, seen = [], set()
+    for t in triggers:
+        if t.cls not in seen:
+            seen.add(t.cls)
+            order.append(t.cls)
+    for cls in order:
+        tk.Label(inner, text=CLASS_LABEL.get(cls, cls), fg=GUI_HPE, bg=GUI_BG,
+                 font=(GUI_MONO, 9, "bold")).pack(anchor="w", padx=10, pady=(14, 2))
+        for t in [x for x in triggers if x.cls == cls]:
+            build_card(t)
+
+    def on_close():
+        run_state["stop"] = True
         try:
-            with open(path, "rb") as fh:
-                data = fh.read()
-        except OSError:
-            return self._json(404, {"error": "asset not found"})
-        return self._send(200, data, ctype)
+            root.destroy()
+        except tk.TclError:
+            pass
+    root.protocol("WM_DELETE_WINDOW", on_close)
+
+    pump()
+    if os.environ.get("SECV_RENDER_ONCE"):        # headless smoke/CI test: lay out, then exit
+        shot = os.environ.get("SECV_SHOT")
+
+        def _finish():
+            if shot:
+                try:
+                    subprocess.run(["scrot", "-o", shot], timeout=10)
+                except Exception:                 # screenshot is best-effort only
+                    pass
+            root.destroy()
+        # Optionally exercise the whole fire -> run_trigger -> set_result path in the real
+        # window (catches result-rendering bugs a static layout pass can't).
+        if os.environ.get("SECV_SELFTEST_FIRE"):
+            for t in triggers:
+                if not t.gated_disabled(settings):
+                    root.after(200, lambda tid=t.id: fire(tid))
+                    break
+        root.update_idletasks()
+        root.update()
+        root.after(int(os.environ.get("SECV_RENDER_MS", "300")), _finish)
+    root.mainloop()
 
 
-def make_server(app):
-    httpd = ThreadingHTTPServer((app.settings.host, app.settings.port), Handler)
-    httpd.app = app
-    httpd.daemon_threads = True
-    return httpd
+def open_update_dialog(root):
+    """Check for / install a signed update from the console. The network is touched only
+    after the user opens this dialog — the app never checks on its own. Verification (RSA
+    signature over the manifest + SHA-256 of the artifact) fails closed on any problem."""
+    existing = getattr(root, "_secv_update_dialog", None)
+    if existing is not None:
+        try:
+            if existing.winfo_exists():
+                existing.lift()
+                existing.focus_set()
+                return
+        except tk.TclError:
+            pass
 
+    dlg = tk.Toplevel(root)
+    root._secv_update_dialog = dlg
+    dlg.title(f"{APP_NAME} update")
+    dlg.configure(bg=GUI_BG, padx=18, pady=14)
+    dlg.resizable(False, False)
+    dlg.transient(root)
 
-# ===========================================================================
-# Embedded web UI (self-contained; HPE visual identity reused from netvitals)
-# ===========================================================================
-INDEX_HTML = r"""<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Security Vitals</title>
-<style>
-:root{
-  --bg:#1a1d21; --surface:#23272e; --panel:#2c313a; --grid:#363b44;
-  --ink:#f2f4f5; --dim:#9aa3ad; --faint:#6f787c;
-  --hpe:#01A982; --hpe-dk:#017a5e;
-  --info:#00B0E6; --warn:#FF8300; --crit:#E0574a; --gold:#FEC901;
-  --shadow:0 1px 2px rgba(0,0,0,.3),0 10px 30px rgba(0,0,0,.35);
-  --mono:ui-monospace,"Cascadia Code","SF Mono",Consolas,monospace;
-}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--ink);
-  font-family:"Segoe UI",system-ui,-apple-system,Roboto,Helvetica,Arial,sans-serif;
-  font-size:15px;line-height:1.5;padding:clamp(14px,3vw,34px)}
-.wrap{max-width:1100px;margin:0 auto}
-a{color:var(--hpe)}
-.eyebrow{font:600 11px/1 var(--mono);letter-spacing:.18em;text-transform:uppercase;color:var(--hpe)}
-header.head{display:flex;align-items:center;gap:16px;padding-bottom:16px;border-bottom:2px solid var(--grid)}
-.logo{width:40px;height:40px;flex:none;display:grid;place-items:center;color:var(--hpe)}
-.logo svg{width:100%;height:100%}
-h1{margin:.2em 0 0;font-size:clamp(20px,3vw,28px);font-weight:800;letter-spacing:-.01em}
-.head .meta{margin-left:auto;text-align:right;color:var(--dim);font:12px/1.5 var(--mono)}
-.path{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:16px 0 6px;font-size:12.5px;color:var(--dim)}
-.node{background:var(--panel);border:1px solid var(--grid);border-radius:8px;padding:6px 10px}
-.node.sensor{border-color:var(--hpe);box-shadow:inset 0 0 0 1px var(--hpe)}
-.arrow{color:var(--faint);font-weight:700}
-.notice{margin:14px 0;padding:11px 14px;border-radius:10px;border:1px solid var(--grid);
-  background:var(--surface);color:var(--dim);font-size:13px}
-.notice b{color:var(--ink)}
-.notice.live{border-color:var(--warn)}
-.toolbar{display:flex;align-items:center;gap:12px;margin:16px 0 4px;flex-wrap:wrap}
-.toolbar .kv{color:var(--dim)}
-button.ghost{appearance:none;border:1px solid var(--grid);border-radius:8px;background:var(--panel);
-  color:var(--ink);font:700 13px/1 "Segoe UI",sans-serif;padding:9px 16px;cursor:pointer}
-button.ghost:hover{border-color:var(--hpe)}
-button.ghost:disabled{color:var(--faint);cursor:not-allowed}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px;margin-top:14px}
-.card{background:var(--surface);border:1px solid var(--grid);border-radius:12px;padding:15px 16px;
-  box-shadow:var(--shadow);border-left:3px solid var(--faint);display:flex;flex-direction:column;gap:9px}
-.card.sev-info{border-left-color:var(--info)} .card.sev-warn{border-left-color:var(--warn)} .card.sev-crit{border-left-color:var(--crit)}
-.card.disabled{opacity:.62}
-.card h3{margin:0;font-size:15.5px}
-.chips{display:flex;flex-wrap:wrap;gap:6px}
-.chip{font:600 10.5px/1.4 var(--mono);padding:2px 8px;border-radius:999px;border:1px solid var(--grid);color:var(--dim);white-space:nowrap}
-.chip.cls{color:var(--hpe);border-color:var(--hpe-dk)}
-.chip.flag-live{color:var(--warn);border-color:var(--warn)}
-.fire-row{font-size:12.5px;color:var(--dim)}
-.fire-row .sid{color:var(--hpe);font-family:var(--mono);font-weight:700}
-.talk{font-size:12.5px;color:var(--faint)}
-.actions{display:flex;align-items:center;gap:10px;margin-top:2px}
-button.fire{appearance:none;border:0;border-radius:8px;background:var(--hpe);color:#04120e;
-  font:700 13px/1 "Segoe UI",sans-serif;padding:9px 16px;cursor:pointer}
-button.fire:hover{background:var(--hpe-dk);color:#eafff8}
-button.fire:disabled{background:var(--panel);color:var(--faint);cursor:not-allowed}
-.state{font:700 12px/1 var(--mono);padding:6px 10px;border-radius:7px;letter-spacing:.02em;white-space:nowrap}
-.state.allowed{background:rgba(0,176,230,.14);color:var(--info);border:1px solid var(--info)}
-.state.blocked{background:rgba(1,169,130,.16);color:var(--hpe);border:1px solid var(--hpe)}
-.state.error{background:rgba(224,87,74,.16);color:var(--crit);border:1px solid var(--crit)}
-.state.invalid{background:rgba(254,201,1,.14);color:var(--gold);border:1px solid var(--gold)}
-.state.ratio{background:rgba(0,176,230,.12);color:var(--info);border:1px solid var(--info)}
-.state.running{background:var(--panel);color:var(--dim);border:1px solid var(--grid)}
-.notice.webcc{border-color:var(--info)}
-.result{font-size:12.5px;color:var(--dim);border-top:1px dashed var(--grid);padding-top:9px;display:none}
-.result.show{display:block}
-.result .reason{color:var(--ink);margin-bottom:6px}
-details{margin-top:6px}
-summary{cursor:pointer;color:var(--faint);font-size:12px}
-pre{background:var(--bg);border:1px solid var(--grid);border-radius:7px;padding:8px;overflow:auto;
-  max-height:200px;font:12px/1.45 var(--mono);color:var(--ink);white-space:pre-wrap;word-break:break-word}
-.kv{font-family:var(--mono);font-size:11.5px;color:var(--dim)}
-footer{margin-top:26px;padding-top:12px;border-top:1px solid var(--grid);color:var(--faint);font:12px/1.5 var(--mono)}
-</style></head>
-<body><div class="wrap">
-  <header class="head">
-    <div class="logo" aria-hidden="true"><svg viewBox="0 0 40 40" fill="none">
-      <g opacity="0.95">
-        <path d="M14.5 20 v-4 a5.5 5.5 0 0 1 11 0 v4" stroke="var(--faint)" stroke-width="2.2" stroke-linecap="round"/>
-        <rect x="10.5" y="20" width="19" height="15" rx="3.5" fill="var(--panel)" stroke="var(--faint)" stroke-width="1.5"/>
-        <circle cx="20" cy="26.4" r="1.6" fill="var(--faint)"/>
-        <rect x="19.3" y="26.9" width="1.4" height="3.6" rx="0.7" fill="var(--faint)"/>
-      </g>
-      <path d="M1 27 H14 L17.5 16 L22 34 L25.5 27 H39" stroke="var(--hpe)" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round"/>
-    </svg></div>
-    <div>
-      <div class="eyebrow">HPE Aruba · EdgeConnect demo toolbox</div>
-      <h1>Security Vitals</h1>
-    </div>
-    <div class="meta">v__VERSION__<br><span id="path-src">Windows + WSL</span></div>
-  </header>
+    tk.Label(dlg, text=f"Installed version: {__version__}", fg=GUI_INK, bg=GUI_BG,
+             font=(GUI_FONT, 11, "bold")).pack(anchor="w")
+    status_var = tk.StringVar(value="Checking …")
+    tk.Label(dlg, textvariable=status_var, fg=GUI_DIM, bg=GUI_BG, font=(GUI_FONT, 10),
+             wraplength=440, justify="left").pack(anchor="w", pady=(6, 12))
 
-  <div class="path">
-    <span class="node">Source · WSL</span><span class="arrow">→</span>
-    <span class="node sensor">EdgeConnect · Suricata v7 / WebCC</span><span class="arrow">→</span>
-    <span class="node">Internet</span>
-    <span style="margin-left:8px">verify on the Orchestrator / EC dashboard — this console polls no API</span>
-  </div>
+    btns = tk.Frame(dlg, bg=GUI_BG)
+    btns.pack(anchor="e", fill="x")
+    state = {"manifest": None, "vstr": None}
+    outcome = {}
 
-  <div id="live-notice" class="notice" style="display:none"></div>
-  <div id="webcc-notice" class="notice webcc" style="display:none"></div>
+    def check_worker():
+        try:
+            m = check_update()
+            outcome["check"] = ("uptodate", __version__) if m is None else ("available", m)
+        except Exception as e:
+            outcome["check"] = ("error", str(e) or e.__class__.__name__)
 
-  <div class="toolbar">
-    <button id="run-all" class="ghost">Run all enabled</button>
-    <button id="stop-all" class="ghost" style="display:none">Stop</button>
-    <span id="run-all-status" class="kv"></span>
-  </div>
+    def install_worker():
+        try:
+            download_and_install(state["manifest"])
+            outcome["install"] = ("done", None)
+        except Exception as e:
+            outcome["install"] = ("error", str(e) or e.__class__.__name__)
 
-  <div id="grid" class="grid" aria-live="polite"></div>
-  <p id="empty" style="color:var(--dim)"></p>
+    def do_check():
+        check_btn.configure(state="disabled")
+        install_btn.pack_forget()
+        status_var.set("Checking the pinned, signed release source …")
+        threading.Thread(target=check_worker, daemon=True).start()
 
-  <footer>
-    tmNIDS © 3CORESec · SIDs = Emerging Threats / GPL rulesets ·
-    <span id="foot-state">loading…</span>
-  </footer>
-</div>
-<script>
-const TOKEN = "__TOKEN__";
-const REG = [];                 // [{t, card, btn, state, res}]
-let stopFlag = false;
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-const el = (t, c, txt) => { const e = document.createElement(t); if (c) e.className = c; if (txt != null) e.textContent = txt; return e; };
-const fmt = v => (v==null? "—" : v);
+    def do_install():
+        install_btn.configure(state="disabled")
+        check_btn.configure(state="disabled")
+        status_var.set("Downloading and verifying …")
+        threading.Thread(target=install_worker, daemon=True).start()
 
-async function loadCatalog(){
-  const r = await fetch("/api/catalog", {headers:{"Accept":"application/json"}});
-  const data = await r.json();
-  const enabledCount = data.triggers.filter(t => !t.gated_disabled).length;
-  document.getElementById("foot-state").textContent =
-    "catalog " + data.triggers.length + " trigger(s) · live-suspect hosts " +
-    (data.enable_live_suspect_hosts ? "ENABLED" : "disabled");
-  const ln = document.getElementById("live-notice");
-  if (!data.enable_live_suspect_hosts){
-    ln.style.display = "block"; ln.className = "notice";
-    ln.innerHTML = "<b>Live suspect-infrastructure triggers are disabled.</b> " +
-      "Triggers that reach real suspect hosts / live Tor nodes are greyed out. " +
-      "Set <span class='kv'>enable_live_suspect_hosts: true</span> in config/settings.yaml to run them in a lab.";
-  }
-  const wn = document.getElementById("webcc-notice");
-  if (data.triggers.some(t => t.class === "ns-webcc" || t.class === "ns-iprep")){
-    wn.style.display = "block";
-    wn.innerHTML = "<b>WebCC / IP reputation:</b> EdgeConnect denies by <b>silently dropping the flow</b> " +
-      "— there is no block page, so a deny shows as a timeout/reset. <b>Prerequisite:</b> the category or " +
-      "reputation must be set to <b>Deny</b> in policy for a test to block; an <i>allowed</i> result most " +
-      "often means the policy isn't set, not that enforcement failed.";
-  }
-  const grid = document.getElementById("grid");
-  grid.innerHTML = ""; REG.length = 0;
-  for (const t of data.triggers) grid.appendChild(card(t));
+    check_btn = _gui_button(btns, "Check again", do_check)
+    install_btn = _gui_button(btns, "Install", do_install, primary=True)
+    close_btn = _gui_button(btns, "Close", dlg.destroy)
+    close_btn.pack(side="right")
+    check_btn.pack(side="right", padx=(0, 6))
 
-  const runBtn = document.getElementById("run-all");
-  runBtn.textContent = "Run all enabled (" + enabledCount + ")";
-  runBtn.disabled = enabledCount === 0;
-  runBtn.addEventListener("click", runAll);
-  document.getElementById("stop-all").addEventListener("click", () => { stopFlag = true; });
-}
+    def poll():
+        if "check" in outcome:
+            kind, val = outcome.pop("check")
+            check_btn.configure(state="normal")
+            if kind == "uptodate":
+                status_var.set(f"You're on the latest version ({val}).")
+            elif kind == "available":
+                state["manifest"], state["vstr"] = val, val["version"]
+                status_var.set(f"Version {state['vstr']} is available — signature verified. "
+                               "Install swaps this file (previous kept as .bak).")
+                install_btn.configure(state="normal")
+                install_btn.pack(side="right", padx=(0, 6))
+            else:
+                status_var.set(f"Update check failed: {val}")
+        if "install" in outcome:
+            kind, val = outcome.pop("install")
+            if kind == "done":
+                status_var.set(f"Updated to {state['vstr']}. Restart {APP_NAME} to run the new version.")
+                install_btn.pack_forget()
+                return
+            status_var.set(f"Install failed: {val}")
+            check_btn.configure(state="normal")
+            install_btn.configure(state="normal")
+        try:
+            dlg.after(150, poll)
+        except tk.TclError:
+            pass
 
-function card(t){
-  const c = el("div", "card sev-" + (t.severity||"info"));
-  if (t.gated_disabled) c.classList.add("disabled");
-  c.appendChild(el("h3", null, t.label));
-  const chips = el("div", "chips");
-  chips.appendChild(el("span", "chip cls", t.class));
-  for (const f of (t.flags||[])){
-    const live = f === "hits_live_suspect_hosts";
-    chips.appendChild(el("span", "chip" + (live ? " flag-live" : ""), f.replace(/_/g," ")));
-  }
-  c.appendChild(chips);
-  if (t.expected_fire){
-    const fr = el("div", "fire-row"); fr.innerHTML = "Expect: <span class='sid'></span>";
-    fr.querySelector(".sid").textContent = t.expected_fire; c.appendChild(fr);
-  }
-  if (t.talking_point) c.appendChild(el("div", "talk", t.talking_point));
-
-  const actions = el("div", "actions");
-  const btn = el("button", "fire", t.gated_disabled ? "Disabled" : "Fire trigger");
-  btn.disabled = !!t.gated_disabled;
-  const state = el("span", "state", ""); state.style.display = "none";
-  actions.appendChild(btn); actions.appendChild(state);
-  c.appendChild(actions);
-  const res = el("div", "result");
-  c.appendChild(res);
-
-  const entry = {t, card: c, btn, state, res};
-  REG.push(entry);
-  btn.addEventListener("click", () => runOne(entry));
-  return c;
-}
-
-async function runOne(entry){
-  const {t, btn, state, res} = entry;
-  btn.disabled = true;
-  state.style.display = ""; state.className = "state running"; state.textContent = "running…";
-  res.className = "result";
-  try{
-    const r = await fetch("/api/run", {
-      method:"POST",
-      headers:{"Content-Type":"application/json","X-Secvitals-Token":TOKEN},
-      body: JSON.stringify({id: t.id})
-    });
-    const d = await r.json();
-    render(d, state, res);
-    return d.state;
-  }catch(e){
-    state.className = "state error"; state.textContent = "error";
-    res.className = "result show"; res.textContent = "request failed: " + e;
-    return "error";
-  }finally{
-    btn.disabled = !!t.gated_disabled;
-  }
-}
-
-async function runAll(){
-  const runBtn = document.getElementById("run-all");
-  const stopBtn = document.getElementById("stop-all");
-  const status = document.getElementById("run-all-status");
-  const enabled = REG.filter(e => !e.t.gated_disabled);
-  if (!enabled.length) return;
-  stopFlag = false;
-  runBtn.disabled = true; stopBtn.style.display = "";
-  const tally = {allowed:0, blocked:0, error:0, invalid:0};
-  let i = 0;
-  for (const e of enabled){
-    if (stopFlag){ status.textContent = "stopped after " + i + "/" + enabled.length; break; }
-    i++;
-    status.textContent = "running " + i + "/" + enabled.length + ": " + e.t.label;
-    e.card.scrollIntoView({block:"nearest", behavior:"smooth"});
-    const s = await runOne(e);
-    tally[s] = (tally[s]||0) + 1;
-    if (i < enabled.length && !stopFlag) await sleep(500);   // client pacing; server also spaces
-  }
-  if (!stopFlag)
-    status.textContent = "done — " + tally.allowed + " allowed · " + tally.blocked + " blocked · " + tally.error + " error";
-  runBtn.disabled = false; stopBtn.style.display = "none";
-}
-
-function render(d, state, res){
-  const s = d.state || "error";
-  const labels = {allowed:"sent · allowed", blocked:"sent · blocked", error:"error", invalid:"invalid"};
-  if (s === "ratio" && d.ratio){
-    state.className = "state ratio";
-    state.textContent = d.ratio.blocked + " / " + d.ratio.total + " blocked";
-  } else {
-    state.className = "state " + s; state.textContent = labels[s] || s;
-  }
-  res.className = "result show";
-  res.innerHTML = "";
-  res.appendChild(el("div", "reason", d.reason || ""));
-  const kv = el("div", "kv",
-    ["rc=" + fmt(d.rc), d.http_code!=null?("http="+d.http_code):null,
-     d.duration_s!=null?(d.duration_s+"s"):null].filter(Boolean).join("   "));
-  res.appendChild(kv);
-  if (d.argv){ res.appendChild(detail("argv", d.argv.join(" "))); }
-  if (d.stdout){ res.appendChild(detail("stdout", d.stdout)); }
-  if (d.stderr){ res.appendChild(detail("stderr", d.stderr)); }
-}
-function detail(label, text){
-  const dt = el("details"); dt.appendChild(el("summary", null, label));
-  dt.appendChild(el("pre", null, text)); return dt;
-}
-
-loadCatalog().catch(e => { document.getElementById("empty").textContent = "failed to load catalog: " + e; });
-</script>
-</body></html>
-"""
+    do_check()
+    poll()
 
 
 # ===========================================================================
@@ -1563,6 +1695,65 @@ def verify_rsa_sha256(pubkey_pem, message, signature):
     return hmac.compare_digest(em, expected)
 
 
+def _is_cert_error(exc):
+    """True when exc is (or wraps) an SSL certificate-verification failure — the
+    'unable to get local issuer certificate' class behind TLS-inspecting proxies."""
+    import ssl
+    candidates = (exc, getattr(exc, "reason", None), exc.__cause__)
+    return any(isinstance(c, ssl.SSLCertVerificationError) for c in candidates if c is not None)
+
+
+def _download_via_windows_tls(url, timeout, max_bytes, _curl=None, _ps="powershell"):
+    """Fetch `url` with tools that validate TLS through Windows SChannel: curl.exe
+    (Windows 10 1803+), then PowerShell. Python's OpenSSL fails with 'unable to get
+    local issuer certificate' behind a corporate TLS-inspecting proxy whose root lives
+    only in the Windows store — routing the download through curl/PowerShell applies the
+    SAME trust decisions as Edge, so verification stays ON. Returns raw bytes."""
+    import tempfile
+    creation = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    errors = []
+    if _curl is None:
+        _curl = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "curl.exe")
+        if not os.path.exists(_curl):
+            _curl = "curl.exe"
+    try:
+        out = subprocess.run(
+            [_curl, "-sSfL", "--proto", "=https", "--proto-redir", "=https",
+             "--max-time", str(int(timeout) * 2), url],
+            capture_output=True, creationflags=creation, timeout=timeout * 4)
+        if out.returncode == 0 and out.stdout:
+            return out.stdout[:max_bytes + 1]
+        errors.append("curl: " + (out.stderr or b"").decode("utf-8", "replace").strip())
+    except (OSError, subprocess.TimeoutExpired) as e:
+        errors.append(f"curl: {e}")
+
+    tmp = tempfile.NamedTemporaryFile(prefix="secv-update-", delete=False)
+    tmp.close()
+    env = dict(os.environ, SECV_UPDATE_URL=url, SECV_UPDATE_OUT=tmp.name)
+    try:
+        out = subprocess.run(
+            [_ps, "-NoProfile", "-NonInteractive", "-Command",
+             "$ProgressPreference = 'SilentlyContinue'; "
+             "[Net.ServicePointManager]::SecurityProtocol = "
+             "[Net.ServicePointManager]::SecurityProtocol -bor 3072; "
+             "Invoke-WebRequest -UseBasicParsing -Uri $env:SECV_UPDATE_URL "
+             "-OutFile $env:SECV_UPDATE_OUT"],
+            capture_output=True, creationflags=creation, env=env, timeout=timeout * 4)
+        if out.returncode == 0:
+            with open(tmp.name, "rb") as fh:
+                data = fh.read(max_bytes + 1)
+            if data:
+                return data
+            errors.append("powershell: empty download")
+        else:
+            errors.append("powershell: " + (out.stderr or b"").decode("utf-8", "replace").strip())
+    except (OSError, subprocess.TimeoutExpired) as e:
+        errors.append(f"powershell: {e}")
+    finally:
+        _quiet_remove(tmp.name)
+    raise UpdateError("; ".join(errors) or "no downloader available")
+
+
 def _update_http_get(url, timeout, max_bytes):
     req = urllib.request.Request(url, headers={"User-Agent": "secvitals/%s" % __version__})
     try:
@@ -1572,7 +1763,17 @@ def _update_http_get(url, timeout, max_bytes):
                 raise UpdateError(f"refusing redirect to insecure URL {final}")
             data = resp.read(max_bytes + 1)
     except (urllib.error.URLError, OSError) as e:
-        raise UpdateError(f"download failed: {e}") from e
+        # Behind a TLS-inspecting proxy Python's own trust chain fails; on Windows retry
+        # through the system certificate store (curl/PowerShell). Verification stays on.
+        if _is_cert_error(e) and sys.platform == "win32" and url.lower().startswith("https:"):
+            data = _download_via_windows_tls(url, timeout, max_bytes)
+        else:
+            msg = f"download failed: {e}"
+            if _is_cert_error(e):
+                msg += (" — certificate verification failed (a TLS-inspecting proxy whose "
+                        "root Python doesn't trust; on Windows the updater retries through "
+                        "the system certificate store automatically)")
+            raise UpdateError(msg) from e
     if len(data) > max_bytes:
         raise UpdateError("response larger than expected — refusing")
     return data
@@ -1642,7 +1843,9 @@ def download_and_install(manifest, manifest_url=UPDATE_MANIFEST_URL, pubkey=UPDA
     if "SecVitals" not in text and "Security Vitals" not in text:
         raise UpdateError("artifact does not look like Security Vitals — refusing")
 
-    target = target or os.path.abspath(__file__)
+    target = target or _THIS_FILE
+    if not target:
+        raise UpdateError("can't locate the installed file to update — run the update from the install folder")
     tmp, backup = target + ".new", target + ".bak"
     try:
         with open(target, "rb") as fh:
@@ -1700,8 +1903,6 @@ def parse_args(argv):
     p = argparse.ArgumentParser(prog="secvitals", description=APP_NAME)
     p.add_argument("--config-dir", default=DEFAULT_CONFIG_DIR,
                    help="directory holding settings.yaml and catalog.yaml")
-    p.add_argument("--port", type=int, default=None, help="override the listen port (loopback only)")
-    p.add_argument("--no-browser", action="store_true", help="do not try to open a browser")
     p.add_argument("--verbose", action="store_true", help="debug logging")
     p.add_argument("--check-update", action="store_true",
                    help="check the pinned, signed release source for a newer version and exit")
@@ -1712,7 +1913,7 @@ def parse_args(argv):
 
 
 def main(argv=None):
-    args = parse_args(argv)
+    args = parse_args(list(sys.argv[1:]) if argv is None else list(argv))
     setup_logging(args.verbose)
 
     if args.check_update or args.update:
@@ -1721,39 +1922,21 @@ def main(argv=None):
 
     try:
         settings = load_settings(args.config_dir)
-        if args.port is not None:
-            settings.raw.setdefault("server", {})["port"] = args.port
         triggers = load_catalog(args.config_dir, settings)
     except ConfigError as e:
         log.error("configuration error: %s", e)
         return 2
 
-    if not _is_loopback(settings.host):
-        log.error("refusing to bind non-loopback host %r — this app is not a LAN service", settings.host)
-        return 2
-
     app = App(settings, triggers, args.config_dir)
+    log.info("%s %s — %d triggers, native execution on %s",
+             APP_NAME, __version__, len(triggers), sys.platform)
     try:
-        httpd = make_server(app)
-    except OSError as e:
-        log.error("could not bind %s:%s — %s", settings.host, settings.port, e)
+        run_gui(settings, triggers, app, args.config_dir)
+    except RuntimeError as e:
+        log.error("%s", e)
+        print(f"{APP_NAME} is a desktop app and needs a display.\n"
+              "On Windows run it with pythonw/py; under headless Linux use Xvfb.", file=sys.stderr)
         return 2
-
-    url = f"http://{settings.host}:{settings.port}/"
-    log.info("%s %s serving on %s (%d triggers)", APP_NAME, __version__, url, len(triggers))
-    print(f"\n  {APP_NAME} {__version__}")
-    print(f"  Open in the Windows browser:  {url}\n")
-    if settings.open_browser and not args.no_browser:
-        try:
-            webbrowser.open(url)
-        except Exception as e:  # webbrowser can raise on headless WSL — never fatal
-            log.debug("could not open a browser automatically: %s", e)
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        log.info("shutting down")
-    finally:
-        httpd.server_close()
     return 0
 
 

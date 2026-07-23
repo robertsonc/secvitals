@@ -4,46 +4,39 @@
   Security Vitals installer for Windows - no admin rights required.
 
 .DESCRIPTION
-  Security Vitals runs INSIDE WSL (its triggers use bash / tmNIDS / curl) and serves
-  a local web UI you open in the Windows browser. This installer:
-    * finds a WSL distro and a Python 3.8+ inside it; if Python is missing it installs
-      it into the distro (as root, no password prompt - apt/dnf/apk/pacman),
-    * copies the app into the WSL distro (native filesystem, fast),
-    * writes a Windows launcher that starts the server in WSL and opens the browser,
-    * creates Start Menu / Desktop shortcuts to that launcher,
+  Installs Security Vitals for the current user:
+    * finds a Windows Python 3.8+ WITH Tkinter (the console is a Tkinter window); if
+      none, downloads the official python.org installer and installs it per-user,
+    * copies the app to the install folder (from this folder when run out of a repo
+      checkout / release download, otherwise straight from GitHub),
+    * creates Start Menu / Desktop shortcuts that open the window (pythonw.exe, so no
+      console window),
     * registers in Settings > Apps ("Add/Remove Programs") with an uninstaller.
 
-  It does NOT install WSL itself (that needs admin + a reboot). If WSL is missing it
-  tells you how: run 'wsl --install' in an elevated PowerShell, reboot, then re-run this.
+  Everything runs NATIVELY on Windows - no WSL. Triggers use curl.exe (ships with
+  Windows 10 1803+) and small built-in Python probes; nothing is installed in a distro.
 
   Run it by double-clicking install.bat, or directly:
     powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1
 
 .PARAMETER InstallDir
-  Windows folder for the launcher + shortcuts (default %LOCALAPPDATA%\Programs\SecVitals).
-.PARAMETER WslDir
-  Folder inside WSL for the app (default ~/.local/share/secvitals in the distro).
-.PARAMETER Distro
-  WSL distro to target (default: the WSL default distro).
-.PARAMETER Port
-  Loopback port the console serves on (default 8787).
+  Where to install (default: %LOCALAPPDATA%\Programs\SecVitals).
 .PARAMETER NoGui
   Use console output instead of the setup window.
 .PARAMETER Silent
-  No window, no prompts (implies -NoGui).
-.PARAMETER NoDesktopShortcut / -NoStartMenuShortcut
-  Skip that shortcut.
+  No window, no prompts - install with the given options (implies -NoGui).
+.PARAMETER NoDesktopShortcut
+  Skip the desktop shortcut.
+.PARAMETER NoStartMenuShortcut
+  Skip the Start Menu shortcut.
 .PARAMETER SkipPythonInstall
-  Never install Python into WSL; fail instead if a usable one isn't found.
+  Never install Python; fail instead if a usable one isn't found.
 .PARAMETER Branch
   Git branch to fetch when downloading from GitHub (default: main).
 #>
 [CmdletBinding()]
 param(
     [string]$InstallDir = "$env:LOCALAPPDATA\Programs\SecVitals",
-    [string]$WslDir = "",
-    [string]$Distro = "",
-    [int]$Port = 8787,
     [switch]$NoGui,
     [switch]$Silent,
     [switch]$NoDesktopShortcut,
@@ -55,26 +48,22 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
 
-$AppName = "Security Vitals"
-$AppKey  = "SecVitals"                 # registry key + folder name
-$Repo    = "robertsonc/secvitals"
-$RepoUrl = "https://github.com/$Repo"
-# App files copied INTO WSL (the app runs there). Installer files stay on Windows.
-$AppItems = @("secvitals.py", "config", "assets", "docs", "README.md", "requirements.txt")
+$AppName       = "Security Vitals"
+$AppKey        = "SecVitals"   # registry key + folder name
+$Repo          = "robertsonc/secvitals"
+$RepoUrl       = "https://github.com/$Repo"
+$PythonVersion = "3.12.10"     # installed only when no usable Python exists
+$AppFiles      = @("secvitals.py", "install.ps1", "uninstall.ps1", "install.bat",
+                   "README.md", "requirements.txt")
+$AppDirs       = @("config", "assets", "docs")
 
 if ($Silent) { $NoGui = $true }
-$env:WSL_UTF8 = "1"                    # make wsl.exe emit UTF-8, not UTF-16
 
-# script-scoped install context (filled by the probe / GUI)
-$script:Distro  = $Distro
-$script:WslHome = ""
-$script:WslDir  = $WslDir
-$script:Port    = $Port
-
-# PS 5.1 defaults to TLS 1.0 - GitHub requires TLS 1.2+.
+# PS 5.1 defaults to TLS 1.0 - python.org and GitHub require TLS 1.2+.
 try {
     [Net.ServicePointManager]::SecurityProtocol =
-        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        [Net.ServicePointManager]::SecurityProtocol -bor
+        [Net.SecurityProtocolType]::Tls12
 } catch {}
 
 # ---------------------------------------------------------------------------
@@ -92,100 +81,75 @@ function Write-Log {
 }
 
 # ---------------------------------------------------------------------------
-# WSL discovery + Python-in-WSL
+# Python discovery / install (needs Tkinter - the console is a Tk window)
 # ---------------------------------------------------------------------------
-function Get-DefaultDistro {
-    if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) { return $null }
-    # Prefer the distro marked default ('*') in `wsl -l -v`.
+function Test-PythonExe {
+    # Probe one candidate interpreter. Returns $null or an object with
+    # Exe / Version / HasTk. A temp probe file sidesteps every PowerShell
+    # argument-quoting pitfall, and real execution filters out the
+    # Microsoft Store stub (which exits non-zero when given arguments).
+    param([string]$Command, [string[]]$PreArgs = @())
+    $probe = Join-Path $env:TEMP "secv-pyprobe.py"
+    Set-Content -Path $probe -Encoding ASCII -Value @(
+        "import sys, importlib.util",
+        "print('%d.%d' % sys.version_info[:2])",
+        "print(sys.executable)",
+        "print(1 if importlib.util.find_spec('_tkinter') else 0)"
+    )
     try {
-        foreach ($ln in (& wsl.exe -l -v 2>$null)) {
-            if ("$ln" -match '^\s*\*\s+(\S+)') { return $Matches[1] }
+        $out = & $Command @PreArgs $probe 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $out) { return $null }
+        $lines = @($out | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+        if ($lines.Count -lt 3) { return $null }
+        $ver = $null
+        if (-not [Version]::TryParse($lines[0], [ref]$ver)) { return $null }
+        return [pscustomobject]@{
+            Exe     = $lines[1]
+            Version = $ver
+            HasTk   = ($lines[2] -eq "1")
         }
-    } catch {}
-    try {
-        foreach ($ln in (& wsl.exe -l -q 2>$null)) {
-            $t = "$ln".Trim(); if ($t) { return $t }
-        }
-    } catch {}
-    return $null
+    } catch {
+        return $null
+    } finally {
+        Remove-Item $probe -ErrorAction SilentlyContinue
+    }
 }
 
-function Invoke-Wsl {
-    # Run a bash command in the target distro. The script is base64-encoded so its own
-    # quoting survives the PowerShell -> wsl.exe -> bash argument boundary intact: Windows
-    # PowerShell mangles embedded double quotes when passing native-exe arguments, which
-    # otherwise breaks any command containing quotes (version probe, $HOME, the file copy).
-    param([string]$Command, [switch]$AsRoot)
-    $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Command))
-    $a = @("-d", $script:Distro)
-    if ($AsRoot) { $a += @("-u", "root") }
-    $a += @("-e", "bash", "-lc", "echo $b64 | base64 -d | bash")
-    return (& wsl.exe @a)
-}
-
-function Test-Wsl {
-    if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) { return $false }
-    if (-not $script:Distro) { $script:Distro = Get-DefaultDistro }
-    if (-not $script:Distro) { return $false }
-    try {
-        $ok = (Invoke-Wsl -Command "echo __wsl_ok__" | Where-Object { "$_".Trim() -eq "__wsl_ok__" })
-        return [bool]$ok
-    } catch { return $false }
-}
-
-function Get-WslHome {
-    $h = (Invoke-Wsl -Command 'printf %s "$HOME"' | Select-Object -First 1)
-    $h = "$h".Trim()
-    if (-not $h) { $h = "/root" }
-    return $h
-}
-
-function Get-WslPython {
-    # Returns a version string like "3.12", or $null. Security Vitals needs no Tkinter.
-    # `python3 --version` avoids embedded quotes; scanning every line means a login-shell
-    # banner can't be mistaken for the version.
-    try {
-        $out = Invoke-Wsl -Command 'command -v python3 >/dev/null 2>&1 && python3 --version 2>&1 || true'
-    } catch { return $null }
-    foreach ($line in @($out)) {
-        if ("$line" -match 'Python\s+(\d+)\.(\d+)') {
-            if (([int]$Matches[1] -gt 3) -or ([int]$Matches[1] -eq 3 -and [int]$Matches[2] -ge 8)) {
-                return "$($Matches[1]).$($Matches[2])"
-            }
+function Find-Python {
+    # Try the py launcher, then PATH names, then the default per-user and
+    # per-machine install folders (a just-installed Python isn't on THIS
+    # process's PATH yet - the environment was read at startup).
+    $tries = @()
+    if (Get-Command py -ErrorAction SilentlyContinue) {
+        $tries += ,@("py", @("-3"))
+    }
+    foreach ($name in @("python", "python3")) {
+        if (Get-Command $name -ErrorAction SilentlyContinue) {
+            $tries += ,@($name, @())
         }
     }
-    return $null
-}
-
-function Install-WslPython {
-    Write-Log "Installing python3 into WSL distro '$($script:Distro)' (as root) ..."
-    $sh = 'set -e; ' +
-          'if command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y python3; ' +
-          'elif command -v dnf >/dev/null 2>&1; then dnf install -y python3; ' +
-          'elif command -v apk >/dev/null 2>&1; then apk add --no-cache python3; ' +
-          'elif command -v pacman >/dev/null 2>&1; then pacman -Sy --noconfirm python; ' +
-          'else echo NO_PKG_MGR; exit 1; fi'
-    Invoke-Wsl -Command $sh -AsRoot | ForEach-Object { if ("$_".Trim()) { Write-Log "  $_" } }
-    $v = Get-WslPython
-    if (-not $v) {
-        throw "Could not install python3 in WSL automatically. Open the '$($script:Distro)' distro and install it (e.g. 'sudo apt install python3'), then re-run setup."
+    foreach ($root in @("$env:LOCALAPPDATA\Programs\Python",
+                        $env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+        if (-not $root) { continue }
+        foreach ($exe in (Get-ChildItem -Path "$root\Python3*\python.exe" `
+                          -ErrorAction SilentlyContinue |
+                          Sort-Object FullName -Descending)) {
+            $tries += ,@($exe.FullName, @())
+        }
     }
-    Write-Log "python3 $v ready in WSL."
-    return $v
+    $best = $null
+    foreach ($t in $tries) {
+        $found = Test-PythonExe -Command $t[0] -PreArgs $t[1]
+        if (-not $found) { continue }
+        if ($found.Version -lt [Version]"3.8") { continue }
+        if ($found.HasTk) { return $found }        # ideal: take it
+        if (-not $best) { $best = $found }         # remember a tk-less one
+    }
+    return $best  # may be $null, or a Python without Tkinter
 }
 
-function Resolve-WslPython {
-    $v = Get-WslPython
-    if ($v) { Write-Log "Found Python $v in WSL '$($script:Distro)'."; return $v }
-    if ($SkipPythonInstall) { throw "No Python 3.8+ in WSL and -SkipPythonInstall was given." }
-    Write-Log "No usable Python in WSL - installing it for you."
-    return Install-WslPython
-}
-
-# ---------------------------------------------------------------------------
-# App source (local folder next to this script, or the GitHub branch zip)
-# ---------------------------------------------------------------------------
 function Get-RemoteFile {
+    # Async download + message pump so the GUI stays responsive.
     param([string]$Url, [string]$Destination, [string]$What)
     Write-Log "Downloading $What ..."
     Write-Log "  $Url"
@@ -195,22 +159,95 @@ function Get-RemoteFile {
         $task = $wc.DownloadFileTaskAsync($Url, $Destination)
         while (-not $task.IsCompleted) {
             Start-Sleep -Milliseconds 100
-            if ($script:GuiLogBox -ne $null) { [System.Windows.Forms.Application]::DoEvents() }
+            if ($script:GuiLogBox -ne $null) {
+                [System.Windows.Forms.Application]::DoEvents()
+            }
         }
         if ($task.IsFaulted) { throw $task.Exception.InnerException }
     } finally {
         $wc.Dispose()
     }
-    $mb = [math]::Round((Get-Item $Destination).Length / 1MB, 2)
+    $mb = [math]::Round((Get-Item $Destination).Length / 1MB, 1)
     Write-Log "  done ($mb MB)."
 }
 
+function Install-Python {
+    # Silent per-user install from python.org: no admin, includes Tkinter,
+    # pip and the py launcher, and adds Python to the user PATH.
+    $suffix = switch ($env:PROCESSOR_ARCHITECTURE) {
+        "ARM64" { "-arm64" }
+        "AMD64" { "-amd64" }
+        default { "" }       # 32-bit x86
+    }
+    $url = "https://www.python.org/ftp/python/$PythonVersion/python-$PythonVersion$suffix.exe"
+    $tmp = Join-Path $env:TEMP "python-$PythonVersion-setup.exe"
+    Get-RemoteFile -Url $url -Destination $tmp -What "Python $PythonVersion"
+    Write-Log "Installing Python $PythonVersion (current user, this takes a minute or two) ..."
+    $arguments = @("/quiet", "InstallAllUsers=0", "InstallLauncherAllUsers=0",
+                   "PrependPath=1", "Include_tcltk=1", "Include_pip=1",
+                   "Include_test=0", "AssociateFiles=0")
+    $proc = Start-Process -FilePath $tmp -ArgumentList $arguments -PassThru
+    while (-not $proc.HasExited) {
+        Start-Sleep -Milliseconds 250
+        if ($script:GuiLogBox -ne $null) {
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+    }
+    Remove-Item $tmp -ErrorAction SilentlyContinue
+    if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
+        throw "Python installer failed (exit code $($proc.ExitCode))."
+    }
+    $py = Find-Python
+    if (-not $py) { throw "Python was installed but can't be located - open a NEW terminal and re-run the installer." }
+    if (-not $py.HasTk) { throw "Python was installed but Tkinter is missing - re-run the python.org installer and enable 'tcl/tk and IDLE'." }
+    Write-Log "Installed Python $($py.Version) -> $($py.Exe)"
+    return $py
+}
+
+function Resolve-Python {
+    $py = Find-Python
+    if ($py -and $py.HasTk) {
+        Write-Log "Found Python $($py.Version) with Tkinter -> $($py.Exe)"
+        return $py
+    }
+    if ($py -and -not $py.HasTk) {
+        Write-Log "Found Python $($py.Version) at $($py.Exe), but WITHOUT Tkinter (the GUI toolkit)."
+        if ($SkipPythonInstall) {
+            throw "Python lacks Tkinter and -SkipPythonInstall was given. Re-run the python.org installer and enable 'tcl/tk and IDLE'."
+        }
+        Write-Log "Installing a separate per-user Python $PythonVersion that includes it ..."
+        return Install-Python
+    }
+    if ($SkipPythonInstall) {
+        throw "No Python 3.8+ found and -SkipPythonInstall was given."
+    }
+    Write-Log "No usable Python found - installing Python $PythonVersion for the current user."
+    return Install-Python
+}
+
+function Test-Curl {
+    # curl.exe ships with Windows 10 1803+; the console shells out to it for HTTP
+    # triggers. Its absence isn't fatal (the window still opens), so just note it.
+    $curl = Join-Path $env:SystemRoot "System32\curl.exe"
+    if ((Test-Path $curl) -or (Get-Command curl.exe -ErrorAction SilentlyContinue)) {
+        Write-Log "Found curl.exe - HTTP triggers will run natively."
+    } else {
+        Write-Log "NOTE: curl.exe was not found. It ships with Windows 10 1803+; on older"
+        Write-Log "  Windows, install curl so the HTTP triggers can run (dns/tcp still work)."
+    }
+}
+
+# ---------------------------------------------------------------------------
+# App files
+# ---------------------------------------------------------------------------
 function Get-SourceDir {
+    # A repo checkout / release download has secvitals.py next to this script -
+    # install offline from there. Otherwise fetch the branch zip.
     if ($PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot "secvitals.py"))) {
         Write-Log "Installing from local folder: $PSScriptRoot"
         return $PSScriptRoot
     }
-    $safe = $Branch -replace '[\\/:*?"<>|]', '-'
+    $safe = $Branch -replace '[\\/:*?"<>|]', '-'   # branch names may contain /
     $zip = Join-Path $env:TEMP "secvitals-$safe.zip"
     $dst = Join-Path $env:TEMP "secvitals-unzip"
     Get-RemoteFile -Url "https://codeload.github.com/$Repo/zip/refs/heads/$Branch" `
@@ -228,99 +265,55 @@ function Get-SourceDir {
 function Get-AppVersion {
     param([string]$Dir)
     $m = Select-String -Path (Join-Path $Dir "secvitals.py") `
-                       -Pattern '^__version__\s*=\s*"([^"]+)"' | Select-Object -First 1
+                       -Pattern '^__version__\s*=\s*"([^"]+)"' |
+         Select-Object -First 1
     if ($m) { return $m.Matches[0].Groups[1].Value }
     return "0.0.0"
 }
 
 function Install-AppFiles {
     param([string]$SourceDir)
-    Write-Log "Copying application files into WSL: $($script:WslDir)"
-    # Translate the Windows source dir to a /mnt path inside WSL (wslpath handles the
-    # backslashes; do NOT route the raw Windows path through bash).
-    $wslSrc = (& wsl.exe -d $script:Distro -e wslpath -a "$SourceDir" | Select-Object -First 1)
-    $wslSrc = "$wslSrc".Trim().TrimEnd('/')
-    if (-not $wslSrc) { throw "could not translate the source path into WSL." }
-    $items = ($AppItems | ForEach-Object { "'$_'" }) -join ' '
-    $sh = "set -e; dst='$($script:WslDir)'; src='$wslSrc'; mkdir -p `"`$dst`"; " +
-          "for it in $items; do if [ -e `"`$src/`$it`" ]; then cp -rf `"`$src/`$it`" `"`$dst/`"; fi; done; " +
-          "echo copied"
-    $r = Invoke-Wsl -Command $sh
-    if (-not ($r | Where-Object { "$_".Trim() -eq "copied" })) { throw "copy into WSL failed." }
-}
-
-# ---------------------------------------------------------------------------
-# Windows launcher + shortcuts + Add/Remove Programs
-# ---------------------------------------------------------------------------
-function New-Launcher {
+    Write-Log "Copying application files to $InstallDir ..."
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-
-    # Delays a moment, then opens the default browser (kept separate to avoid cmd
-    # nested-quote pitfalls).
-    $opener = @(
-        "@echo off",
-        "ping -n 4 127.0.0.1 >nul",
-        "start `"`" http://127.0.0.1:$($script:Port)/"
-    ) -join "`r`n"
-    Set-Content -Path (Join-Path $InstallDir "open-browser.cmd") -Value $opener -Encoding ASCII
-
-    # The launcher: start the browser opener in the background, then run the server in
-    # WSL in THIS window. Closing the window stops the console.
-    $launch = @(
-        "@echo off",
-        "title $AppName",
-        "echo Starting $AppName in WSL ($($script:Distro)) ...",
-        "echo A browser tab opens at http://127.0.0.1:$($script:Port)/  -  close THIS window to stop.",
-        "start `"`" /b `"%~dp0open-browser.cmd`"",
-        "wsl.exe -d $($script:Distro) -e bash -lc `"cd '$($script:WslDir)' && exec python3 secvitals.py --no-browser --port $($script:Port)`""
-    ) -join "`r`n"
-    Set-Content -Path (Join-Path $InstallDir "launch.cmd") -Value $launch -Encoding ASCII
-
-    # Updater: runs the app's hardened, signed self-update inside WSL.
-    $upd = @(
-        "@echo off",
-        "title $AppName updater",
-        "wsl.exe -d $($script:Distro) -e bash -lc `"cd '$($script:WslDir)' && python3 secvitals.py --update`"",
-        "pause"
-    ) -join "`r`n"
-    Set-Content -Path (Join-Path $InstallDir "update.cmd") -Value $upd -Encoding ASCII
-
-    # install-info.txt: read by uninstall.ps1 to remove the WSL files too.
-    $info = @("Distro=$($script:Distro)", "WslDir=$($script:WslDir)", "Port=$($script:Port)") -join "`r`n"
-    Set-Content -Path (Join-Path $InstallDir "install-info.txt") -Value $info -Encoding ASCII
-}
-
-function Copy-InstallerFiles {
-    param([string]$SourceDir)
-    foreach ($f in @("uninstall.ps1", "install.ps1", "install.bat")) {
+    foreach ($f in $AppFiles) {
         $src = Join-Path $SourceDir $f
         if (Test-Path $src) { Copy-Item $src -Destination $InstallDir -Force }
     }
-    $ico = Join-Path $SourceDir "assets\secvitals.ico"
-    if (Test-Path $ico) { Copy-Item $ico -Destination $InstallDir -Force }
+    foreach ($d in $AppDirs) {
+        $src = Join-Path $SourceDir $d
+        if (Test-Path $src) { Copy-Item $src -Destination $InstallDir -Recurse -Force }
+    }
 }
 
+# ---------------------------------------------------------------------------
+# Shortcuts + Add/Remove Programs registration
+# ---------------------------------------------------------------------------
 function New-AppShortcut {
-    param([string]$LinkPath)
+    param([string]$LinkPath, [string]$PythonwExe)
     $shell = New-Object -ComObject WScript.Shell
     $lnk = $shell.CreateShortcut($LinkPath)
-    $lnk.TargetPath = Join-Path $InstallDir "launch.cmd"
+    $lnk.TargetPath = $PythonwExe
+    $lnk.Arguments = "`"$InstallDir\secvitals.py`""
     $lnk.WorkingDirectory = $InstallDir
-    $lnk.Description = "$AppName - local security-trigger console (runs in WSL)"
-    $ico = Join-Path $InstallDir "secvitals.ico"
+    $lnk.Description = "$AppName - fire EdgeConnect security triggers and classify the result"
+    $ico = Join-Path $InstallDir "assets\secvitals.ico"
     if (Test-Path $ico) { $lnk.IconLocation = "$ico,0" }
     $lnk.Save()
     Write-Log "Shortcut: $LinkPath"
 }
 
 function Install-Shortcuts {
+    param($Python)
+    # pythonw.exe runs the Tkinter window with no console window behind it.
+    $pythonw = Join-Path (Split-Path $Python.Exe) "pythonw.exe"
+    if (-not (Test-Path $pythonw)) { $pythonw = $Python.Exe }
     if (-not $NoStartMenuShortcut) {
         $programs = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"
-        New-AppShortcut -LinkPath (Join-Path $programs "$AppName.lnk")
+        New-AppShortcut -LinkPath (Join-Path $programs "$AppName.lnk") -PythonwExe $pythonw
     }
     if (-not $NoDesktopShortcut) {
         $desktop = [Environment]::GetFolderPath("Desktop")
-        New-AppShortcut -LinkPath (Join-Path $desktop "$AppName.lnk")
+        New-AppShortcut -LinkPath (Join-Path $desktop "$AppName.lnk") -PythonwExe $pythonw
     }
 }
 
@@ -336,7 +329,7 @@ function Register-App {
     Set-ItemProperty -Path $reg -Name "DisplayVersion" -Value $Version
     Set-ItemProperty -Path $reg -Name "Publisher" -Value $AppName
     Set-ItemProperty -Path $reg -Name "InstallLocation" -Value $InstallDir
-    Set-ItemProperty -Path $reg -Name "DisplayIcon" -Value "$InstallDir\secvitals.ico"
+    Set-ItemProperty -Path $reg -Name "DisplayIcon" -Value "$InstallDir\assets\secvitals.ico"
     Set-ItemProperty -Path $reg -Name "UninstallString" -Value $uninst
     Set-ItemProperty -Path $reg -Name "QuietUninstallString" -Value "$uninst -Silent"
     Set-ItemProperty -Path $reg -Name "URLInfoAbout" -Value $RepoUrl
@@ -348,37 +341,40 @@ function Register-App {
     Write-Log "Registered in Settings > Apps (uninstall from there any time)."
 }
 
+function Write-InstallInfo {
+    param([string]$Version)
+    $info = @("AppName = $AppName", "Version = $Version", "InstallDir = $InstallDir")
+    Set-Content -Path (Join-Path $InstallDir "install-info.txt") -Value $info -Encoding UTF8
+}
+
 # ---------------------------------------------------------------------------
 # The install itself (shared by GUI and console modes)
 # ---------------------------------------------------------------------------
 function Invoke-Install {
     Write-Log "=== $AppName setup ==="
-    if (-not (Test-Wsl)) {
-        throw "WSL was not found. Install it first: open an elevated PowerShell, run 'wsl --install', reboot, then re-run this setup."
-    }
-    if (-not $script:WslHome) { $script:WslHome = Get-WslHome }
-    if (-not $script:WslDir) { $script:WslDir = "$($script:WslHome)/.local/share/secvitals" }
-    Write-Log "Target: WSL distro '$($script:Distro)', folder $($script:WslDir)"
-    $pyv = Resolve-WslPython
+    $py = Resolve-Python
+    Test-Curl
     $srcDir = Get-SourceDir
     $version = Get-AppVersion -Dir $srcDir
     Write-Log "Installing $AppName $version ..."
     Install-AppFiles -SourceDir $srcDir
-    New-Launcher
-    Copy-InstallerFiles -SourceDir $srcDir
-    Install-Shortcuts
+    Install-Shortcuts -Python $py
     Register-App -Version $version
+    Write-InstallInfo -Version $version
     Write-Log ""
-    Write-Log "$AppName $version installed."
-    Write-Log "  App (WSL):  $($script:WslDir)"
-    Write-Log "  Launcher:   $InstallDir\launch.cmd"
-    Write-Log "Start it from the Start Menu ('$AppName'): the console starts in WSL and"
-    Write-Log "your browser opens at http://127.0.0.1:$($script:Port)/ ."
-    return [pscustomobject]@{ Version = $version; Python = $pyv }
+    Write-Log "$AppName $version installed to:"
+    Write-Log "  $InstallDir"
+    Write-Log "Start it from the Start Menu ('$AppName'). Click a trigger's Fire button,"
+    Write-Log "then verify the detection on the Orchestrator / EdgeConnect dashboard."
+    return [pscustomobject]@{ Python = $py; Version = $version }
 }
 
 function Start-App {
-    Start-Process -FilePath (Join-Path $InstallDir "launch.cmd") -WorkingDirectory $InstallDir
+    param($Python)
+    $pythonw = Join-Path (Split-Path $Python.Exe) "pythonw.exe"
+    if (-not (Test-Path $pythonw)) { $pythonw = $Python.Exe }
+    Start-Process -FilePath $pythonw -ArgumentList "`"$InstallDir\secvitals.py`"" `
+                  -WorkingDirectory $InstallDir
 }
 
 # ---------------------------------------------------------------------------
@@ -392,12 +388,11 @@ function Show-InstallerGui {
     $panel  = [System.Drawing.Color]::FromArgb(35, 39, 46)
     $txtCol = [System.Drawing.Color]::FromArgb(242, 244, 245)
     $dimCol = [System.Drawing.Color]::FromArgb(154, 163, 173)
-    $warn   = [System.Drawing.Color]::FromArgb(255, 131, 0)
     $green  = [System.Drawing.Color]::FromArgb(1, 169, 130)
 
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "$AppName setup"
-    $form.ClientSize = New-Object System.Drawing.Size(560, 462)
+    $form.ClientSize = New-Object System.Drawing.Size(560, 470)
     $form.BackColor = $bg
     $form.FormBorderStyle = "FixedSingle"
     $form.MaximizeBox = $false
@@ -406,153 +401,194 @@ function Show-InstallerGui {
     $title = New-Object System.Windows.Forms.Label
     $title.Text = "$AppName setup"
     $title.Font = New-Object System.Drawing.Font("Segoe UI", 16, [System.Drawing.FontStyle]::Bold)
-    $title.ForeColor = $txtCol; $title.AutoSize = $true
-    $title.Location = New-Object System.Drawing.Point(20, 14)
+    $title.ForeColor = $txtCol
+    $title.AutoSize = $true
+    $title.Location = New-Object System.Drawing.Point(20, 16)
     $form.Controls.Add($title)
 
     $sub = New-Object System.Windows.Forms.Label
-    $sub.Text = "Fires security-trigger traffic; reads the local result. Runs in WSL, opens in your browser."
-    $sub.Font = New-Object System.Drawing.Font("Segoe UI", 9); $sub.ForeColor = $dimCol
-    $sub.AutoSize = $true; $sub.Location = New-Object System.Drawing.Point(22, 44)
+    $sub.Text = "Fire EdgeConnect security triggers on a click and classify the result."
+    $sub.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $sub.ForeColor = $dimCol
+    $sub.AutoSize = $true
+    $sub.Location = New-Object System.Drawing.Point(22, 48)
     $form.Controls.Add($sub)
 
-    $wslLabel = New-Object System.Windows.Forms.Label
-    $wslLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9); $wslLabel.MaximumSize = New-Object System.Drawing.Size(516, 0)
-    $wslLabel.AutoSize = $true; $wslLabel.Location = New-Object System.Drawing.Point(22, 70)
-    $wslReady = $false
-    if (Test-Wsl) {
-        if (-not $script:WslHome) { $script:WslHome = Get-WslHome }
-        if (-not $script:WslDir) { $script:WslDir = "$($script:WslHome)/.local/share/secvitals" }
-        $pyv = Get-WslPython
-        if ($pyv) {
-            $wslLabel.Text = "WSL '$($script:Distro)' with Python $pyv found - ready to install."
-            $wslLabel.ForeColor = $green; $wslReady = $true
-        } else {
-            $wslLabel.Text = "WSL '$($script:Distro)' found; Python 3 will be added to it (per-user, apt/dnf/apk)."
-            $wslLabel.ForeColor = $dimCol; $wslReady = $true
-        }
+    $pyLabel = New-Object System.Windows.Forms.Label
+    $pyLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $pyLabel.AutoSize = $true
+    $pyLabel.Location = New-Object System.Drawing.Point(22, 78)
+    $pyProbe = Find-Python
+    if ($pyProbe -and $pyProbe.HasTk) {
+        $pyLabel.Text = "Python $($pyProbe.Version) with Tkinter found - nothing extra to install."
+        $pyLabel.ForeColor = $green
+    } elseif ($pyProbe) {
+        $pyLabel.Text = "Python $($pyProbe.Version) found but without Tkinter - Python $PythonVersion will be added (per-user, python.org)."
+        $pyLabel.ForeColor = $dimCol
     } else {
-        $wslLabel.Text = "WSL not found. In an elevated PowerShell run 'wsl --install', reboot, then re-run this setup."
-        $wslLabel.ForeColor = $warn
+        $pyLabel.Text = "Python not found - Python $PythonVersion will be installed for you (per-user, from python.org)."
+        $pyLabel.ForeColor = $dimCol
     }
-    $form.Controls.Add($wslLabel)
+    $form.Controls.Add($pyLabel)
 
     $dirLabel = New-Object System.Windows.Forms.Label
-    $dirLabel.Text = "Install folder (inside WSL):"; $dirLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
-    $dirLabel.ForeColor = $txtCol; $dirLabel.AutoSize = $true
-    $dirLabel.Location = New-Object System.Drawing.Point(22, 100)
+    $dirLabel.Text = "Install folder:"
+    $dirLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $dirLabel.ForeColor = $txtCol
+    $dirLabel.AutoSize = $true
+    $dirLabel.Location = New-Object System.Drawing.Point(22, 108)
     $form.Controls.Add($dirLabel)
 
     $dirBox = New-Object System.Windows.Forms.TextBox
-    $dirBox.Text = $(if ($script:WslDir) { $script:WslDir } else { "~/.local/share/secvitals" })
-    $dirBox.Font = New-Object System.Drawing.Font("Consolas", 9); $dirBox.BackColor = $panel
-    $dirBox.ForeColor = $txtCol; $dirBox.BorderStyle = "FixedSingle"
-    $dirBox.Location = New-Object System.Drawing.Point(24, 120); $dirBox.Size = New-Object System.Drawing.Size(516, 24)
+    $dirBox.Text = $InstallDir
+    $dirBox.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $dirBox.BackColor = $panel
+    $dirBox.ForeColor = $txtCol
+    $dirBox.BorderStyle = "FixedSingle"
+    $dirBox.Location = New-Object System.Drawing.Point(24, 128)
+    $dirBox.Size = New-Object System.Drawing.Size(430, 24)
     $form.Controls.Add($dirBox)
 
-    $portLabel = New-Object System.Windows.Forms.Label
-    $portLabel.Text = "Port:"; $portLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
-    $portLabel.ForeColor = $txtCol; $portLabel.AutoSize = $true
-    $portLabel.Location = New-Object System.Drawing.Point(22, 152)
-    $form.Controls.Add($portLabel)
-
-    $portBox = New-Object System.Windows.Forms.TextBox
-    $portBox.Text = "$($script:Port)"; $portBox.Font = New-Object System.Drawing.Font("Consolas", 9)
-    $portBox.BackColor = $panel; $portBox.ForeColor = $txtCol; $portBox.BorderStyle = "FixedSingle"
-    $portBox.Location = New-Object System.Drawing.Point(62, 150); $portBox.Size = New-Object System.Drawing.Size(56, 24)
-    $form.Controls.Add($portBox)
+    $browse = New-Object System.Windows.Forms.Button
+    $browse.Text = "Browse..."
+    $browse.FlatStyle = "Flat"
+    $browse.BackColor = $panel
+    $browse.ForeColor = $txtCol
+    $browse.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(54, 59, 68)
+    $browse.Location = New-Object System.Drawing.Point(462, 127)
+    $browse.Size = New-Object System.Drawing.Size(78, 25)
+    $browse.Add_Click({
+        $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+        $dlg.Description = "Choose the parent folder ('$AppKey' is created inside it)"
+        if ($dlg.ShowDialog() -eq "OK") {
+            $dirBox.Text = Join-Path $dlg.SelectedPath $AppKey
+        }
+    })
+    $form.Controls.Add($browse)
 
     $cbStart = New-Object System.Windows.Forms.CheckBox
-    $cbStart.Text = "Start Menu shortcut"; $cbStart.Font = New-Object System.Drawing.Font("Segoe UI", 9)
-    $cbStart.ForeColor = $txtCol; $cbStart.Checked = -not $NoStartMenuShortcut; $cbStart.AutoSize = $true
-    $cbStart.Location = New-Object System.Drawing.Point(150, 152)
+    $cbStart.Text = "Start Menu shortcut"
+    $cbStart.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $cbStart.ForeColor = $txtCol
+    $cbStart.Checked = -not $NoStartMenuShortcut
+    $cbStart.AutoSize = $true
+    $cbStart.Location = New-Object System.Drawing.Point(24, 162)
     $form.Controls.Add($cbStart)
 
     $cbDesk = New-Object System.Windows.Forms.CheckBox
-    $cbDesk.Text = "Desktop shortcut"; $cbDesk.Font = New-Object System.Drawing.Font("Segoe UI", 9)
-    $cbDesk.ForeColor = $txtCol; $cbDesk.Checked = -not $NoDesktopShortcut; $cbDesk.AutoSize = $true
-    $cbDesk.Location = New-Object System.Drawing.Point(330, 152)
+    $cbDesk.Text = "Desktop shortcut"
+    $cbDesk.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $cbDesk.ForeColor = $txtCol
+    $cbDesk.Checked = -not $NoDesktopShortcut
+    $cbDesk.AutoSize = $true
+    $cbDesk.Location = New-Object System.Drawing.Point(200, 162)
     $form.Controls.Add($cbDesk)
 
     $log = New-Object System.Windows.Forms.TextBox
-    $log.Multiline = $true; $log.ReadOnly = $true; $log.ScrollBars = "Vertical"
-    $log.Font = New-Object System.Drawing.Font("Consolas", 8.5); $log.BackColor = $panel
-    $log.ForeColor = $txtCol; $log.BorderStyle = "FixedSingle"
-    $log.Location = New-Object System.Drawing.Point(24, 182); $log.Size = New-Object System.Drawing.Size(516, 198)
+    $log.Multiline = $true
+    $log.ReadOnly = $true
+    $log.ScrollBars = "Vertical"
+    $log.Font = New-Object System.Drawing.Font("Consolas", 8.5)
+    $log.BackColor = $panel
+    $log.ForeColor = $txtCol
+    $log.BorderStyle = "FixedSingle"
+    $log.Location = New-Object System.Drawing.Point(24, 194)
+    $log.Size = New-Object System.Drawing.Size(516, 200)
     $form.Controls.Add($log)
 
     $bar = New-Object System.Windows.Forms.ProgressBar
     $bar.Style = "Continuous"
-    $bar.Location = New-Object System.Drawing.Point(24, 388); $bar.Size = New-Object System.Drawing.Size(516, 6)
+    $bar.Location = New-Object System.Drawing.Point(24, 402)
+    $bar.Size = New-Object System.Drawing.Size(516, 6)
     $form.Controls.Add($bar)
 
     $btnInstall = New-Object System.Windows.Forms.Button
-    $btnInstall.Text = "Install"; $btnInstall.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
-    $btnInstall.FlatStyle = "Flat"; $btnInstall.BackColor = $green; $btnInstall.ForeColor = [System.Drawing.Color]::White
+    $btnInstall.Text = "Install"
+    $btnInstall.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+    $btnInstall.FlatStyle = "Flat"
+    $btnInstall.BackColor = $green
+    $btnInstall.ForeColor = [System.Drawing.Color]::White
     $btnInstall.FlatAppearance.BorderSize = 0
-    $btnInstall.Location = New-Object System.Drawing.Point(430, 406); $btnInstall.Size = New-Object System.Drawing.Size(110, 36)
-    $btnInstall.Enabled = $wslReady
+    $btnInstall.Location = New-Object System.Drawing.Point(430, 422)
+    $btnInstall.Size = New-Object System.Drawing.Size(110, 36)
     $form.Controls.Add($btnInstall)
 
     $btnLaunch = New-Object System.Windows.Forms.Button
-    $btnLaunch.Text = "Launch"; $btnLaunch.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
-    $btnLaunch.FlatStyle = "Flat"; $btnLaunch.BackColor = $green; $btnLaunch.ForeColor = [System.Drawing.Color]::White
+    $btnLaunch.Text = "Launch"
+    $btnLaunch.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+    $btnLaunch.FlatStyle = "Flat"
+    $btnLaunch.BackColor = $green
+    $btnLaunch.ForeColor = [System.Drawing.Color]::White
     $btnLaunch.FlatAppearance.BorderSize = 0
-    $btnLaunch.Location = New-Object System.Drawing.Point(430, 406); $btnLaunch.Size = New-Object System.Drawing.Size(110, 36)
+    $btnLaunch.Location = New-Object System.Drawing.Point(430, 422)
+    $btnLaunch.Size = New-Object System.Drawing.Size(110, 36)
     $btnLaunch.Visible = $false
     $form.Controls.Add($btnLaunch)
 
     $btnClose = New-Object System.Windows.Forms.Button
-    $btnClose.Text = "Close"; $btnClose.Font = New-Object System.Drawing.Font("Segoe UI", 9)
-    $btnClose.FlatStyle = "Flat"; $btnClose.BackColor = $panel; $btnClose.ForeColor = $txtCol
+    $btnClose.Text = "Close"
+    $btnClose.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $btnClose.FlatStyle = "Flat"
+    $btnClose.BackColor = $panel
+    $btnClose.ForeColor = $txtCol
     $btnClose.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(54, 59, 68)
-    $btnClose.Location = New-Object System.Drawing.Point(330, 406); $btnClose.Size = New-Object System.Drawing.Size(90, 36)
+    $btnClose.Location = New-Object System.Drawing.Point(330, 422)
+    $btnClose.Size = New-Object System.Drawing.Size(90, 36)
     $btnClose.Add_Click({ $form.Close() })
     $form.Controls.Add($btnClose)
 
+    $result = @{ Python = $null }
     $script:Installing = $false
     $form.Add_FormClosing({
         param($sender, $e)
         if ($script:Installing) {
             [System.Windows.Forms.MessageBox]::Show(
-                "Setup is still running - let it finish first.", "$AppName setup",
+                "Setup is still running - let it finish first.",
+                "$AppName setup",
                 [System.Windows.Forms.MessageBoxButtons]::OK,
                 [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
             $e.Cancel = $true
         }
     })
     $btnInstall.Add_Click({
-        $p = 0
-        if (-not [int]::TryParse($portBox.Text.Trim(), [ref]$p) -or $p -lt 1 -or $p -gt 65535) {
-            [System.Windows.Forms.MessageBox]::Show("Port must be a number between 1 and 65535.", "$AppName setup",
-                [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
-            return
-        }
-        $btnInstall.Enabled = $false; $btnClose.Enabled = $false
-        $dirBox.Enabled = $false; $portBox.Enabled = $false; $cbStart.Enabled = $false; $cbDesk.Enabled = $false
+        $btnInstall.Enabled = $false
+        $btnClose.Enabled = $false
+        $browse.Enabled = $false
+        $dirBox.Enabled = $false
         $script:Installing = $true
-        $script:WslDir = $dirBox.Text.Trim()
-        $script:Port = $p
+        $script:InstallDir = $dirBox.Text.Trim()
         $script:NoStartMenuShortcut = -not $cbStart.Checked
         $script:NoDesktopShortcut = -not $cbDesk.Checked
         $script:GuiLogBox = $log
         $bar.Style = "Marquee"
         try {
-            [void](Invoke-Install)
-            $bar.Style = "Continuous"; $bar.Value = 100
-            $btnInstall.Visible = $false; $btnLaunch.Visible = $true
+            $r = Invoke-Install
+            $result.Python = $r.Python
+            $bar.Style = "Continuous"
+            $bar.Value = 100
+            $btnInstall.Visible = $false
+            $btnLaunch.Visible = $true
         } catch {
-            $bar.Style = "Continuous"; $bar.Value = 0
-            Write-Log ""; Write-Log "INSTALL FAILED: $($_.Exception.Message)"
-            [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "$AppName setup",
-                [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
-            $btnInstall.Enabled = $true; $dirBox.Enabled = $true; $portBox.Enabled = $true
-            $cbStart.Enabled = $true; $cbDesk.Enabled = $true
+            $bar.Style = "Continuous"
+            $bar.Value = 0
+            Write-Log ""
+            Write-Log "INSTALL FAILED: $($_.Exception.Message)"
+            [System.Windows.Forms.MessageBox]::Show(
+                $_.Exception.Message, "$AppName setup",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+            $btnInstall.Enabled = $true
+            $browse.Enabled = $true
+            $dirBox.Enabled = $true
         } finally {
-            $script:Installing = $false; $btnClose.Enabled = $true
+            $script:Installing = $false
+            $btnClose.Enabled = $true
         }
     })
-    $btnLaunch.Add_Click({ Start-App; $form.Close() })
+    $btnLaunch.Add_Click({
+        Start-App -Python $result.Python
+        $form.Close()
+    })
 
     [System.Windows.Forms.Application]::EnableVisualStyles()
     $form.Add_Shown({ $form.Activate() }) | Out-Null
@@ -568,7 +604,9 @@ if ($useGui) {
     try {
         Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
         if (-not [Environment]::UserInteractive) { $useGui = $false }
-    } catch { $useGui = $false }
+    } catch {
+        $useGui = $false
+    }
 }
 
 if ($useGui) {
@@ -576,15 +614,19 @@ if ($useGui) {
 } else {
     if (-not $Silent) {
         Write-Host "=== $AppName setup (console) ==="
-        Write-Host "WSL distro     : $(if ($script:Distro) { $script:Distro } else { '(default)' })"
-        Write-Host "Windows folder : $InstallDir"
-        Write-Host "Port           : $($script:Port)"
+        Write-Host "Install folder : $InstallDir"
+        Write-Host "Shortcuts      : StartMenu=$(-not $NoStartMenuShortcut)  Desktop=$(-not $NoDesktopShortcut)"
         $answer = Read-Host "Proceed? [Y/n]"
-        if ($answer -and $answer.Trim().ToLower().StartsWith("n")) { Write-Host "Cancelled."; exit 1 }
+        if ($answer -and $answer.Trim().ToLower().StartsWith("n")) {
+            Write-Host "Cancelled."
+            exit 1
+        }
     }
-    [void](Invoke-Install)
+    $r = Invoke-Install
     if (-not $Silent) {
         $answer = Read-Host "Launch $AppName now? [Y/n]"
-        if (-not ($answer -and $answer.Trim().ToLower().StartsWith("n"))) { Start-App }
+        if (-not ($answer -and $answer.Trim().ToLower().StartsWith("n"))) {
+            Start-App -Python $r.Python
+        }
     }
 }

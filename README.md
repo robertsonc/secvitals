@@ -15,7 +15,15 @@ it observed locally.
 This build covers **north–south** functions: IDS/IPS (tmNIDS) and WebCC / IP reputation.
 East–west is deferred.
 
-## Run it (inside WSL)
+## Install (Windows, one-click)
+
+Double-click **`install.bat`**. A per-user setup window (no admin rights) finds your WSL
+distro + Python, installs the app into WSL, and creates Start Menu / Desktop shortcuts
+plus a Settings → Apps entry — the same installer experience as NetVitals, adapted for the
+WSL web app. See [docs/INSTALL.md](docs/INSTALL.md) for options, silent install, updating,
+and uninstalling.
+
+## Run it manually (inside WSL)
 
 The console runs **inside WSL**, serves on loopback, and you open it in the **Windows
 browser**. No dependencies beyond Python 3.8+ (standard library only).
@@ -87,9 +95,11 @@ python3 -m unittest discover -s tests
 
 ## Provenance
 
-Reuses two things from the `netvitals` app: the **HPE visual identity** (palette, dark
-theme, branding) for the UI form factor, and the **self-update mechanism** (ported and
-hardened — netvitals' updater had no authenticity check). Everything else is new. The
+Reuses from the `netvitals` app: the **HPE visual identity** (palette, dark theme,
+branding) for the UI form factor, the **self-update mechanism** (ported and hardened —
+netvitals' updater had no authenticity check), and the **installer UI** (the WinForms
+setup experience, ported and adapted for the WSL web app — see `docs/INSTALL.md`).
+Everything else is new. The
 original demo scripts and cheatsheets are kept under
 [`docs/reference/`](docs/reference/) for provenance; the app reimplements their trigger
 logic and does not execute them. See [`CONFIRMED.md`](CONFIRMED.md) for the full decision

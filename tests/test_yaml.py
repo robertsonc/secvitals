@@ -68,6 +68,13 @@ class TestYaml(unittest.TestCase):
         self.assertEqual(d["root"]["items"], ["one", "two"])
         self.assertEqual(d["root"]["n"], 2)
 
+    def test_seq_same_indent_as_key(self):
+        # Valid YAML: a block sequence at the same column as its parent key.
+        text = "flags:\n- needs_internet\n- needs_et_ruleset\nother: 1\n"
+        d = sv.yaml_load(text)
+        self.assertEqual(d["flags"], ["needs_internet", "needs_et_ruleset"])
+        self.assertEqual(d["other"], 1)
+
     def test_tabs_rejected(self):
         with self.assertRaises(sv.YamlError):
             sv.yaml_load("x:\n\ty: 1")

@@ -293,19 +293,30 @@ so the schema doesn't paint us into a corner:
 
 ## 9. Non-negotiables checklist (tracked through the build)
 
-- [ ] Fixed server-side catalog (enum/allowlist); UI sends a **trigger id**; params
-  validated per-trigger; command never built from client input.
-- [ ] `subprocess` **argv list**, **no `shell=True`**, per-trigger **timeout**,
+- [x] Fixed server-side catalog (enum/allowlist); UI sends a **trigger id**; params
+  validated per-trigger (allowlist/pattern, control-char guard, compiled at load);
+  command never built from client input.
+- [x] `subprocess` **argv list**, **no `shell=True`**, per-trigger **timeout**,
   captured stdout/stderr/rc; no `eval`/`exec`; no bare `except:`; structured
-  logging (not `print`).
-- [ ] Update channel verified (signature) + source pinned + **fail closed**.
-- [ ] tmNIDS binary cached (no per-click re-download).
-- [ ] Server bound to **loopback only**.
-- [ ] `local` mode excluded from the buttons.
-- [ ] Config (catalog + endpoints) separated from logic, in config files.
-- [ ] `blocked` vs `error` never collapse; three-state WebCC classifier; IP-rep
-  control probe + ratio; Deny-prerequisite notice; live-suspect hosts flagged +
-  disable-able (default off).
+  logging (the only `print` is the CLI startup banner).
+- [x] Update channel verified (RSA signature) + source pinned (non-overridable) +
+  **fail closed**.
+- [x] tmNIDS binary cached (no per-click re-download) **and pinned** — mandatory
+  SHA-256 verification, bounded download, https enforced, fail closed.
+- [x] Server bound to **loopback only** (refuses non-loopback); + CSRF token,
+  Host-rebinding + Origin checks, request-body draining, socket timeout, strict CSP.
+- [x] `local` mode excluded from the buttons.
+- [x] Config (catalog + endpoints) separated from logic, in config files.
+- [x] `blocked` vs `error` never collapse — three-state classifier; the tmNIDS path
+  uses a **control egress probe** so a broken environment reports `error`, never a
+  false `blocked`; live-suspect hosts flagged + disable-able (default off).
+- [ ] *(Phase 3)* three-state **WebCC** classifier; IP-rep control probe + ratio;
+  Deny-prerequisite notice.
+
+Phase 1 was hardened against an adversarial code review (11 confirmed findings: tmNIDS
+supply-chain integrity, tmNIDS block-vs-error honesty via the control probe, YAML
+same-indent sequences, load-time predicate validation, handler socket timeout, param
+hardening, curl-code honesty, and dropping the unimplemented `tcp443` runner).
 
 ---
 

@@ -18,14 +18,21 @@ enable_live_suspect_hosts: false
 tmnids:
   url: "https://raw.githubusercontent.com/3CORESec/testmynids.org/master/tmNIDS"
   cache_path: ""           # empty => default under the per-user cache dir (never re-downloaded per click)
-  sha256: ""               # optional pin; if set, the cached binary must match this hex digest or it is refused
+  sha256: ""               # overrides the built-in pin; empty = use the pinned default (verification is ALWAYS on, fail closed)
   download_timeout_s: 20
 
 run:
   default_timeout_s: 30
+  # Control egress probe — how the console tells a genuine inline drop (blocked) from a
+  # broken environment (error) for tmNIDS triggers. Before deciding a trigger was
+  # BLOCKED, it confirms general egress by TCP-connecting to this known-good host; if the
+  # control fails, the result is `error`, never a false `blocked`. Set control_host to ""
+  # to disable and fall back to the catalog's expected_on_block predicate.
+  control_host: "1.1.1.1"
+  control_port: 443
 
-# (Phase 3 will add a `webcc:` section — Tor node-list URL/TTL, the control-probe host,
-#  and the IP-reputation sample size — when those runners are wired.)
+# (Phase 3 will add a `webcc:` section — Tor node-list URL/TTL and the IP-reputation
+#  sample size — when those runners are wired.)
 
 update:
   # Pinned, non-overridable release source. The updater fails CLOSED without a valid

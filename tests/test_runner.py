@@ -1,5 +1,6 @@
 """Tests for the runner: argv construction (allowlist) and subprocess execution."""
 import os
+import socket
 import stat
 import sys
 import tempfile
@@ -91,11 +92,14 @@ class TestRunTrigger(unittest.TestCase):
         # the resolved argv[0] is the stub, not the literal "tmNIDS"
         self.assertEqual(r.argv[0], stub)
 
-    def test_tmnids_blocked(self):
+    def test_tmnids_blocked_predicate_fallback(self):
+        # control disabled => deterministic fallback to expected_on_block {rc_nonzero}.
         stub = self._stub("", 7)
         t = mk_trigger(runner="tmnids", argv=["tmNIDS", "-1"])
-        r = sv.run_trigger(t, {}, sv.Settings(raw={}), FakeCache(path=stub))
+        noctrl = sv.Settings(raw={"run": {"control_host": ""}})
+        r = sv.run_trigger(t, {}, noctrl, FakeCache(path=stub))
         self.assertEqual(r.rc, 7)
+        self.assertIsNone(r.control_ok)   # probe not run
         self.assertEqual(sv.classify(t, r)[0], sv.BLOCKED)
 
     def test_tmnids_binary_unavailable_is_error(self):
@@ -150,6 +154,25 @@ class TestRunTrigger(unittest.TestCase):
         r = sv.run_trigger(t, {}, sv.Settings(raw={}), FakeCache())
         self.assertIsNotNone(r.error_reason)
         self.assertEqual(sv.classify(t, r)[0], sv.ERROR)
+
+
+class TestTcpProbe(unittest.TestCase):
+    def test_open_port_true(self):
+        ls = socket.socket()
+        ls.bind(("127.0.0.1", 0))
+        ls.listen(1)
+        port = ls.getsockname()[1]
+        try:
+            self.assertTrue(sv._tcp_probe("127.0.0.1", port, 2))
+        finally:
+            ls.close()
+
+    def test_closed_port_false(self):
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()   # nothing listening on `port` now
+        self.assertFalse(sv._tcp_probe("127.0.0.1", port, 1))
 
 
 if __name__ == "__main__":

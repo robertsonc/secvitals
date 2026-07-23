@@ -64,6 +64,21 @@ class TestTriggerValidation(unittest.TestCase):
         with self.assertRaises(sv.ConfigError):
             sv.Trigger.from_dict(self.base(argv=["curl", "{missing}"], params=[]), 30.0)
 
+    def test_bad_predicate_type_rejected(self):
+        with self.assertRaises(sv.ConfigError):
+            sv.Trigger.from_dict(self.base(expected_on_allow={"rc": "zero"}), 30.0)
+        with self.assertRaises(sv.ConfigError):
+            sv.Trigger.from_dict(self.base(expected_on_block={"http_code_in": "403"}), 30.0)
+        with self.assertRaises(sv.ConfigError):
+            sv.Trigger.from_dict(self.base(expected_on_allow={"unknown_key": 1}), 30.0)
+        with self.assertRaises(sv.ConfigError):
+            sv.Trigger.from_dict(self.base(expected_on_block={"rc_nonzero": "yes"}), 30.0)
+
+    def test_bad_regex_pattern_rejected(self):
+        with self.assertRaises(sv.ConfigError):
+            sv.Trigger.from_dict(self.base(argv=["curl", "{t}"],
+                                           params=[{"name": "t", "pattern": "("}]), 30.0)
+
 
 class TestGating(unittest.TestCase):
     def _settings(self, enabled):

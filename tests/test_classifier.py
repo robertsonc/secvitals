@@ -37,6 +37,10 @@ class TestCurlClassifier(unittest.TestCase):
         self.assertEqual(sv.classify_curl(99, None), sv.ERROR)
         self.assertEqual(sv.classify_curl(1, None), sv.ERROR)
 
+    def test_rc0_unparsed_code_is_error(self):
+        # rc==0 but http_code couldn't be parsed: can't confirm a pass — fail honest.
+        self.assertEqual(sv.classify_curl(0, None), sv.ERROR)
+
 
 class TestTmnidsClassifier(unittest.TestCase):
     def test_allowed(self):
@@ -64,6 +68,24 @@ class TestTmnidsClassifier(unittest.TestCase):
         t = mk_trigger()
         r = sv.RunResult(rc=None, timed_out=True)
         self.assertEqual(sv.classify(t, r)[0], sv.ERROR)
+
+    def test_control_ok_true_is_blocked(self):
+        # egress works but the trigger's response didn't return -> flow dropped inline.
+        t = mk_trigger()
+        r = sv.RunResult(rc=7, stdout="", control_ok=True)
+        self.assertEqual(sv.classify(t, r)[0], sv.BLOCKED)
+
+    def test_control_ok_false_is_error_not_blocked(self):
+        # egress itself is broken -> environment error, never a false blocked.
+        t = mk_trigger()
+        r = sv.RunResult(rc=7, stdout="", control_ok=False)
+        self.assertEqual(sv.classify(t, r)[0], sv.ERROR)
+
+    def test_control_ok_true_still_allowed_when_expected_body_present(self):
+        # a successful detect (uid=0 came back) is allowed regardless of the control probe.
+        t = mk_trigger()
+        r = sv.RunResult(rc=0, stdout="uid=0(root)", control_ok=True)
+        self.assertEqual(sv.classify(t, r)[0], sv.ALLOWED)
 
 
 class TestPredMatch(unittest.TestCase):

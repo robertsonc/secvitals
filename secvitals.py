@@ -70,9 +70,16 @@ DEFAULT_ASSETS_DIR = os.path.join(HERE, "assets")
 
 # Known catalog vocabularies (fixed allowlists).
 CLASSES = {"ns-ids", "ns-webcc", "ns-iprep", "ew"}   # `ew` reserved / deferred
-RUNNERS = {"tmnids", "curl", "tcp443"}
+RUNNERS = {"tmnids", "curl"}                          # `tcp443` reserved for Phase 3 IP-rep
 FLAGS = {"needs_internet", "needs_et_ruleset", "hits_live_suspect_hosts"}
 SEVERITIES = {"info", "warn", "crit"}
+
+# tmNIDS is a download-and-execute channel, so its bytes are pinned by default and
+# verification is MANDATORY (fail closed). If 3CORESec updates tmNIDS upstream, verify
+# the new binary out-of-band, recompute its SHA-256, and set tmnids.sha256 in
+# settings.yaml (which overrides this constant). See docs/UPDATE_SECURITY.md.
+TMNIDS_SHA256 = "7016952b1713d09aac0b17bc05d1cc9c589c5ab1ed441233b9413717494fa0c4"
+TMNIDS_MAX_BYTES = 4 * 1024 * 1024
 
 # UI result states — `blocked` and `error` MUST stay distinct.
 ALLOWED, BLOCKED, ERROR, INVALID = "allowed", "blocked", "error", "invalid"
@@ -249,6 +256,10 @@ def _parse_map(lines, i, indent):
             i += 1
             if i < len(lines) and lines[i][0] > indent:
                 val, i = _parse_node(lines, i)
+            elif (i < len(lines) and lines[i][0] == indent
+                  and (lines[i][1] == "-" or lines[i][1].startswith("- "))):
+                # YAML allows a block sequence at the same indent as its parent key.
+                val, i = _parse_seq(lines, i, indent)
             else:
                 val = None
         else:
@@ -356,6 +367,22 @@ class Settings:
         return float(_dget(self.raw, "run.default_timeout_s", 30))
 
     @property
+    def control_host(self):
+        # A known-good, high-reputation control endpoint. When set (default), a control
+        # egress probe distinguishes a genuine inline drop (`blocked`) from a broken
+        # environment (`error`). Set to "" to disable and fall back to the catalog's
+        # declared expected_on_block predicate.
+        return (_dget(self.raw, "run.control_host", "1.1.1.1") or "").strip()
+
+    @property
+    def control_port(self):
+        return int(_dget(self.raw, "run.control_port", 443))
+
+    @property
+    def control_enabled(self):
+        return bool(self.control_host)
+
+    @property
     def tmnids_url(self):
         return str(_dget(self.raw, "tmnids.url", ""))
 
@@ -366,7 +393,9 @@ class Settings:
 
     @property
     def tmnids_sha256(self):
-        return (_dget(self.raw, "tmnids.sha256", "") or "").strip()
+        # Config overrides the built-in pin; the pin is never empty, so verification
+        # is always mandatory (fail closed).
+        return ((_dget(self.raw, "tmnids.sha256", "") or "").strip() or TMNIDS_SHA256)
 
     @property
     def tmnids_timeout(self):
@@ -416,6 +445,8 @@ class Trigger:
         block = d.get("expected_on_block") or {}
         if not isinstance(allow, dict) or not isinstance(block, dict):
             raise ConfigError(f"{tid}: expected_on_allow/expected_on_block must be mappings")
+        _validate_predicate(tid, "expected_on_allow", allow)
+        _validate_predicate(tid, "expected_on_block", block)
         params = d.get("params") or []
         _validate_params(tid, params, argv)
         return Trigger(
@@ -457,6 +488,28 @@ class Trigger:
         }
 
 
+_PRED_KEYS = {"rc": int, "rc_nonzero": bool, "body_contains": str,
+              "http_code": int, "http_code_in": list}
+
+
+def _validate_predicate(tid, name, pred):
+    """Validate expected_on_allow/expected_on_block contents at LOAD time, so a bad
+    config fails loudly at startup rather than crashing a request thread at classify."""
+    for key, value in pred.items():
+        if key not in _PRED_KEYS:
+            raise ConfigError(f"{tid}: {name} has unknown key {key!r}")
+        exp = _PRED_KEYS[key]
+        if exp is bool and not isinstance(value, bool):
+            raise ConfigError(f"{tid}: {name}.{key} must be a boolean")
+        if exp is int and (not isinstance(value, int) or isinstance(value, bool)):
+            raise ConfigError(f"{tid}: {name}.{key} must be an integer")
+        if exp is str and not isinstance(value, str):
+            raise ConfigError(f"{tid}: {name}.{key} must be a string")
+        if exp is list and (not isinstance(value, list)
+                            or not all(isinstance(x, int) and not isinstance(x, bool) for x in value)):
+            raise ConfigError(f"{tid}: {name}.{key} must be a list of integers")
+
+
 def _validate_params(tid, params, argv):
     if not isinstance(params, list):
         raise ConfigError(f"{tid}: params must be a list")
@@ -472,6 +525,13 @@ def _validate_params(tid, params, argv):
             raise ConfigError(f"{tid}: param {name} must declare an 'allow' list or a 'pattern'")
         if "allow" in p and not isinstance(p["allow"], list):
             raise ConfigError(f"{tid}: param {name} 'allow' must be a list")
+        if "pattern" in p:
+            if not isinstance(p["pattern"], str):
+                raise ConfigError(f"{tid}: param {name} 'pattern' must be a string")
+            try:
+                re.compile(p["pattern"])          # fail at startup, not at click time
+            except re.error as e:
+                raise ConfigError(f"{tid}: param {name} has an invalid regex pattern: {e}") from e
         names.add(name)
     used = {tok[1:-1] for tok in argv if isinstance(tok, str) and tok.startswith("{") and tok.endswith("}")}
     missing = used - names
@@ -527,19 +587,26 @@ class TmnidsCache:
 
     def ensure(self):
         """Return the path to a ready-to-exec tmNIDS binary, downloading it once if
-        needed. Raises TmnidsError (→ classified as `error`, never `blocked`)."""
+        needed. Verification against the SHA-256 pin is MANDATORY and fails closed —
+        the binary is downloaded and executed, so TLS host auth alone is not enough
+        (a TLS-terminating SWG is in-path). Raises TmnidsError (→ `error`, never
+        `blocked`)."""
         with self._lock:
+            if not self.sha256:
+                raise TmnidsError("no tmNIDS SHA-256 pin configured — refusing to run")
             if os.path.exists(self.path) and os.access(self.path, os.X_OK):
-                if self.sha256:
-                    self._verify_file(self.path)
+                self._verify_file(self.path)          # re-verify the cached binary each time
                 return self.path
             if not self.url:
                 raise TmnidsError("no tmnids.url configured")
+            if not self.url.lower().startswith("https:"):
+                raise TmnidsError(f"tmnids.url must be https, got {self.url!r}")
             data = self._download()
-            if self.sha256:
-                got = hashlib.sha256(data).hexdigest()
-                if not hmac.compare_digest(got, self.sha256):
-                    raise TmnidsError(f"sha256 mismatch (pinned {self.sha256[:12]}…, got {got[:12]}…)")
+            got = hashlib.sha256(data).hexdigest()
+            if not hmac.compare_digest(got, self.sha256):
+                raise TmnidsError(
+                    f"tmNIDS sha256 mismatch — refusing (pinned {self.sha256[:12]}…, got {got[:12]}…). "
+                    "If 3CORESec updated tmNIDS, verify the new binary and set tmnids.sha256 in settings.yaml.")
             os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
             tmp = self.path + ".dl"
             try:
@@ -550,7 +617,7 @@ class TmnidsCache:
             except OSError as e:
                 _quiet_remove(tmp)
                 raise TmnidsError(f"could not install binary: {e}") from e
-            log.info("tmNIDS cached at %s (%d bytes)", self.path, len(data))
+            log.info("tmNIDS cached at %s (%d bytes, sha256 verified)", self.path, len(data))
             return self.path
 
     def _verify_file(self, path):
@@ -567,11 +634,13 @@ class TmnidsCache:
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 final = getattr(resp, "url", None) or self.url
-                if self.url.lower().startswith("https:") and not final.lower().startswith("https:"):
-                    raise TmnidsError(f"refusing redirect to insecure URL {final}")
-                data = resp.read()
+                if not final.lower().startswith("https:"):   # no http, no https->http redirect
+                    raise TmnidsError(f"refusing non-https download URL {final}")
+                data = resp.read(TMNIDS_MAX_BYTES + 1)        # bounded — no memory DoS
         except (urllib.error.URLError, OSError) as e:
             raise TmnidsError(f"download failed: {e}") from e
+        if len(data) > TMNIDS_MAX_BYTES:
+            raise TmnidsError("tmNIDS download exceeds the size limit — refusing")
         if not data:
             raise TmnidsError("download was empty")
         return data
@@ -605,6 +674,7 @@ class RunResult:
     duration_s: float = 0.0
     timed_out: bool = False
     error_reason: str = None   # set => classified as `error`
+    control_ok: bool = None    # egress control probe (tmnids); None = not run
 
 
 class ParamError(Exception):
@@ -644,13 +714,19 @@ def build_argv(trigger, params):
         val = params[name]
         if not isinstance(val, str):
             raise ParamError(f"param {name!r} must be a string")
+        if len(val) > 512 or any(ord(c) < 0x20 or ord(c) == 0x7F for c in val):
+            raise ParamError(f"param {name!r} contains control characters or is too long")
         allow = spec.get("allow")
         pattern = spec.get("pattern")
         if allow is not None:
             if val not in allow:
                 raise ParamError(f"param {name!r} value is not in the allowlist")
         elif pattern is not None:
-            if not re.fullmatch(pattern, val):
+            try:
+                matched = re.fullmatch(pattern, val)
+            except re.error as e:
+                raise ParamError(f"param {name!r} pattern error: {e}") from e
+            if not matched:
                 raise ParamError(f"param {name!r} value fails its pattern")
         else:
             raise ParamError(f"param {name!r} has no allowlist or pattern")  # fail closed
@@ -707,11 +783,27 @@ def run_trigger(trigger, params, settings, tmnids_cache):
     if trigger.runner == "curl":
         res.http_code = _parse_http_code(out)
     else:
-        # Non-curl (tmNIDS): a broken environment must report `error`, never a false
-        # `blocked`. Scan stderr for name-resolution / route / TLS failures.
+        # Non-curl (tmNIDS): distinguish a genuine inline drop (`blocked`) from a broken
+        # environment (`error`), and never report a false `blocked`.
         if _env_error_signature(err):
             res.error_reason = "environment error (name resolution / route / TLS): " + _first_line(err)
+        elif not _pred_match(trigger.expected_on_allow, res) and settings.control_enabled:
+            # The expected response did not come back. A control egress probe to a known-
+            # good host tells us whether general egress works (=> this specific flow was
+            # dropped => blocked) or the whole environment is broken (=> error). This is
+            # reliable where a hardcoded English stderr blocklist is not.
+            res.control_ok = _tcp_probe(settings.control_host, settings.control_port,
+                                        min(6.0, trigger.timeout))
     return res
+
+
+def _tcp_probe(host, port, timeout):
+    """Return True iff a TCP connection to host:port completes within `timeout`."""
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 
 def _dec(b):
@@ -748,6 +840,8 @@ def _parse_http_code(stdout):
 # ===========================================================================
 def classify_curl(rc, http_code):
     if rc == 0:
+        if http_code is None:
+            return ERROR                       # can't confirm a pass — fail toward honest
         return BLOCKED if http_code in (403, 451) else ALLOWED
     if rc in BROKEN_RC:
         return ERROR
@@ -783,11 +877,17 @@ def classify(trigger, result):
     if trigger.runner == "curl":
         state = classify_curl(result.rc, result.http_code)
         return state, f"curl rc={result.rc}, http={result.http_code}"
-    # tmNIDS / default: expectation-driven.
+    # tmNIDS / default: expectation-driven, with control-probe disambiguation.
     if _pred_match(trigger.expected_on_allow, result):
         return ALLOWED, "matched expected_on_allow"
+    if result.control_ok is True:
+        return BLOCKED, "egress control OK but the trigger's expected response did not return — dropped inline"
+    if result.control_ok is False:
+        return ERROR, "egress control probe failed — environment, not policy"
+    # No control signal (control probe disabled): fall back to the catalog's declared
+    # block predicate, as an operator-accepted, less-certain path.
     if _pred_match(trigger.expected_on_block, result):
-        return BLOCKED, "matched expected_on_block"
+        return BLOCKED, "matched expected_on_block (egress control disabled)"
     return ERROR, f"result matched neither expected_on_allow nor expected_on_block (rc={result.rc})"
 
 
@@ -869,6 +969,7 @@ def _is_loopback(host):
 class Handler(BaseHTTPRequestHandler):
     server_version = "SecVitals/" + __version__
     protocol_version = "HTTP/1.1"
+    timeout = 15   # bound a stalled read so a slow client can't pin a daemon thread
 
     @property
     def app(self):

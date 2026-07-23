@@ -12,7 +12,7 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 class TestLoad(unittest.TestCase):
     def test_load_real(self):
         settings = sv.load_settings(os.path.join(HERE, "config"))
-        self.assertEqual(settings.host, "127.0.0.1")
+        self.assertEqual(settings.wsl_python, "python3")
         self.assertFalse(settings.enable_live_suspect_hosts)
         triggers = sv.load_catalog(os.path.join(HERE, "config"), settings)
         self.assertTrue(any(t.id == "ns-uid" for t in triggers))

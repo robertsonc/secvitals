@@ -82,8 +82,7 @@ class TestYaml(unittest.TestCase):
     def test_real_config_files(self):
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         settings = sv.yaml_load_file(os.path.join(here, "config", "settings.yaml"))
-        self.assertEqual(settings["server"]["host"], "127.0.0.1")
-        self.assertEqual(settings["server"]["port"], 8787)
+        self.assertEqual(settings["wsl"]["python"], "python3")
         self.assertFalse(settings["enable_live_suspect_hosts"])
         self.assertIn("raw.githubusercontent.com", settings["tmnids"]["url"])
 

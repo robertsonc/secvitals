@@ -3,10 +3,15 @@
 # hand on the SE laptop; loaded once at startup. Anything security-relevant that a
 # presenter might need to change lives here, not in code.
 
-server:
-  host: "127.0.0.1"        # loopback only — this app executes local commands; it is NOT a LAN service
-  port: 8787
-  open_browser: true       # best-effort; the URL is always printed for the Windows browser
+wsl:
+  # The Tkinter console runs on Windows Python and fires each trigger by shelling one
+  # worker into WSL (native bash / curl, on the SD-WAN egress path). Leave distro empty
+  # to use wsl.exe's DEFAULT distro; set it to pin a specific one (e.g. "Ubuntu-22.04").
+  # Only consulted on Windows — run the app natively on Linux and it runs the worker
+  # in-process. Nothing is installed inside the distro; the console streams its own
+  # source over stdin, so `python` just needs to exist there.
+  distro: ""
+  python: "python3"
 
 # Live suspect-infrastructure gate.
 # Triggers flagged `hits_live_suspect_hosts` reach REAL suspect hosts / live Tor

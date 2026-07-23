@@ -1,7 +1,12 @@
 # Security Vitals has NO third-party dependencies — it uses only the Python standard
-# library (http.server, subprocess, urllib, hashlib, hmac, ssl, json, logging, ...).
+# library (tkinter, subprocess, urllib, hashlib, hmac, ssl, json, logging, ...).
 # This is deliberate: a tool that self-updates AND runs local commands keeps the
 # smallest possible supply chain. Python 3.8+ is required.
+#
+# The console is a Tkinter window, so the Windows Python that runs it needs tcl/tk
+# (the official python.org installer includes it; the bundled installer verifies this
+# and installs a python.org build if the found Python lacks it). tkinter is NOT needed
+# in WSL — the in-WSL worker uses only subprocess/urllib to run curl / tmNIDS.
 #
 # Release signing (offline, on a trusted machine) uses the `openssl` CLI, not a Python
 # package — see tools/sign_release.sh and docs/UPDATE_SECURITY.md.

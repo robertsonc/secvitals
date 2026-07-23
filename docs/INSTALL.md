@@ -1,36 +1,41 @@
 # Installing Security Vitals (Windows + WSL)
 
-Security Vitals runs **inside WSL** — its triggers use bash, tmNIDS and curl — and serves
-a local web UI you open in the **Windows browser**. The installer is a per-user Windows
-setup (no admin rights) with the same GUI experience as NetVitals, adapted for the WSL
-web app.
+Security Vitals is a **Tkinter window** that runs on **Windows Python**. When you fire a
+trigger it runs a short-lived **worker inside WSL** (native `bash` / `curl` / tmNIDS, on
+the SD-WAN egress path) and classifies the result. The installer is a per-user Windows
+setup (no admin rights) with the same GUI experience as NetVitals.
 
 ## Quick start
 
 1. Download this repo (or a release) and unzip it, **or** just grab `install.bat` +
    `install.ps1`.
 2. Double-click **`install.bat`**.
-3. In the setup window: confirm the WSL distro / Python status, pick the install folder
-   and port, and click **Install**. Then **Launch**.
+3. In the setup window: confirm the Python / WSL status, pick the install folder, and
+   click **Install**. Then **Launch**.
 
-That's it — the console starts in WSL and your browser opens at `http://127.0.0.1:8787/`.
-A Start Menu / Desktop shortcut (**Security Vitals**) does the same later, and it shows up
-in **Settings → Apps** so you can uninstall it like any Windows app.
+That's it — the **Security Vitals** window opens. A Start Menu / Desktop shortcut does the
+same later, and it shows up in **Settings → Apps** so you can uninstall it like any Windows
+app.
 
 ## What the installer does
 
-- Finds your **WSL** default distro and a **Python 3.8+** inside it. Security Vitals needs
-  no Tkinter (it's a web app), so any modern python3 works. If python3 is missing it is
-  installed into the distro as root — no password prompt — via `apt`/`dnf`/`apk`/`pacman`.
-- Copies the app into the distro's native filesystem (default
-  `~/.local/share/secvitals`) — fast, no `/mnt` line-ending quirks.
-- Writes a Windows **launcher** (`launch.cmd`) that starts the server in WSL and opens the
-  browser; closing the launcher window stops the console.
-- Creates **Start Menu / Desktop shortcuts** and registers an uninstaller in
-  **Settings → Apps**.
+- Finds a **Windows Python 3.8+ with Tkinter** (the console is a Tk window). If none is
+  found — or the one it finds lacks Tkinter — it installs Python from **python.org**
+  per-user (silently, no admin), with tcl/tk included.
+- Verifies **WSL** and its default distro, and makes sure **`python3`** exists inside it
+  (the worker needs it — no Tkinter required in WSL). If it's missing it's installed into
+  the distro as root via `apt`/`dnf`/`apk`/`pacman`. Nothing else is copied into WSL; the
+  console streams its own source to `python3 -` at run time.
+- Copies the app to the Windows install folder (default
+  `%LOCALAPPDATA%\Programs\SecVitals`) and **pins the verified distro** into
+  `config\settings.yaml`.
+- Creates **Start Menu / Desktop shortcuts** (a `pythonw` shortcut, so no console window)
+  and registers an uninstaller in **Settings → Apps**.
 
-It does **not** install WSL itself (that needs admin + a reboot). If WSL is missing, the
-setup window tells you: run `wsl --install` in an elevated PowerShell, reboot, then re-run.
+It does **not** install WSL itself (that needs admin + a reboot). If WSL is missing, setup
+**still installs** and the window still opens — it just warns you; run `wsl --install` in
+an elevated PowerShell, reboot, and triggers will fire. (WSL problems surface as an
+`error` at fire time, never as a false `blocked`.)
 
 ## Command line
 
@@ -42,28 +47,29 @@ powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 [options]
 |---|---|
 | `-Silent` | no window, no prompts (implies `-NoGui`) |
 | `-NoGui` | console output instead of the setup window |
-| `-InstallDir <path>` | Windows folder for the launcher + shortcuts (default `%LOCALAPPDATA%\Programs\SecVitals`) |
-| `-WslDir <path>` | folder inside WSL for the app (default `~/.local/share/secvitals`) |
-| `-Distro <name>` | target WSL distro (default: the WSL default distro) |
-| `-Port <n>` | loopback port (default 8787) |
+| `-InstallDir <path>` | Windows install folder (default `%LOCALAPPDATA%\Programs\SecVitals`) |
+| `-Distro <name>` | WSL distro the worker runs in (default: the WSL default distro) |
 | `-NoDesktopShortcut` / `-NoStartMenuShortcut` | skip that shortcut |
-| `-SkipPythonInstall` | never install python3 into WSL; fail if none is found |
+| `-SkipPythonInstall` | never install Python (Windows or WSL); fail / warn instead |
 | `-Branch <name>` | branch to fetch when downloading from GitHub (default `main`) |
 
-Silent example: `install.bat -Silent -Port 9000 -NoDesktopShortcut`
+Silent example: `install.bat -Silent -NoDesktopShortcut`
 
 ## Updating
 
-The launcher folder includes **`update.cmd`**, which runs the app's hardened, signed
-self-update inside WSL (`python3 secvitals.py --update` — pinned source, RSA-verified,
-fail closed; see [UPDATE_SECURITY.md](UPDATE_SECURITY.md)).
+Use **Check for updates** in the window, or run `py secvitals.py --update` from the install
+folder. Either way it runs the app's hardened, signed self-update (pinned source,
+RSA-verified, fail closed; on Windows the download retries through the system certificate
+store so a TLS-inspecting proxy doesn't break it — see
+[UPDATE_SECURITY.md](UPDATE_SECURITY.md)).
 
 ## Uninstalling
 
-Uninstall from **Settings → Apps**, or run `uninstall.ps1` from the launcher folder. It
-removes the shortcuts, the registration, the WSL app folder (only if it actually contains
-`secvitals.py`), and the launcher folder. The tmNIDS cache inside WSL
-(`~/.cache/secvitals`) is kept unless you pass `-PurgeSettings`.
+Uninstall from **Settings → Apps**, or run `uninstall.ps1` from the install folder. It
+removes the shortcuts, the registration, and the install folder (only if it actually
+contains `secvitals.py`). Security Vitals installs nothing inside WSL, so the only WSL
+footprint is the tmNIDS cache (`~/.cache/secvitals`), which is kept unless you pass
+`-PurgeSettings`.
 
 ## Files
 
@@ -71,11 +77,11 @@ removes the shortcuts, the registration, the WSL app folder (only if it actually
 |---|---|
 | `install.bat` | double-click bootstrapper (runs `install.ps1`, or fetches it from GitHub) |
 | `install.ps1` | the WinForms GUI installer (console/`-Silent` fallback) |
-| `uninstall.ps1` | per-user uninstaller (also removes the WSL app folder, safely) |
-| `launch.cmd` / `open-browser.cmd` | generated at install time — start the server + open the browser |
-| `update.cmd` | generated at install time — runs the signed self-update in WSL |
+| `uninstall.ps1` | per-user uninstaller (safe: refuses anything that isn't an install folder) |
+| `install-info.txt` | generated at install time — records the version + pinned distro |
 
-Reused from NetVitals: the installer's **UI/experience** (WinForms GUI, HPE theme, Python
-discovery, shortcuts, Add/Remove Programs registration, console fallback). Adapted: it
-targets **WSL + python3** instead of Windows Python + Tkinter, and launches a **server +
-browser** instead of a native Tkinter window.
+Reused from NetVitals: the installer's **UI/experience** (WinForms GUI, HPE theme, Windows
+Python discovery + python.org install, `pythonw` shortcut, Add/Remove Programs
+registration, console fallback). Added for Security Vitals: the **WSL worker check**
+(verify WSL + provision `python3` in the distro), preserving the base64 command transport
+that keeps PowerShell from mangling the bash it sends to WSL.

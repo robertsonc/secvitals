@@ -21,22 +21,32 @@ class TestLoad(unittest.TestCase):
         self.assertEqual(uid.cls, "ns-ids")
         self.assertEqual(uid.runner, "tmnids")
 
-    def test_full_tmnids_catalog(self):
+    def test_full_catalog(self):
         settings = sv.load_settings(os.path.join(HERE, "config"))
         triggers = sv.load_catalog(os.path.join(HERE, "config"), settings)
-        ids = [t.id for t in triggers]
-        # all 15 tmNIDS selectors present exactly once, argv[1] = -1..-15
-        selectors = sorted(int(t.argv[1].lstrip("-")) for t in triggers if t.runner == "tmnids")
-        self.assertEqual(selectors, list(range(1, 16)))
+        by_class = {}
         for t in triggers:
+            by_class.setdefault(t.cls, []).append(t)
+
+        # 15 tmNIDS signatures, selectors -1..-15
+        tmnids = [t for t in triggers if t.runner == "tmnids"]
+        self.assertEqual(len(tmnids), 15)
+        self.assertEqual(sorted(int(t.argv[1].lstrip("-")) for t in tmnids), list(range(1, 16)))
+        for t in tmnids:
             self.assertEqual(t.cls, "ns-ids")
-            self.assertEqual(t.runner, "tmnids")
             self.assertEqual(t.argv[0], "tmNIDS")
-        # live-suspect triggers gated off by default; the rest are runnable
+
+        # Phase 3: 10 WebCC (curl) + 1 IP-rep (iprep)
+        self.assertEqual(len(by_class.get("ns-webcc", [])), 10)
+        self.assertEqual(len(by_class.get("ns-iprep", [])), 1)
+        for t in by_class["ns-webcc"]:
+            self.assertEqual(t.runner, "curl")
+            self.assertEqual(t.argv[0], "curl")
+        self.assertEqual(by_class["ns-iprep"][0].runner, "iprep")
+
+        # live-suspect triggers gated off by default
         gated = {t.id for t in triggers if t.gated_disabled(settings)}
-        self.assertEqual(gated, {"ns-badcert", "ns-tor"})
-        self.assertIn("ns-c2", ids)
-        self.assertIn("ns-iplookup", ids)
+        self.assertEqual(gated, {"ns-badcert", "ns-tor", "web-cat-p2p", "ip-rep-tor"})
 
 
 class TestTriggerValidation(unittest.TestCase):

@@ -101,5 +101,5 @@ record.
 - [x] Phase 1 — catalog + runner + three-state classifier + `ns-uid`, in the UI shell
 - [x] Hardened self-update channel
 - [x] Phase 2 — full tmNIDS N/S catalog (15 triggers) + run-all with rate limiting
-- [ ] Phase 3 — WebCC + IP reputation (category / web-rep / ip-rep, control probe, Deny notice)
-- [ ] E/W — deferred
+- [x] Phase 3 — WebCC (category + web-reputation) + IP reputation (control probe + ratio, Deny notice)
+- [ ] E/W — deferred (schema reserves `ew`; not implemented)

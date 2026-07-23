@@ -31,8 +31,15 @@ run:
   control_host: "1.1.1.1"
   control_port: 443
 
-# (Phase 3 will add a `webcc:` section — Tor node-list URL/TTL and the IP-reputation
-#  sample size — when those runners are wired.)
+webcc:
+  # IP-reputation (ns-iprep) probes live Tor relays. The node list is cached with a TTL
+  # (not refetched per click). Before probing, a control egress probe (run.control_host)
+  # confirms egress; if it fails the whole test is reported `invalid`, and node results
+  # are reported as a ratio ("4 of 6 blocked"), never a single verdict.
+  tor_list_url: "https://raw.githubusercontent.com/SecOps-Institute/Tor-IP-Addresses/master/tor-nodes.lst"
+  tor_list_ttl_s: 3600
+  ip_rep_sample: 6                # probe the first N well-formed relay IPs
+  node_probe_timeout_s: 5
 
 update:
   # Pinned, non-overridable release source. The updater fails CLOSED without a valid

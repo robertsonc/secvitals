@@ -310,8 +310,10 @@ so the schema doesn't paint us into a corner:
 - [x] `blocked` vs `error` never collapse — three-state classifier; the tmNIDS path
   uses a **control egress probe** so a broken environment reports `error`, never a
   false `blocked`; live-suspect hosts flagged + disable-able (default off).
-- [ ] *(Phase 3)* three-state **WebCC** classifier; IP-rep control probe + ratio;
-  Deny-prerequisite notice.
+- [x] *(Phase 3)* three-state **WebCC** classifier (curl rc-set); IP-rep control probe
+  (fail => whole test `invalid`) + **ratio** reporting (never a single verdict); Tor list
+  cached with a TTL; Deny-prerequisite + silent-drop notice in the UI; EICAR labelled as
+  URL/category reputation, not file scanning.
 
 Phase 1 was hardened against an adversarial code review (11 confirmed findings: tmNIDS
 supply-chain integrity, tmNIDS block-vs-error honesty via the control probe, YAML

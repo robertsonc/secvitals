@@ -70,7 +70,7 @@ DEFAULT_ASSETS_DIR = os.path.join(HERE, "assets")
 
 # Known catalog vocabularies (fixed allowlists).
 CLASSES = {"ns-ids", "ns-webcc", "ns-iprep", "ew"}   # `ew` reserved / deferred
-RUNNERS = {"tmnids", "curl"}                          # `tcp443` reserved for Phase 3 IP-rep
+RUNNERS = {"tmnids", "curl", "iprep"}                 # `iprep` = built-in IP-reputation probe
 FLAGS = {"needs_internet", "needs_et_ruleset", "hits_live_suspect_hosts"}
 SEVERITIES = {"info", "warn", "crit"}
 
@@ -83,6 +83,7 @@ TMNIDS_MAX_BYTES = 4 * 1024 * 1024
 
 # UI result states — `blocked` and `error` MUST stay distinct.
 ALLOWED, BLOCKED, ERROR, INVALID = "allowed", "blocked", "error", "invalid"
+RATIO = "ratio"   # IP reputation reports N-of-M, never a single verdict
 
 
 # ===========================================================================
@@ -389,6 +390,22 @@ class Settings:
         return float(_dget(self.raw, "run.min_interval_s", 0.75))
 
     @property
+    def tor_list_url(self):
+        return str(_dget(self.raw, "webcc.tor_list_url", "") or "")
+
+    @property
+    def tor_list_ttl(self):
+        return float(_dget(self.raw, "webcc.tor_list_ttl_s", 3600))
+
+    @property
+    def ip_rep_sample(self):
+        return int(_dget(self.raw, "webcc.ip_rep_sample", 6))
+
+    @property
+    def node_probe_timeout(self):
+        return float(_dget(self.raw, "webcc.node_probe_timeout_s", 5))
+
+    @property
     def tmnids_url(self):
         return str(_dget(self.raw, "tmnids.url", ""))
 
@@ -667,6 +684,46 @@ def _quiet_remove(path):
         pass
 
 
+class TorNodeCache:
+    """Fetch + cache the Tor relay IP list with a TTL — not refetched on every click."""
+
+    def __init__(self, url, ttl):
+        self.url = url
+        self.ttl = ttl
+        self._lock = threading.Lock()
+        self._nodes = None
+        self._fetched_at = 0.0
+
+    def get(self):
+        """Return a list of relay IPv4 strings. Raises urllib/OSError on fetch failure
+        (the caller maps that to `error`)."""
+        with self._lock:
+            now = time.monotonic()
+            if self._nodes is not None and (now - self._fetched_at) < self.ttl:
+                return self._nodes
+            nodes = self._fetch()
+            self._nodes, self._fetched_at = nodes, now
+            return nodes
+
+    def _fetch(self):
+        if not self.url.lower().startswith("https:"):
+            raise OSError(f"tor_list_url must be https, got {self.url!r}")
+        req = urllib.request.Request(self.url, headers={"User-Agent": "secvitals/%s" % __version__})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = resp.read(8 * 1024 * 1024).decode("utf-8", "replace")
+        return _parse_tor_ips(data)
+
+
+def _parse_tor_ips(text):
+    """Extract well-formed IPv4 addresses from the node list, skipping comments/junk."""
+    out = []
+    for line in (text or "").splitlines():
+        ip = line.strip()
+        if re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", ip) and all(0 <= int(o) <= 255 for o in ip.split(".")):
+            out.append(ip)
+    return out
+
+
 # ===========================================================================
 # Runner  —  subprocess with an argv list, no shell=True, per-trigger timeout
 # ===========================================================================
@@ -909,6 +966,7 @@ class App:
         self.token = secrets.token_urlsafe(32)
         self.tmnids = TmnidsCache(settings.tmnids_url, settings.tmnids_cache_path,
                                   settings.tmnids_sha256, settings.tmnids_timeout)
+        self.tor_cache = TorNodeCache(settings.tor_list_url, settings.tor_list_ttl)
         self._run_lock = threading.Lock()   # serialize triggers — clean before/after on stage
         self._last_run_end = 0.0            # for server-side rate limiting
 
@@ -930,6 +988,10 @@ class App:
             if gap > 0:
                 time.sleep(min(gap, 5.0))       # server-side rate limiting (spacing)
             log.info("run start id=%s", trigger_id)
+            if trigger.runner == "iprep":
+                out = self._run_iprep(trigger)
+                log.info("run done id=%s state=%s", trigger_id, out.get("state"))
+                return trigger, out
             result = run_trigger(trigger, params, self.settings, self.tmnids)
             state, reason = classify(trigger, result)
             log.info("run done id=%s state=%s rc=%s dur=%.2fs argv=%s",
@@ -948,6 +1010,46 @@ class App:
         finally:
             self._last_run_end = time.monotonic()
             self._run_lock.release()
+
+    def _run_iprep(self, trigger):
+        """IP-reputation probe: a control egress probe first (fail => whole test invalid),
+        then connect to the first N Tor nodes on :443 and report a RATIO (never a single
+        verdict). Called while the run lock is held."""
+        s = self.settings
+        if not s.control_enabled:
+            return {"state": ERROR, "expected_fire": trigger.expected_fire,
+                    "reason": "IP reputation needs a control probe — set run.control_host"}
+        if not _tcp_probe(s.control_host, s.control_port, 6.0):
+            return {"state": INVALID, "expected_fire": trigger.expected_fire,
+                    "reason": (f"control probe to {s.control_host}:{s.control_port} failed — "
+                               "egress is broken, so the whole test is invalid (not blocked)")}
+        try:
+            nodes = self.tor_cache.get()
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            return {"state": ERROR, "expected_fire": trigger.expected_fire,
+                    "reason": f"could not fetch the Tor node list: {e}"}
+        sample = nodes[:max(1, s.ip_rep_sample)]
+        if not sample:
+            return {"state": ERROR, "expected_fire": trigger.expected_fire,
+                    "reason": "the Tor node list was empty"}
+        blocked = reached = 0
+        details = []
+        for ip in sample:
+            if _tcp_probe(ip, 443, s.node_probe_timeout):
+                reached += 1
+                details.append(f"{ip}:443  reached  (not blocked by IP reputation)")
+            else:
+                blocked += 1
+                details.append(f"{ip}:443  blocked  (timeout/reset)")
+        return {
+            "state": RATIO,
+            "ratio": {"blocked": blocked, "reached": reached, "total": len(sample)},
+            "reason": (f"{blocked} of {len(sample)} Tor nodes blocked by IP reputation "
+                       "(control OK). A ratio, not a single verdict — a lone reach may be a "
+                       "live relay; the EC IP-rep stats are authoritative."),
+            "expected_fire": trigger.expected_fire,
+            "stdout": "\n".join(details),
+        }
 
 
 def _clip(s, n):
@@ -1168,7 +1270,9 @@ button.fire:disabled{background:var(--panel);color:var(--faint);cursor:not-allow
 .state.blocked{background:rgba(1,169,130,.16);color:var(--hpe);border:1px solid var(--hpe)}
 .state.error{background:rgba(224,87,74,.16);color:var(--crit);border:1px solid var(--crit)}
 .state.invalid{background:rgba(254,201,1,.14);color:var(--gold);border:1px solid var(--gold)}
+.state.ratio{background:rgba(0,176,230,.12);color:var(--info);border:1px solid var(--info)}
 .state.running{background:var(--panel);color:var(--dim);border:1px solid var(--grid)}
+.notice.webcc{border-color:var(--info)}
 .result{font-size:12.5px;color:var(--dim);border-top:1px dashed var(--grid);padding-top:9px;display:none}
 .result.show{display:block}
 .result .reason{color:var(--ink);margin-bottom:6px}
@@ -1197,6 +1301,7 @@ footer{margin-top:26px;padding-top:12px;border-top:1px solid var(--grid);color:v
   </div>
 
   <div id="live-notice" class="notice" style="display:none"></div>
+  <div id="webcc-notice" class="notice webcc" style="display:none"></div>
 
   <div class="toolbar">
     <button id="run-all" class="ghost">Run all enabled</button>
@@ -1233,6 +1338,14 @@ async function loadCatalog(){
     ln.innerHTML = "<b>Live suspect-infrastructure triggers are disabled.</b> " +
       "Triggers that reach real suspect hosts / live Tor nodes are greyed out. " +
       "Set <span class='kv'>enable_live_suspect_hosts: true</span> in config/settings.yaml to run them in a lab.";
+  }
+  const wn = document.getElementById("webcc-notice");
+  if (data.triggers.some(t => t.class === "ns-webcc" || t.class === "ns-iprep")){
+    wn.style.display = "block";
+    wn.innerHTML = "<b>WebCC / IP reputation:</b> EdgeConnect denies by <b>silently dropping the flow</b> " +
+      "— there is no block page, so a deny shows as a timeout/reset. <b>Prerequisite:</b> the category or " +
+      "reputation must be set to <b>Deny</b> in policy for a test to block; an <i>allowed</i> result most " +
+      "often means the policy isn't set, not that enforcement failed.";
   }
   const grid = document.getElementById("grid");
   grid.innerHTML = ""; REG.length = 0;
@@ -1326,8 +1439,13 @@ async function runAll(){
 
 function render(d, state, res){
   const s = d.state || "error";
-  const labels = {allowed:"sent · allowed", blocked:"sent · blocked", error:"error", invalid:"disabled"};
-  state.className = "state " + s; state.textContent = labels[s] || s;
+  const labels = {allowed:"sent · allowed", blocked:"sent · blocked", error:"error", invalid:"invalid"};
+  if (s === "ratio" && d.ratio){
+    state.className = "state ratio";
+    state.textContent = d.ratio.blocked + " / " + d.ratio.total + " blocked";
+  } else {
+    state.className = "state " + s; state.textContent = labels[s] || s;
+  }
   res.className = "result show";
   res.innerHTML = "";
   res.appendChild(el("div", "reason", d.reason || ""));

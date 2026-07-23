@@ -4,24 +4,19 @@
   Uninstall Security Vitals (per-user install; no admin rights required).
 
 .DESCRIPTION
-  Removes the shortcuts, the Settings > Apps registration, and this Windows install
-  folder. Security Vitals installs NOTHING inside WSL (each trigger's worker is streamed
-  in over stdin at run time), so the only WSL footprint is the tmNIDS binary cache under
-  ~/.cache/secvitals, which is kept unless -PurgeSettings is given.
+  Removes the shortcuts, the Settings > Apps registration, and this install folder.
+  Security Vitals runs entirely on Windows and keeps no other on-disk state, so there
+  is nothing else to clean up.
 
 .PARAMETER Silent
   No confirmation prompt.
-.PARAMETER PurgeSettings
-  Also delete the WSL cache (~/.cache/secvitals, including the pinned tmNIDS binary).
 #>
 [CmdletBinding()]
 param(
-    [switch]$Silent,
-    [switch]$PurgeSettings
+    [switch]$Silent
 )
 
 $ErrorActionPreference = "SilentlyContinue"
-$env:WSL_UTF8 = "1"
 
 $AppName    = "Security Vitals"
 $AppKey     = "SecVitals"
@@ -48,19 +43,9 @@ foreach ($p in $protected) {
     }
 }
 
-# Read the distro that ran the worker (only needed for -PurgeSettings).
-$distro = ""
-$infoPath = Join-Path $InstallDir "install-info.txt"
-if (Test-Path $infoPath) {
-    foreach ($line in (Get-Content $infoPath)) {
-        if ("$line" -match '^\s*Distro\s*=\s*(.+?)\s*$') { $distro = $Matches[1] }
-    }
-}
-
 if (-not $Silent) {
     Write-Host "This removes $AppName:"
-    Write-Host "  Windows install folder : $InstallDir"
-    if ($PurgeSettings -and $distro) { Write-Host "  WSL tmNIDS cache       : $distro : ~/.cache/secvitals" }
+    Write-Host "  Install folder : $InstallDir"
     $answer = Read-Host "Continue? [y/N]"
     if (-not ($answer -and $answer.Trim().ToLower().StartsWith("y"))) {
         Write-Host "Cancelled."; exit 1
@@ -74,14 +59,6 @@ Remove-Item (Join-Path ([Environment]::GetFolderPath("Desktop")) "$AppName.lnk")
 
 # Settings > Apps registration
 Remove-Item "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$AppKey" -Recurse -Force
-
-# Optional: purge the WSL-side tmNIDS cache. base64 the command so its quotes survive the
-# PowerShell -> wsl.exe -> bash boundary intact.
-if ($PurgeSettings -and $distro -and (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
-    $pb64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes('rm -rf "$HOME/.cache/secvitals"'))
-    & wsl.exe -d $distro -e bash -lc "echo $pb64 | base64 -d | bash" | Out-Null
-    Write-Host "Purged WSL cache (~/.cache/secvitals)."
-}
 
 Write-Host "$AppName has been removed."
 

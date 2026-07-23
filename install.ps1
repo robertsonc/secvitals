@@ -5,25 +5,22 @@
 
 .DESCRIPTION
   Installs Security Vitals for the current user:
-    * finds Windows Python 3.8+ WITH Tkinter (the console is a Tkinter window); if
+    * finds a Windows Python 3.8+ WITH Tkinter (the console is a Tkinter window); if
       none, downloads the official python.org installer and installs it per-user,
-    * verifies WSL and makes sure python3 exists inside the target distro - each
-      fired trigger runs a short-lived worker there (native bash / curl, on the
-      SD-WAN egress path). Nothing is copied into the distro; the console streams
-      its own source to `python3 -` over stdin,
-    * copies the app to the install folder and pins the verified WSL distro into
-      config\settings.yaml,
-    * creates Start Menu / Desktop shortcuts that open the window (pythonw.exe, so
-      no console window),
+    * copies the app to the install folder (from this folder when run out of a repo
+      checkout / release download, otherwise straight from GitHub),
+    * creates Start Menu / Desktop shortcuts that open the window (pythonw.exe, so no
+      console window),
     * registers in Settings > Apps ("Add/Remove Programs") with an uninstaller.
+
+  Everything runs NATIVELY on Windows - no WSL. Triggers use curl.exe (ships with
+  Windows 10 1803+) and small built-in Python probes; nothing is installed in a distro.
 
   Run it by double-clicking install.bat, or directly:
     powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1
 
 .PARAMETER InstallDir
   Where to install (default: %LOCALAPPDATA%\Programs\SecVitals).
-.PARAMETER Distro
-  WSL distro to run the worker in (default: wsl.exe's default distro).
 .PARAMETER NoGui
   Use console output instead of the setup window.
 .PARAMETER Silent
@@ -33,14 +30,13 @@
 .PARAMETER NoStartMenuShortcut
   Skip the Start Menu shortcut.
 .PARAMETER SkipPythonInstall
-  Never install Python (Windows or WSL); fail / warn instead.
+  Never install Python; fail instead if a usable one isn't found.
 .PARAMETER Branch
   Git branch to fetch when downloading from GitHub (default: main).
 #>
 [CmdletBinding()]
 param(
     [string]$InstallDir = "$env:LOCALAPPDATA\Programs\SecVitals",
-    [string]$Distro = "",
     [switch]$NoGui,
     [switch]$Silent,
     [switch]$NoDesktopShortcut,
@@ -51,19 +47,15 @@ param(
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
-$env:WSL_UTF8 = "1"
 
 $AppName       = "Security Vitals"
 $AppKey        = "SecVitals"   # registry key + folder name
 $Repo          = "robertsonc/secvitals"
 $RepoUrl       = "https://github.com/$Repo"
-$PythonVersion = "3.12.10"     # installed only when no usable Windows Python exists
+$PythonVersion = "3.12.10"     # installed only when no usable Python exists
 $AppFiles      = @("secvitals.py", "install.ps1", "uninstall.ps1", "install.bat",
                    "README.md", "requirements.txt")
 $AppDirs       = @("config", "assets", "docs")
-
-$script:Distro    = $Distro
-$script:WslPython = "python3"
 
 if ($Silent) { $NoGui = $true }
 
@@ -89,7 +81,7 @@ function Write-Log {
 }
 
 # ---------------------------------------------------------------------------
-# Windows Python discovery / install (needs Tkinter - the console is a Tk window)
+# Python discovery / install (needs Tkinter - the console is a Tk window)
 # ---------------------------------------------------------------------------
 function Test-PythonExe {
     # Probe one candidate interpreter. Returns $null or an object with
@@ -215,7 +207,7 @@ function Install-Python {
 function Resolve-Python {
     $py = Find-Python
     if ($py -and $py.HasTk) {
-        Write-Log "Found Windows Python $($py.Version) with Tkinter -> $($py.Exe)"
+        Write-Log "Found Python $($py.Version) with Tkinter -> $($py.Exe)"
         return $py
     }
     if ($py -and -not $py.HasTk) {
@@ -229,113 +221,20 @@ function Resolve-Python {
     if ($SkipPythonInstall) {
         throw "No Python 3.8+ found and -SkipPythonInstall was given."
     }
-    Write-Log "No usable Windows Python found - installing Python $PythonVersion for the current user."
+    Write-Log "No usable Python found - installing Python $PythonVersion for the current user."
     return Install-Python
 }
 
-# ---------------------------------------------------------------------------
-# WSL discovery + python3-in-distro (where each fired trigger's worker runs)
-# ---------------------------------------------------------------------------
-function Get-DefaultDistro {
-    if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) { return $null }
-    try {
-        foreach ($ln in (& wsl.exe -l -v 2>$null)) {
-            if ("$ln" -match '^\s*\*\s+(\S+)') { return $Matches[1] }
-        }
-    } catch {}
-    try {
-        foreach ($ln in (& wsl.exe -l -q 2>$null)) {
-            $t = "$ln".Trim(); if ($t) { return $t }
-        }
-    } catch {}
-    return $null
-}
-
-function Invoke-Wsl {
-    # Run a bash command in the target distro. The script is base64-encoded so its own
-    # quoting survives the PowerShell -> wsl.exe -> bash argument boundary intact: Windows
-    # PowerShell mangles embedded double quotes when passing native-exe arguments, which
-    # otherwise breaks any command containing quotes (the version probe, the pkg install).
-    param([string]$Command, [switch]$AsRoot)
-    $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Command))
-    $a = @("-d", $script:Distro)
-    if ($AsRoot) { $a += @("-u", "root") }
-    $a += @("-e", "bash", "-lc", "echo $b64 | base64 -d | bash")
-    return (& wsl.exe @a)
-}
-
-function Test-Wsl {
-    if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) { return $false }
-    if (-not $script:Distro) { $script:Distro = Get-DefaultDistro }
-    if (-not $script:Distro) { return $false }
-    try {
-        $ok = (Invoke-Wsl -Command "echo __wsl_ok__" | Where-Object { "$_".Trim() -eq "__wsl_ok__" })
-        return [bool]$ok
-    } catch { return $false }
-}
-
-function Get-WslPython {
-    # Returns a version string like "3.12", or $null. The worker needs no Tkinter in WSL.
-    # `python3 --version` avoids embedded quotes; scanning every line means a login-shell
-    # banner can't be mistaken for the version.
-    try {
-        $out = Invoke-Wsl -Command 'command -v python3 >/dev/null 2>&1 && python3 --version 2>&1 || true'
-    } catch { return $null }
-    foreach ($line in @($out)) {
-        if ("$line" -match 'Python\s+(\d+)\.(\d+)') {
-            if (([int]$Matches[1] -gt 3) -or ([int]$Matches[1] -eq 3 -and [int]$Matches[2] -ge 8)) {
-                return "$($Matches[1]).$($Matches[2])"
-            }
-        }
-    }
-    return $null
-}
-
-function Install-WslPython {
-    Write-Log "Installing python3 into WSL distro '$($script:Distro)' (as root) ..."
-    $sh = 'set -e; ' +
-          'if command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y python3; ' +
-          'elif command -v dnf >/dev/null 2>&1; then dnf install -y python3; ' +
-          'elif command -v apk >/dev/null 2>&1; then apk add --no-cache python3; ' +
-          'elif command -v pacman >/dev/null 2>&1; then pacman -Sy --noconfirm python; ' +
-          'else echo NO_PKG_MGR; exit 1; fi'
-    Invoke-Wsl -Command $sh -AsRoot | ForEach-Object { if ("$_".Trim()) { Write-Log "  $_" } }
-    $v = Get-WslPython
-    if (-not $v) {
-        throw "Could not install python3 in WSL automatically. Open the '$($script:Distro)' distro and install it (e.g. 'sudo apt install python3'), then re-run setup."
-    }
-    Write-Log "python3 $v ready in WSL."
-    return $v
-}
-
-function Resolve-WslWorker {
-    # Best-effort: verify WSL + python3 in the distro so triggers can fire. WSL problems
-    # DON'T block the install (the window still opens; firing shows a clear error) - they
-    # are surfaced as warnings so the SE can fix WSL and try again without reinstalling.
-    if (-not (Test-Wsl)) {
-        Write-Log "WARNING: WSL was not detected (or has no default distro)."
-        Write-Log "  Security Vitals fires each trigger through WSL. Install WSL (`"wsl --install`")"
-        Write-Log "  and a distro, then re-run setup. The window will still open meanwhile."
-        return $false
-    }
-    Write-Log "Using WSL distro '$($script:Distro)' for the trigger worker."
-    $v = Get-WslPython
-    if (-not $v) {
-        if ($SkipPythonInstall) {
-            Write-Log "WARNING: no python3 in WSL '$($script:Distro)' and -SkipPythonInstall was given."
-            Write-Log "  Install it later with 'sudo apt install python3' inside the distro."
-            return $false
-        }
-        try {
-            $v = Install-WslPython
-        } catch {
-            Write-Log "WARNING: $($_.Exception.Message)"
-            return $false
-        }
+function Test-Curl {
+    # curl.exe ships with Windows 10 1803+; the console shells out to it for HTTP
+    # triggers. Its absence isn't fatal (the window still opens), so just note it.
+    $curl = Join-Path $env:SystemRoot "System32\curl.exe"
+    if ((Test-Path $curl) -or (Get-Command curl.exe -ErrorAction SilentlyContinue)) {
+        Write-Log "Found curl.exe - HTTP triggers will run natively."
     } else {
-        Write-Log "Found python3 $v in WSL '$($script:Distro)'."
+        Write-Log "NOTE: curl.exe was not found. It ships with Windows 10 1803+; on older"
+        Write-Log "  Windows, install curl so the HTTP triggers can run (dns/tcp still work)."
     }
-    return $true
 }
 
 # ---------------------------------------------------------------------------
@@ -383,25 +282,6 @@ function Install-AppFiles {
     foreach ($d in $AppDirs) {
         $src = Join-Path $SourceDir $d
         if (Test-Path $src) { Copy-Item $src -Destination $InstallDir -Recurse -Force }
-    }
-}
-
-function Set-WslDistroInSettings {
-    # Pin the verified distro into the INSTALLED settings.yaml, but only if the user
-    # hasn't already set one (shipped value is an empty string).
-    param([string]$DistroName)
-    if (-not $DistroName) { return }
-    $path = Join-Path $InstallDir "config\settings.yaml"
-    if (-not (Test-Path $path)) { return }
-    try {
-        $text = Get-Content -Path $path -Raw
-        $patched = [regex]::Replace($text, '(?m)^(\s*distro:\s*)""\s*$', "`${1}`"$DistroName`"", 1)
-        if ($patched -ne $text) {
-            Set-Content -Path $path -Value $patched -Encoding UTF8
-            Write-Log "Pinned WSL distro '$DistroName' in config\settings.yaml."
-        }
-    } catch {
-        Write-Log "NOTE: could not pin the WSL distro in settings.yaml ($($_.Exception.Message)); the app will use the default distro."
     }
 }
 
@@ -463,10 +343,7 @@ function Register-App {
 
 function Write-InstallInfo {
     param([string]$Version)
-    # A small record the uninstaller reads (Windows-only footprint; the app deploys
-    # nothing inside WSL, so there is no WSL folder to remove).
-    $info = @("AppName = $AppName", "Version = $Version",
-              "InstallDir = $InstallDir", "Distro = $($script:Distro)")
+    $info = @("AppName = $AppName", "Version = $Version", "InstallDir = $InstallDir")
     Set-Content -Path (Join-Path $InstallDir "install-info.txt") -Value $info -Encoding UTF8
 }
 
@@ -476,12 +353,11 @@ function Write-InstallInfo {
 function Invoke-Install {
     Write-Log "=== $AppName setup ==="
     $py = Resolve-Python
-    $null = Resolve-WslWorker            # best-effort; warnings only
+    Test-Curl
     $srcDir = Get-SourceDir
     $version = Get-AppVersion -Dir $srcDir
     Write-Log "Installing $AppName $version ..."
     Install-AppFiles -SourceDir $srcDir
-    Set-WslDistroInSettings -DistroName $script:Distro
     Install-Shortcuts -Python $py
     Register-App -Version $version
     Write-InstallInfo -Version $version
@@ -513,11 +389,10 @@ function Show-InstallerGui {
     $txtCol = [System.Drawing.Color]::FromArgb(242, 244, 245)
     $dimCol = [System.Drawing.Color]::FromArgb(154, 163, 173)
     $green  = [System.Drawing.Color]::FromArgb(1, 169, 130)
-    $amber  = [System.Drawing.Color]::FromArgb(255, 131, 0)
 
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "$AppName setup"
-    $form.ClientSize = New-Object System.Drawing.Size(560, 500)
+    $form.ClientSize = New-Object System.Drawing.Size(560, 470)
     $form.BackColor = $bg
     $form.FormBorderStyle = "FixedSingle"
     $form.MaximizeBox = $false
@@ -542,10 +417,10 @@ function Show-InstallerGui {
     $pyLabel = New-Object System.Windows.Forms.Label
     $pyLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
     $pyLabel.AutoSize = $true
-    $pyLabel.Location = New-Object System.Drawing.Point(22, 74)
+    $pyLabel.Location = New-Object System.Drawing.Point(22, 78)
     $pyProbe = Find-Python
     if ($pyProbe -and $pyProbe.HasTk) {
-        $pyLabel.Text = "Windows Python $($pyProbe.Version) with Tkinter found - nothing extra to install."
+        $pyLabel.Text = "Python $($pyProbe.Version) with Tkinter found - nothing extra to install."
         $pyLabel.ForeColor = $green
     } elseif ($pyProbe) {
         $pyLabel.Text = "Python $($pyProbe.Version) found but without Tkinter - Python $PythonVersion will be added (per-user, python.org)."
@@ -556,26 +431,12 @@ function Show-InstallerGui {
     }
     $form.Controls.Add($pyLabel)
 
-    $wslLabel = New-Object System.Windows.Forms.Label
-    $wslLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
-    $wslLabel.AutoSize = $true
-    $wslLabel.Location = New-Object System.Drawing.Point(22, 94)
-    if (-not $script:Distro) { $script:Distro = Get-DefaultDistro }
-    if ($script:Distro) {
-        $wslLabel.Text = "WSL distro '$($script:Distro)' will run the trigger worker (python3 added if missing)."
-        $wslLabel.ForeColor = $dimCol
-    } else {
-        $wslLabel.Text = "WSL not detected - triggers need it. Install with 'wsl --install'; the window still opens."
-        $wslLabel.ForeColor = $amber
-    }
-    $form.Controls.Add($wslLabel)
-
     $dirLabel = New-Object System.Windows.Forms.Label
     $dirLabel.Text = "Install folder:"
     $dirLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
     $dirLabel.ForeColor = $txtCol
     $dirLabel.AutoSize = $true
-    $dirLabel.Location = New-Object System.Drawing.Point(22, 124)
+    $dirLabel.Location = New-Object System.Drawing.Point(22, 108)
     $form.Controls.Add($dirLabel)
 
     $dirBox = New-Object System.Windows.Forms.TextBox
@@ -584,7 +445,7 @@ function Show-InstallerGui {
     $dirBox.BackColor = $panel
     $dirBox.ForeColor = $txtCol
     $dirBox.BorderStyle = "FixedSingle"
-    $dirBox.Location = New-Object System.Drawing.Point(24, 144)
+    $dirBox.Location = New-Object System.Drawing.Point(24, 128)
     $dirBox.Size = New-Object System.Drawing.Size(430, 24)
     $form.Controls.Add($dirBox)
 
@@ -594,7 +455,7 @@ function Show-InstallerGui {
     $browse.BackColor = $panel
     $browse.ForeColor = $txtCol
     $browse.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(54, 59, 68)
-    $browse.Location = New-Object System.Drawing.Point(462, 143)
+    $browse.Location = New-Object System.Drawing.Point(462, 127)
     $browse.Size = New-Object System.Drawing.Size(78, 25)
     $browse.Add_Click({
         $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
@@ -611,7 +472,7 @@ function Show-InstallerGui {
     $cbStart.ForeColor = $txtCol
     $cbStart.Checked = -not $NoStartMenuShortcut
     $cbStart.AutoSize = $true
-    $cbStart.Location = New-Object System.Drawing.Point(24, 178)
+    $cbStart.Location = New-Object System.Drawing.Point(24, 162)
     $form.Controls.Add($cbStart)
 
     $cbDesk = New-Object System.Windows.Forms.CheckBox
@@ -620,7 +481,7 @@ function Show-InstallerGui {
     $cbDesk.ForeColor = $txtCol
     $cbDesk.Checked = -not $NoDesktopShortcut
     $cbDesk.AutoSize = $true
-    $cbDesk.Location = New-Object System.Drawing.Point(200, 178)
+    $cbDesk.Location = New-Object System.Drawing.Point(200, 162)
     $form.Controls.Add($cbDesk)
 
     $log = New-Object System.Windows.Forms.TextBox
@@ -631,13 +492,13 @@ function Show-InstallerGui {
     $log.BackColor = $panel
     $log.ForeColor = $txtCol
     $log.BorderStyle = "FixedSingle"
-    $log.Location = New-Object System.Drawing.Point(24, 210)
+    $log.Location = New-Object System.Drawing.Point(24, 194)
     $log.Size = New-Object System.Drawing.Size(516, 200)
     $form.Controls.Add($log)
 
     $bar = New-Object System.Windows.Forms.ProgressBar
     $bar.Style = "Continuous"
-    $bar.Location = New-Object System.Drawing.Point(24, 418)
+    $bar.Location = New-Object System.Drawing.Point(24, 402)
     $bar.Size = New-Object System.Drawing.Size(516, 6)
     $form.Controls.Add($bar)
 
@@ -648,7 +509,7 @@ function Show-InstallerGui {
     $btnInstall.BackColor = $green
     $btnInstall.ForeColor = [System.Drawing.Color]::White
     $btnInstall.FlatAppearance.BorderSize = 0
-    $btnInstall.Location = New-Object System.Drawing.Point(430, 448)
+    $btnInstall.Location = New-Object System.Drawing.Point(430, 422)
     $btnInstall.Size = New-Object System.Drawing.Size(110, 36)
     $form.Controls.Add($btnInstall)
 
@@ -659,7 +520,7 @@ function Show-InstallerGui {
     $btnLaunch.BackColor = $green
     $btnLaunch.ForeColor = [System.Drawing.Color]::White
     $btnLaunch.FlatAppearance.BorderSize = 0
-    $btnLaunch.Location = New-Object System.Drawing.Point(430, 448)
+    $btnLaunch.Location = New-Object System.Drawing.Point(430, 422)
     $btnLaunch.Size = New-Object System.Drawing.Size(110, 36)
     $btnLaunch.Visible = $false
     $form.Controls.Add($btnLaunch)
@@ -671,7 +532,7 @@ function Show-InstallerGui {
     $btnClose.BackColor = $panel
     $btnClose.ForeColor = $txtCol
     $btnClose.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(54, 59, 68)
-    $btnClose.Location = New-Object System.Drawing.Point(330, 448)
+    $btnClose.Location = New-Object System.Drawing.Point(330, 422)
     $btnClose.Size = New-Object System.Drawing.Size(90, 36)
     $btnClose.Add_Click({ $form.Close() })
     $form.Controls.Add($btnClose)
@@ -754,7 +615,6 @@ if ($useGui) {
     if (-not $Silent) {
         Write-Host "=== $AppName setup (console) ==="
         Write-Host "Install folder : $InstallDir"
-        Write-Host "WSL distro     : $(if ($script:Distro) { $script:Distro } else { '(default)' })"
         Write-Host "Shortcuts      : StartMenu=$(-not $NoStartMenuShortcut)  Desktop=$(-not $NoDesktopShortcut)"
         $answer = Read-Host "Proceed? [Y/n]"
         if ($answer -and $answer.Trim().ToLower().StartsWith("n")) {

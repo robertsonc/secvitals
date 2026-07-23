@@ -1,0 +1,78 @@
+==============================================================================
+ IDS / IPS TRIGGER DEMO  -  tmNIDS  x  EdgeConnect (ECOS Suricata v7)
+==============================================================================
+
+ SIGNAL PATH   Windows + WSL  ->  EdgeConnect (Suricata)  ->  Internet
+ WSL2 NATs through the Windows host, so alerts show the host LAN IP
+ (e.g. 10.13.1.100) as src, zone Untrust outbound.  mode: ids = detect only.
+
+ LAUNCHERS (in this Demo Toolbox folder)
+   Run-IDS-Menu.cmd        pick one signature at a time   (best for demo)
+   Run-IDS-Test.cmd        fire ALL tests   (tmNIDS -99)
+   Run-IDS-Test.cmd 6      fire only test 6
+
+ THREAT CLASS   [C] Malware/Targeted   [P] Policy/PUP   [R] Recon/Info
+
+------------------------------------------------------------------------------
+ #   CLS  TEST                  TRAFFIC IT SENDS              WHAT FIRES
+------------------------------------------------------------------------------
+ 1   [R]  Linux UID             GET /uid -> "uid=0(root)"     2100498 GPL id
+                                                              check returned root
+ 2   [P]  HTTP Basic Auth       Authorization: Basic          ET POLICY basic
+                                (root:root)                   auth base64 creds
+ 3   [C]  Malware User-Agent    UAs: BlackSun, JEDI-VCL,      ET USER_AGENTS
+                                HttpDownload, agent, MSIE     suspicious UA (several)
+ 4   [C]  Bad Certs & CAs       TLS SNI to known-bad hosts    2029346 Winnti DNS
+                                + example.livehost.live       (+2022134, 2020493,
+                                                              2033098, 2045597,
+                                                              2053979, 2054198/200,
+                                                              2021941)  << your alert
+ 5   [P]  Tor .onion + nodes    dig .onion + TCP/443 to       ET TOR known node /
+                                live Tor nodes                .onion lookup
+ 6   [P]  EXE / DLL download    GET /exe/calc.exe over HTTP   ET POLICY PE EXE/DLL
+                                                              download
+ 7   [P]  PDF w/ embedded file  GET /pdf/pdf.pdf              ET POLICY PDF with
+                                                              embedded file
+ 8   [R]  SSH outbound scan     nc testmynids.org:22          GPL/ET outbound SSH
+                                                              scan
+ 9   [R]  Miscellaneous DNS     dig sinkhole.cert.pl,         ET DNS sinkhole /
+                                nic.su, invalid.no-ip.com     .su TLD / DDNS
+ 10  [P]  Anon filesharing      TLS SNI fromsmash.com         ET POLICY anon
+                                                              upload / filesharing
+ 11  [R]  External IP lookup    ipify, ipinfo, icanhazip,     2021997 (+2020716,
+                                ifconfig.io, checkip,         2025331, 2036304,
+                                ip-api.com                    2017398, 2844906,
+                                                              2052027, 2022082...)
+ 12  [P]  URL shortener         zshorten.com, cutt.ly, lk.tc  2038992, 2038568,
+                                                              2035742
+ 13  [P]  Gaming policy         Nintendo Wii UA;              2014718, 2013910
+                                Second_Life_Setup.exe
+ 14  [P]  Adware / PUP          rpc_uci.php, protector.exe,   2003060, 2002001,
+                                kyf?partner_id                2002092
+ 15  [C]  Malware C2 beacon     POST base64 body; GET ?ts     2027793, 2016568
+                                w/ "sleep 20" User-Agent
+ 99   -   CHAOS - run ALL       all 15 tests in sequence      dozens of alerts
+------------------------------------------------------------------------------
+
+ WHAT YOU SAW
+   ET MALWARE Possible Winnti DNS Lookup [1:2029346:2], Priority 1.
+   Source: Test 4 (Bad Certs & CAs) resolving example.livehost.live -- NOT the
+   C2 test.  Reproduce cleanly with:   Run-IDS-Test.cmd 4
+
+ DEMO TIPS
+   * IDS -> IPS: logs read "mode: ids" (detect). Flip the overlay/security
+     policy to inline and the same traffic is DROPPED -- strong before/after.
+   * HTTP not HTTPS: payload-matching tests use cleartext HTTP/DNS/SNI on
+     purpose so the sensor can read them.
+   * Expect repeats: DNS retries hit 8.8.8.8 and 8.8.4.4, so one lookup can
+     log twice -- normal.
+
+ NOTES ON SIDs
+   Rows showing a bare ET POLICY / ET TOR / GPL label (tests 2, 5-10) are not
+   pinned to a specific SID in the tmNIDS source -- labeled by rule class.
+   Hard SIDs (4, 11-15, and 2100498) come from the tool's own comments.
+
+------------------------------------------------------------------------------
+ tmNIDS (c) 3CORESec  -  https://github.com/3CORESec/testmynids.org
+ SIDs = Emerging Threats / GPL rulesets
+==============================================================================

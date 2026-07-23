@@ -1,0 +1,385 @@
+<title>IDS/IPS Demo Cheat Sheet — tmNIDS × EdgeConnect Suricata</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root{
+    --bg:#F2F4F3; --surface:#FFFFFF; --panel:#EBEEEC;
+    --ink:#141A1D; --muted:#5C6A6E; --faint:#869599; --line:#D7DDDA;
+    --accent:#0E8F86; --accent-ink:#0B6B64;
+    --crit:#C43C3C; --crit-bg:#F8E7E6;
+    --warn:#B0740E; --warn-bg:#F8EFDD;
+    --info:#2A6E8F; --info-bg:#E2EEF4;
+    --shadow:0 1px 2px rgba(20,26,29,.06),0 8px 24px rgba(20,26,29,.06);
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#0F1418; --surface:#161D22; --panel:#1B242A;
+      --ink:#E7EDEB; --muted:#93A2A6; --faint:#6A787C; --line:#28333A;
+      --accent:#2FB6AE; --accent-ink:#57C9C1;
+      --crit:#E06B6B; --crit-bg:#2A1A1B;
+      --warn:#E0A64B; --warn-bg:#2A2113;
+      --info:#63B2D6; --info-bg:#132430;
+      --shadow:0 1px 2px rgba(0,0,0,.3),0 10px 30px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="light"]{
+    --bg:#F2F4F3; --surface:#FFFFFF; --panel:#EBEEEC;
+    --ink:#141A1D; --muted:#5C6A6E; --faint:#869599; --line:#D7DDDA;
+    --accent:#0E8F86; --accent-ink:#0B6B64;
+    --crit:#C43C3C; --crit-bg:#F8E7E6;
+    --warn:#B0740E; --warn-bg:#F8EFDD;
+    --info:#2A6E8F; --info-bg:#E2EEF4;
+    --shadow:0 1px 2px rgba(20,26,29,.06),0 8px 24px rgba(20,26,29,.06);
+  }
+  :root[data-theme="dark"]{
+    --bg:#0F1418; --surface:#161D22; --panel:#1B242A;
+    --ink:#E7EDEB; --muted:#93A2A6; --faint:#6A787C; --line:#28333A;
+    --accent:#2FB6AE; --accent-ink:#57C9C1;
+    --crit:#E06B6B; --crit-bg:#2A1A1B;
+    --warn:#E0A64B; --warn-bg:#2A2113;
+    --info:#63B2D6; --info-bg:#132430;
+    --shadow:0 1px 2px rgba(0,0,0,.3),0 10px 30px rgba(0,0,0,.35);
+  }
+
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    font-size:15px; line-height:1.5;
+    padding:clamp(16px,3vw,40px);
+  }
+  .sheet{max-width:1140px; margin:0 auto;}
+
+  code,.mono,.sid,.num,.cmd{
+    font-family:ui-monospace,"Cascadia Code","SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+    font-variant-numeric:tabular-nums;
+  }
+  .eyebrow{
+    font:600 11px/1 ui-monospace,Consolas,monospace;
+    letter-spacing:.18em; text-transform:uppercase; color:var(--accent-ink);
+  }
+
+  /* ---- header ---- */
+  header.head{
+    display:flex; flex-wrap:wrap; align-items:flex-end; gap:12px 24px;
+    padding-bottom:18px; border-bottom:2px solid var(--ink);
+  }
+  header.head .titles{flex:1 1 auto; min-width:260px;}
+  h1{
+    margin:.35em 0 .1em; font-size:clamp(24px,3.4vw,34px); line-height:1.05;
+    letter-spacing:-.01em; text-wrap:balance; font-weight:800;
+  }
+  h1 .amp{color:var(--accent-ink); font-weight:600;}
+  .sub{color:var(--muted); font-size:14px; max-width:60ch;}
+  .badge{
+    align-self:flex-end; font:600 12px/1 ui-monospace,Consolas,monospace;
+    color:var(--accent-ink); border:1px solid var(--line);
+    background:var(--surface); border-radius:999px; padding:7px 12px; white-space:nowrap;
+  }
+  .badge b{color:var(--ink);}
+
+  /* ---- top panels ---- */
+  .panels{
+    display:grid; grid-template-columns:1.15fr 1fr; gap:16px; margin:18px 0 22px;
+  }
+  @media (max-width:760px){ .panels{grid-template-columns:1fr;} }
+  .panel{
+    background:var(--surface); border:1px solid var(--line); border-radius:12px;
+    padding:16px 18px; box-shadow:var(--shadow);
+  }
+  .panel h2{margin:.5em 0 .7em; font-size:13px; letter-spacing:.02em;}
+  .flow{display:flex; align-items:center; gap:10px; flex-wrap:wrap; font-size:13px;}
+  .node{
+    background:var(--panel); border:1px solid var(--line); border-radius:8px;
+    padding:8px 11px; line-height:1.25;
+  }
+  .node .k{display:block; font:600 10px/1.3 ui-monospace,Consolas,monospace;
+    letter-spacing:.08em; text-transform:uppercase; color:var(--muted);}
+  .node .v{font-weight:600;}
+  .node.sensor{border-color:var(--accent); box-shadow:inset 0 0 0 1px var(--accent);}
+  .arrow{color:var(--faint); font-weight:700;}
+  .flownote{margin:11px 0 0; font-size:12px; color:var(--muted);}
+
+  .cmds{display:flex; flex-direction:column; gap:9px;}
+  .cmdrow{display:flex; gap:10px; align-items:baseline;}
+  .cmd{
+    background:var(--panel); border:1px solid var(--line); border-radius:6px;
+    padding:3px 8px; font-size:12.5px; color:var(--ink); white-space:nowrap;
+  }
+  .cmdrow span{font-size:12.5px; color:var(--muted);}
+
+  /* ---- legend ---- */
+  .legend{display:flex; flex-wrap:wrap; gap:8px 16px; align-items:center; margin:0 2px 12px;}
+  .legend .eyebrow{margin-right:4px;}
+  .chip{
+    display:inline-flex; align-items:center; gap:7px; font-size:12.5px; color:var(--muted);
+  }
+  .dot{width:10px; height:10px; border-radius:3px; flex:none;}
+  .dot.crit{background:var(--crit);} .dot.warn{background:var(--warn);} .dot.info{background:var(--info);}
+
+  /* ---- table ---- */
+  .tablewrap{
+    overflow-x:auto; border:1px solid var(--line); border-radius:12px;
+    background:var(--surface); box-shadow:var(--shadow);
+  }
+  table{border-collapse:collapse; width:100%; min-width:820px;}
+  thead th{
+    position:sticky; top:0; background:var(--surface); z-index:1;
+    text-align:left; font:600 10.5px/1.2 ui-monospace,Consolas,monospace;
+    letter-spacing:.1em; text-transform:uppercase; color:var(--muted);
+    padding:12px 14px; border-bottom:1.5px solid var(--line); white-space:nowrap;
+  }
+  tbody td{padding:11px 14px; border-bottom:1px solid var(--line); vertical-align:top;}
+  tbody tr:last-child td{border-bottom:none;}
+  tbody tr:hover td{background:var(--panel);}
+  td.n{white-space:nowrap;}
+  .num{
+    display:inline-block; min-width:2.1em; text-align:center; font-weight:700; font-size:14px;
+    padding:2px 6px; border-radius:6px; border-left:3px solid var(--faint);
+    background:var(--panel);
+  }
+  tr[data-sev="crit"] .num{border-left-color:var(--crit); color:var(--crit);}
+  tr[data-sev="warn"] .num{border-left-color:var(--warn); color:var(--warn);}
+  tr[data-sev="info"] .num{border-left-color:var(--info); color:var(--info);}
+  td.test{font-weight:650; min-width:130px;}
+  td.traffic{color:var(--muted); font-size:12.5px; max-width:230px;}
+  td.traffic .mono{color:var(--ink); font-size:12px;}
+  td.fires{font-size:12.5px; min-width:160px;}
+  .sid{font-weight:700; color:var(--accent-ink);}
+  .fires-name{color:var(--muted); display:block; font-size:12px;}
+  td.talk{min-width:210px;}
+  tr.all td{background:var(--panel);}
+  tr.all .num{border-left-color:var(--ink); color:var(--ink);}
+
+  /* ---- callout ---- */
+  .callout{
+    display:flex; gap:14px; margin:20px 0 8px; padding:15px 18px;
+    background:var(--crit-bg); border:1px solid var(--crit);
+    border-left-width:4px; border-radius:10px;
+  }
+  .callout .tag{
+    font:700 10px/1.3 ui-monospace,Consolas,monospace; letter-spacing:.1em;
+    text-transform:uppercase; color:var(--crit); white-space:nowrap; padding-top:2px;
+  }
+  .callout p{margin:0; font-size:13.5px;}
+  .callout .sid{color:var(--crit);}
+
+  /* ---- footer tips ---- */
+  footer{margin-top:22px; display:grid; grid-template-columns:repeat(3,1fr); gap:16px;}
+  @media (max-width:760px){ footer{grid-template-columns:1fr;} }
+  .tip{border-top:2px solid var(--accent); padding-top:10px;}
+  .tip h3{margin:0 0 4px; font-size:13px;}
+  .tip p{margin:0; font-size:12.5px; color:var(--muted);}
+  .foot-meta{
+    max-width:1140px; margin:20px auto 0; padding-top:12px; border-top:1px solid var(--line);
+    display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap;
+    font:12px/1.4 ui-monospace,Consolas,monospace; color:var(--faint);
+  }
+
+  @media print{
+    :root{
+      --bg:#fff; --surface:#fff; --panel:#f4f6f5; --ink:#111; --muted:#444;
+      --line:#c9cfcc; --shadow:none;
+    }
+    body{padding:0; font-size:11px;}
+    .panel,.tablewrap{box-shadow:none;}
+    tbody tr:hover td{background:transparent;}
+    tr,.callout,.panel{page-break-inside:avoid;}
+    thead th{position:static;}
+  }
+</style>
+
+<div class="sheet">
+  <header class="head">
+    <div class="titles">
+      <div class="eyebrow">Live demo · field card</div>
+      <h1>IDS / IPS Trigger Cheat Sheet</h1>
+      <p class="sub">Fire one Suricata signature at a time with <b>tmNIDS</b> from the Windows/WSL
+        “Demo Toolbox.” Traffic crosses the upstream <b>EdgeConnect</b>, where its built-in Suricata inspects it.</p>
+    </div>
+    <div class="badge">tmNIDS <b>×</b> ECOS Suricata · <b>v7</b></div>
+  </header>
+
+  <section class="panels">
+    <div class="panel">
+      <h2 class="eyebrow">Signal path</h2>
+      <div class="flow">
+        <span class="node"><span class="k">Source</span><span class="v">Windows + WSL</span></span>
+        <span class="arrow">→</span>
+        <span class="node sensor"><span class="k">Sensor</span><span class="v">EdgeConnect · Suricata</span></span>
+        <span class="arrow">→</span>
+        <span class="node"><span class="k">Egress</span><span class="v">Internet</span></span>
+      </div>
+      <p class="flownote">WSL2 NATs through the Windows host, so alerts show the host’s LAN IP
+        (e.g. <span class="mono">10.13.1.100</span>) as <span class="mono">src</span>, zone
+        <span class="mono">Untrust</span> outbound. <span class="mono">mode: ids</span> = detect only.</p>
+    </div>
+    <div class="panel">
+      <h2 class="eyebrow">Launchers</h2>
+      <div class="cmds">
+        <div class="cmdrow"><span class="cmd">Run-IDS-Menu.cmd</span><span>pick one signature (best for demo)</span></div>
+        <div class="cmdrow"><span class="cmd">Run-IDS-Test.cmd</span><span>fire all (tmNIDS <span class="mono">-99</span>)</span></div>
+        <div class="cmdrow"><span class="cmd">Run-IDS-Test.cmd 6</span><span>fire only test 6</span></div>
+      </div>
+    </div>
+  </section>
+
+  <div class="legend">
+    <span class="eyebrow">Threat class</span>
+    <span class="chip"><span class="dot crit"></span>Malware / Targeted</span>
+    <span class="chip"><span class="dot warn"></span>Policy / PUP</span>
+    <span class="chip"><span class="dot info"></span>Recon / Info</span>
+  </div>
+
+  <div class="tablewrap">
+    <table>
+      <thead>
+        <tr>
+          <th>#</th><th>Test</th><th>Traffic it sends</th><th>What fires</th><th>Talking point</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr data-sev="info">
+          <td class="n"><span class="num">1</span></td>
+          <td class="test">Linux UID</td>
+          <td class="traffic">GET <span class="mono">/uid</span> → body <span class="mono">uid=0(root)</span></td>
+          <td class="fires"><span class="sid">2100498</span><span class="fires-name">GPL id check returned root</span></td>
+          <td class="talk">The classic IDS canary — command output leaking in cleartext HTTP.</td>
+        </tr>
+        <tr data-sev="warn">
+          <td class="n"><span class="num">2</span></td>
+          <td class="test">HTTP Basic Auth</td>
+          <td class="traffic"><span class="mono">Authorization: Basic</span> (root:root)</td>
+          <td class="fires"><span class="sid">ET POLICY</span><span class="fires-name">Basic Auth base64 creds</span></td>
+          <td class="talk">Credentials Base64’d, not encrypted — why Basic auth is watched.</td>
+        </tr>
+        <tr data-sev="crit">
+          <td class="n"><span class="num">3</span></td>
+          <td class="test">Malware User-Agent</td>
+          <td class="traffic">UAs: <span class="mono">BlackSun, JEDI-VCL, HttpDownload…</span></td>
+          <td class="fires"><span class="sid">ET USER_AGENTS</span><span class="fires-name">Suspicious UA (several)</span></td>
+          <td class="talk">Malware often outs itself with a sloppy, hard-coded User-Agent.</td>
+        </tr>
+        <tr data-sev="crit">
+          <td class="n"><span class="num">4</span></td>
+          <td class="test">Bad Certs &amp; CAs</td>
+          <td class="traffic">TLS SNI to known-bad hosts + <span class="mono">example.livehost.live</span></td>
+          <td class="fires"><span class="sid">2029346</span><span class="fires-name">+2022134, 2020493, 2033098… (8+ SIDs)</span></td>
+          <td class="talk"><b>The one that fired your Winnti alert</b> — the DNS lookup of the bad domain trips it.</td>
+        </tr>
+        <tr data-sev="warn">
+          <td class="n"><span class="num">5</span></td>
+          <td class="test">Tor .onion + nodes</td>
+          <td class="traffic"><span class="mono">dig .onion</span> + TCP/443 to live Tor nodes</td>
+          <td class="fires"><span class="sid">ET TOR</span><span class="fires-name">Known Tor node / .onion</span></td>
+          <td class="talk">Anonymized egress path — a favorite exfil / C2 channel.</td>
+        </tr>
+        <tr data-sev="warn">
+          <td class="n"><span class="num">6</span></td>
+          <td class="test">EXE / DLL download</td>
+          <td class="traffic">GET <span class="mono">/exe/calc.exe</span> over HTTP</td>
+          <td class="fires"><span class="sid">ET POLICY</span><span class="fires-name">PE EXE/DLL download</span></td>
+          <td class="talk">Executables crossing the wire in the clear — strong “blocked a download” story.</td>
+        </tr>
+        <tr data-sev="warn">
+          <td class="n"><span class="num">7</span></td>
+          <td class="test">PDF w/ embedded file</td>
+          <td class="traffic">GET <span class="mono">/pdf/pdf.pdf</span></td>
+          <td class="fires"><span class="sid">ET POLICY</span><span class="fires-name">PDF with embedded file</span></td>
+          <td class="talk">The weaponized-document vector, front and center.</td>
+        </tr>
+        <tr data-sev="info">
+          <td class="n"><span class="num">8</span></td>
+          <td class="test">SSH outbound scan</td>
+          <td class="traffic"><span class="mono">nc testmynids.org:22</span></td>
+          <td class="fires"><span class="sid">GPL / ET</span><span class="fires-name">Outbound SSH scan</span></td>
+          <td class="talk">Lateral-movement / scanning signal from inside the LAN.</td>
+        </tr>
+        <tr data-sev="info">
+          <td class="n"><span class="num">9</span></td>
+          <td class="test">Miscellaneous DNS</td>
+          <td class="traffic"><span class="mono">dig sinkhole.cert.pl · nic.su · no-ip</span></td>
+          <td class="fires"><span class="sid">ET DNS</span><span class="fires-name">Sinkhole · .su TLD · DDNS</span></td>
+          <td class="talk">Sinkholes, suspicious TLDs and dynamic-DNS — cheap threat signals.</td>
+        </tr>
+        <tr data-sev="warn">
+          <td class="n"><span class="num">10</span></td>
+          <td class="test">Anon filesharing</td>
+          <td class="traffic">TLS SNI <span class="mono">fromsmash.com</span></td>
+          <td class="fires"><span class="sid">ET POLICY</span><span class="fires-name">Anon upload / filesharing</span></td>
+          <td class="talk">Data exfil through consumer file-share sites.</td>
+        </tr>
+        <tr data-sev="info">
+          <td class="n"><span class="num">11</span></td>
+          <td class="test">External IP lookup</td>
+          <td class="traffic"><span class="mono">ipify · ipinfo · icanhazip · ip-api…</span></td>
+          <td class="fires"><span class="sid">2021997</span><span class="fires-name">+2020716, 2036304… (many)</span></td>
+          <td class="talk">Malware fingerprinting its public IP — very early recon.</td>
+        </tr>
+        <tr data-sev="warn">
+          <td class="n"><span class="num">12</span></td>
+          <td class="test">URL shortener</td>
+          <td class="traffic"><span class="mono">zshorten.com · cutt.ly · lk.tc</span></td>
+          <td class="fires"><span class="sid">2038992</span><span class="fires-name">+2038568, 2035742</span></td>
+          <td class="talk">Shorteners hide the real phishing / redirect destination.</td>
+        </tr>
+        <tr data-sev="warn">
+          <td class="n"><span class="num">13</span></td>
+          <td class="test">Gaming policy</td>
+          <td class="traffic">Nintendo Wii UA · <span class="mono">Second_Life_Setup.exe</span></td>
+          <td class="fires"><span class="sid">2014718</span><span class="fires-name">+2013910</span></td>
+          <td class="talk">Acceptable-use / policy-violation example, low drama.</td>
+        </tr>
+        <tr data-sev="warn">
+          <td class="n"><span class="num">14</span></td>
+          <td class="test">Adware / PUP</td>
+          <td class="traffic"><span class="mono">rpc_uci.php · protector.exe · kyf?partner_id</span></td>
+          <td class="fires"><span class="sid">2003060</span><span class="fires-name">+2002001, 2002092</span></td>
+          <td class="talk">Adware/PUP callbacks — the noisy nuisance tier.</td>
+        </tr>
+        <tr data-sev="crit">
+          <td class="n"><span class="num">15</span></td>
+          <td class="test">Malware C2 beacon</td>
+          <td class="traffic">POST base64 body · GET <span class="mono">?ts</span> w/ <span class="mono">sleep 20</span> UA</td>
+          <td class="fires"><span class="sid">2027793</span><span class="fires-name">+2016568</span></td>
+          <td class="talk">Beaconing — the heart of command-and-control detection.</td>
+        </tr>
+        <tr class="all" data-sev="">
+          <td class="n"><span class="num">99</span></td>
+          <td class="test">CHAOS — run all</td>
+          <td class="traffic">All 15 tests, in sequence</td>
+          <td class="fires"><span class="sid">dozens</span><span class="fires-name">of alerts across classes</span></td>
+          <td class="talk">The finale — show coverage and volume in one burst.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <span class="tag">You saw</span>
+    <p><b>ET MALWARE Possible Winnti DNS Lookup</b> <span class="sid">[1:2029346:2]</span>, Priority 1 —
+      that came from <b>Test 4 (Bad Certs &amp; CAs)</b> resolving <span class="mono">example.livehost.live</span>,
+      not the C2 test. To reproduce it cleanly on stage, run <span class="mono">Run-IDS-Test.cmd 4</span>.</p>
+  </div>
+
+  <footer>
+    <div class="tip">
+      <h3>IDS → IPS</h3>
+      <p>Logs read <span class="mono">mode: ids</span> (detect). Flip the overlay/security policy to inline
+        and the same traffic is <b>dropped</b> — a strong before/after moment.</p>
+    </div>
+    <div class="tip">
+      <h3>HTTP, not HTTPS</h3>
+      <p>Payload-matching tests need cleartext. tmNIDS uses HTTP/DNS/SNI on purpose so the sensor can read them.</p>
+    </div>
+    <div class="tip">
+      <h3>Expect repeats</h3>
+      <p>DNS retries hit <span class="mono">8.8.8.8</span> and <span class="mono">8.8.4.4</span>, so one lookup can log twice — normal.</p>
+    </div>
+  </footer>
+
+  <div class="foot-meta">
+    <span>Demo Toolbox · IDS/IPS trigger card</span>
+    <span>tmNIDS © 3CORESec · SIDs = Emerging Threats / GPL rulesets</span>
+  </div>
+</div>

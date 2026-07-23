@@ -1,0 +1,35 @@
+# Security Vitals — trigger catalog
+# A FIXED, server-side allowlist. The UI sends only a trigger `id`; the runner builds
+# argv from THIS file, never from client input. Optional params are validated against
+# a per-trigger allowlist (none of the Phase 1 triggers take params).
+#
+# Phase 1 seeds only `ns-uid` — the canonical "should fire on ET Open" tmNIDS trigger —
+# to prove allow / blocked / error classification end to end before adding breadth.
+# Phases 2 (rest of tmNIDS) and 3 (WebCC / IP reputation) extend this file.
+#
+# Fields:
+#   id                 stable identifier the UI sends
+#   label              human label
+#   class              ns-ids | ns-webcc | ns-iprep   (ew is reserved, deferred)
+#   runner             tmnids | curl | tcp443         (selects how it is executed)
+#   argv               fixed argv template (tmnids: argv[0]=="tmNIDS" resolves to the cached binary)
+#   flags              surfaced in the UI: needs_internet, needs_et_ruleset, hits_live_suspect_hosts
+#   severity           info | warn | crit   (drives UI accent, from the cheatsheet)
+#   threat_class       recon | policy | malware
+#   expected_fire      what the presenter should look for on the EC/Orchestrator dashboard
+#   talking_point      one-line narration for the demo
+#   expected_on_allow  predicate matched when traffic passed (IDS detect-only)
+#   expected_on_block  predicate matched when the flow was dropped inline (IPS)
+
+- id: ns-uid
+  label: "Linux UID (uid=0 root)"
+  class: ns-ids
+  runner: tmnids
+  argv: ["tmNIDS", "-1"]
+  flags: [needs_internet, needs_et_ruleset]
+  severity: info
+  threat_class: recon
+  expected_fire: "SID 2100498 — GPL ATTACK_RESPONSE id check returned root"
+  talking_point: "The classic IDS canary: command output (uid=0(root)) leaking in cleartext HTTP."
+  expected_on_allow: { rc: 0, body_contains: "uid=0" }
+  expected_on_block: { rc_nonzero: true }

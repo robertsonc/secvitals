@@ -1,0 +1,7 @@
+# Security Vitals has NO third-party dependencies — it uses only the Python standard
+# library (http.server, subprocess, urllib, hashlib, hmac, ssl, json, logging, ...).
+# This is deliberate: a tool that self-updates AND runs local commands keeps the
+# smallest possible supply chain. Python 3.8+ is required.
+#
+# Release signing (offline, on a trusted machine) uses the `openssl` CLI, not a Python
+# package — see tools/sign_release.sh and docs/UPDATE_SECURITY.md.

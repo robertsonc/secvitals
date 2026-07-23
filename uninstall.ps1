@@ -44,7 +44,7 @@ foreach ($p in $protected) {
 }
 
 if (-not $Silent) {
-    Write-Host "This removes $AppName:"
+    Write-Host "This removes ${AppName}:"
     Write-Host "  Install folder : $InstallDir"
     $answer = Read-Host "Continue? [y/N]"
     if (-not ($answer -and $answer.Trim().ToLower().StartsWith("y"))) {

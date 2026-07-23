@@ -1,0 +1,352 @@
+# Security Vitals — trigger catalog
+# A FIXED, server-side allowlist. The UI sends only a trigger `id`; the runner builds
+# argv from THIS file, never from client input. Optional params are validated against a
+# per-trigger allowlist (none of these tmNIDS triggers take params).
+#
+# Class ns-ids = tmNIDS signatures against ECOS Suricata v7 (core: cached `tmNIDS -N`).
+# Phase 3 will append the ns-webcc / ns-iprep triggers.
+#
+# Local classification (see CONFIRMED.md §5): the EC/Orchestrator dashboard is
+# authoritative. Locally, `expected_on_allow: { rc: 0 }` means the trigger traffic was
+# sent and not dropped inline (IDS detect-only => sent·allowed). A nonzero exit, with a
+# control egress probe confirming general egress, reads as an inline drop (sent·blocked);
+# if egress itself is down it reads as `error`, never a false `blocked`. Test 1 also
+# checks the `uid=0` canary body for a precise allow signal.
+#
+# Fields: id, label, class, runner, argv, flags, severity, threat_class, expected_fire,
+# talking_point, expected_on_allow, expected_on_block.
+#
+# `hits_live_suspect_hosts` (tests 4 and 5) reach REAL suspect infrastructure / live Tor
+# nodes; they are disabled unless enable_live_suspect_hosts is set (see settings.yaml).
+# Test 11's IP-lookup endpoints (ipify/ipinfo/icanhazip/ifconfig.io/checkip/ip-api) are
+# mainstream echo services, so it is not gated.
+
+- id: ns-uid
+  label: "Linux UID (uid=0 root)"
+  class: ns-ids
+  runner: tmnids
+  argv: ["tmNIDS", "-1"]
+  flags: [needs_internet, needs_et_ruleset]
+  severity: info
+  threat_class: recon
+  expected_fire: "SID 2100498 — GPL ATTACK_RESPONSE id check returned root"
+  talking_point: "The classic IDS canary: command output (uid=0(root)) leaking in cleartext HTTP."
+  expected_on_allow: { rc: 0, body_contains: "uid=0" }
+  expected_on_block: { rc_nonzero: true }
+
+- id: ns-basicauth
+  label: "HTTP Basic Auth (root:root)"
+  class: ns-ids
+  runner: tmnids
+  argv: ["tmNIDS", "-2"]
+  flags: [needs_internet]
+  severity: warn
+  threat_class: policy
+  expected_fire: "ET POLICY — Basic Auth base64 credentials"
+  talking_point: "Credentials Base64'd, not encrypted — why Basic auth is watched."
+  expected_on_allow: { rc: 0 }
+  expected_on_block: { rc_nonzero: true }
+
+- id: ns-malua
+  label: "Malware User-Agents"
+  class: ns-ids
+  runner: tmnids
+  argv: ["tmNIDS", "-3"]
+  flags: [needs_internet]
+  severity: crit
+  threat_class: malware
+  expected_fire: "ET USER_AGENTS — suspicious UA (several: BlackSun, JEDI-VCL, HttpDownload…)"
+  talking_point: "Malware often outs itself with a sloppy, hard-coded User-Agent."
+  expected_on_allow: { rc: 0 }
+  expected_on_block: { rc_nonzero: true }
+
+- id: ns-badcert
+  label: "Bad Certs & CAs (example.livehost.live)"
+  class: ns-ids
+  runner: tmnids
+  argv: ["tmNIDS", "-4"]
+  flags: [needs_internet, hits_live_suspect_hosts]
+  severity: crit
+  threat_class: malware
+  expected_fire: "SID 2029346 Winnti DNS lookup (+2022134, 2020493, 2033098… 8+ SIDs)"
+  talking_point: "The one that fires the Winnti alert — the DNS lookup of the bad domain trips it."
+  expected_on_allow: { rc: 0 }
+  expected_on_block: { rc_nonzero: true }
+
+- id: ns-tor
+  label: "Tor .onion + live nodes"
+  class: ns-ids
+  runner: tmnids
+  argv: ["tmNIDS", "-5"]
+  flags: [needs_internet, hits_live_suspect_hosts]
+  severity: warn
+  threat_class: policy
+  expected_fire: "ET TOR — known Tor node / .onion lookup"
+  talking_point: "Anonymized egress path — a favorite exfil / C2 channel."
+  expected_on_allow: { rc: 0 }
+  expected_on_block: { rc_nonzero: true }
+
+- id: ns-peexe
+  label: "EXE / DLL download over HTTP"
+  class: ns-ids
+  runner: tmnids
+  argv: ["tmNIDS", "-6"]
+  flags: [needs_internet]
+  severity: warn
+  threat_class: policy
+  expected_fire: "ET POLICY — PE EXE/DLL download"
+  talking_point: "Executables crossing the wire in the clear — a strong 'blocked a download' story."
+  expected_on_allow: { rc: 0 }
+  expected_on_block: { rc_nonzero: true }
+
+- id: ns-pdfembed
+  label: "PDF with embedded file"
+  class: ns-ids
+  runner: tmnids
+  argv: ["tmNIDS", "-7"]
+  flags: [needs_internet]
+  severity: warn
+  threat_class: policy
+  expected_fire: "ET POLICY — PDF with embedded file"
+  talking_point: "The weaponized-document vector, front and center."
+  expected_on_allow: { rc: 0 }
+  expected_on_block: { rc_nonzero: true }
+
+- id: ns-sshscan
+  label: "SSH outbound scan"
+  class: ns-ids
+  runner: tmnids
+  argv: ["tmNIDS", "-8"]
+  flags: [needs_internet]
+  severity: info
+  threat_class: recon
+  expected_fire: "GPL / ET — outbound SSH scan (nc testmynids.org:22)"
+  talking_point: "Lateral-movement / scanning signal from inside the LAN."
+  expected_on_allow: { rc: 0 }
+  expected_on_block: { rc_nonzero: true }
+
+- id: ns-dns
+  label: "Sinkhole / .su / DDNS lookups"
+  class: ns-ids
+  runner: tmnids
+  argv: ["tmNIDS", "-9"]
+  flags: [needs_internet]
+  severity: info
+  threat_class: recon
+  expected_fire: "ET DNS — sinkhole (sinkhole.cert.pl) / .su TLD / DDNS (no-ip)"
+  talking_point: "Sinkholes, suspicious TLDs and dynamic-DNS — cheap threat signals."
+  expected_on_allow: { rc: 0 }
+  expected_on_block: { rc_nonzero: true }
+
+- id: ns-anonfile
+  label: "Anonymous filesharing (SNI)"
+  class: ns-ids
+  runner: tmnids
+  argv: ["tmNIDS", "-10"]
+  flags: [needs_internet]
+  severity: warn
+  threat_class: policy
+  expected_fire: "ET POLICY — anonymous upload / filesharing (fromsmash.com SNI)"
+  talking_point: "Data exfil through consumer file-share sites."
+  expected_on_allow: { rc: 0 }
+  expected_on_block: { rc_nonzero: true }
+
+- id: ns-iplookup
+  label: "External IP lookup services"
+  class: ns-ids
+  runner: tmnids
+  argv: ["tmNIDS", "-11"]
+  flags: [needs_internet]
+  severity: info
+  threat_class: recon
+  expected_fire: "SID 2021997 (+2020716, 2036304… many) — ipify/ipinfo/icanhazip/ip-api"
+  talking_point: "Malware fingerprinting its public IP — very early recon."
+  expected_on_allow: { rc: 0 }
+  expected_on_block: { rc_nonzero: true }
+
+- id: ns-shortener
+  label: "URL shorteners"
+  class: ns-ids
+  runner: tmnids
+  argv: ["tmNIDS", "-12"]
+  flags: [needs_internet]
+  severity: warn
+  threat_class: policy
+  expected_fire: "SID 2038992 (+2038568, 2035742) — zshorten.com / cutt.ly / lk.tc"
+  talking_point: "Shorteners hide the real phishing / redirect destination."
+  expected_on_allow: { rc: 0 }
+  expected_on_block: { rc_nonzero: true }
+
+- id: ns-gaming
+  label: "Gaming policy (Wii UA, SL setup)"
+  class: ns-ids
+  runner: tmnids
+  argv: ["tmNIDS", "-13"]
+  flags: [needs_internet]
+  severity: warn
+  threat_class: policy
+  expected_fire: "SID 2014718 (+2013910) — Nintendo Wii UA / Second_Life_Setup.exe"
+  talking_point: "Acceptable-use / policy-violation example, low drama."
+  expected_on_allow: { rc: 0 }
+  expected_on_block: { rc_nonzero: true }
+
+- id: ns-adware
+  label: "Adware / PUP"
+  class: ns-ids
+  runner: tmnids
+  argv: ["tmNIDS", "-14"]
+  flags: [needs_internet]
+  severity: warn
+  threat_class: policy
+  expected_fire: "SID 2003060 (+2002001, 2002092) — rpc_uci.php / protector.exe / kyf?partner_id"
+  talking_point: "Adware/PUP callbacks — the noisy nuisance tier."
+  expected_on_allow: { rc: 0 }
+  expected_on_block: { rc_nonzero: true }
+
+- id: ns-c2
+  label: "Malware C2 beacon"
+  class: ns-ids
+  runner: tmnids
+  argv: ["tmNIDS", "-15"]
+  flags: [needs_internet]
+  severity: crit
+  threat_class: malware
+  expected_fire: "SID 2027793 (+2016568) — POST base64 body + GET ?ts with 'sleep 20' UA"
+  talking_point: "Beaconing — the heart of command-and-control detection."
+  expected_on_allow: { rc: 0 }
+  expected_on_block: { rc_nonzero: true }
+
+# ---------------------------------------------------------------------------
+# Phase 3 — EdgeConnect Secure Web Services (BrightCloud WebCC) + IP reputation.
+#
+# WebCC denies by SILENTLY DROPPING the flow — there is NO block page. A deny is
+# observed as a connect timeout / reset (curl rc 28/7/56 -> blocked); a completed
+# response (rc 0, HTTP 2xx) is `allowed`. Environment failures (DNS/TLS: rc 6/35/60/…)
+# are `error`, never a false blocked. PREREQUISITE: the category/reputation must be set
+# to Deny in policy for a test to block; an `allowed` result most often means the policy
+# isn't set, not that enforcement failed (surfaced in the UI).
+#
+# curl argv is FIXED here (the URL is not client input). -o /dev/null discards the body;
+# -w writes "http_code|size|url" to stdout for the classifier.
+# ---------------------------------------------------------------------------
+
+- id: web-cat-gambling
+  label: "Gambling — bet365.com"
+  class: ns-webcc
+  runner: curl
+  argv: ["curl", "-sS", "-A", "WebCC-Demo", "-o", "/dev/null", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://www.bet365.com/"]
+  flags: [needs_internet]
+  severity: info
+  threat_class: policy
+  expected_fire: "WebCC category Gambling · Deny → timeout (silent drop)"
+  talking_point: "Web-category filtering by hostname/SNI — no decryption needed."
+
+- id: web-cat-social
+  label: "Social Networking — facebook.com"
+  class: ns-webcc
+  runner: curl
+  argv: ["curl", "-sS", "-A", "WebCC-Demo", "-o", "/dev/null", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://www.facebook.com/"]
+  flags: [needs_internet]
+  severity: info
+  threat_class: policy
+  expected_fire: "WebCC category Social Networking · Deny → timeout"
+  talking_point: "The everyday acceptable-use category."
+
+- id: web-cat-streaming
+  label: "Streaming Media — youtube.com"
+  class: ns-webcc
+  runner: curl
+  argv: ["curl", "-sS", "-A", "WebCC-Demo", "-o", "/dev/null", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://www.youtube.com/"]
+  flags: [needs_internet]
+  severity: info
+  threat_class: policy
+  expected_fire: "WebCC category Streaming Media · Deny → timeout"
+  talking_point: "Bandwidth-heavy category, common policy target."
+
+- id: web-cat-proxy
+  label: "Proxy Avoidance / Anonymizer — hidemyass.com"
+  class: ns-webcc
+  runner: curl
+  argv: ["curl", "-sS", "-A", "WebCC-Demo", "-o", "/dev/null", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://www.hidemyass.com/"]
+  flags: [needs_internet]
+  severity: warn
+  threat_class: policy
+  expected_fire: "WebCC category Proxy Avoidance / Anonymizer · Deny → timeout"
+  talking_point: "Category + reputation overlap — anonymizers dodge policy."
+
+- id: web-cat-p2p
+  label: "Peer-to-Peer / Torrent — thepiratebay.org"
+  class: ns-webcc
+  runner: curl
+  argv: ["curl", "-sS", "-A", "WebCC-Demo", "-o", "/dev/null", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://thepiratebay.org/"]
+  flags: [needs_internet, hits_live_suspect_hosts]
+  severity: warn
+  threat_class: policy
+  expected_fire: "WebCC category Peer-to-Peer / Torrent · Deny → timeout"
+  talking_point: "Live piracy site — flagged; enable only in a lab."
+
+- id: web-cat-crypto
+  label: "Cryptocurrency — coinbase.com"
+  class: ns-webcc
+  runner: curl
+  argv: ["curl", "-sS", "-A", "WebCC-Demo", "-o", "/dev/null", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://www.coinbase.com/"]
+  flags: [needs_internet]
+  severity: info
+  threat_class: policy
+  expected_fire: "WebCC category Cryptocurrency · Deny → timeout"
+  talking_point: "Finance/crypto category exemplar."
+
+- id: web-rep-eicar
+  label: "EICAR test file (URL/category reputation, not file scan)"
+  class: ns-webcc
+  runner: curl
+  argv: ["curl", "-sS", "-A", "WebCC-Demo", "-o", "/dev/null", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://secure.eicar.org/eicar.com.txt"]
+  flags: [needs_internet]
+  severity: crit
+  threat_class: malware
+  expected_fire: "Web reputation / SWG · Deny → timeout"
+  talking_point: "Fetched over HTTPS: without SSL inspection a block is URL/category reputation, NOT malware file scanning — label it accordingly."
+
+- id: web-rep-malware-gsb
+  label: "Malware page (Google Safe Browsing test)"
+  class: ns-webcc
+  runner: curl
+  argv: ["curl", "-sS", "-A", "WebCC-Demo", "-o", "/dev/null", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://testsafebrowsing.appspot.com/s/malware.html"]
+  flags: [needs_internet]
+  severity: crit
+  threat_class: malware
+  expected_fire: "Web threat / SWG (malware) · Deny → timeout"
+  talking_point: "Google's sanctioned malware test page — safe to hit repeatedly."
+
+- id: web-rep-phishing-gsb
+  label: "Phishing page (Google Safe Browsing test)"
+  class: ns-webcc
+  runner: curl
+  argv: ["curl", "-sS", "-A", "WebCC-Demo", "-o", "/dev/null", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://testsafebrowsing.appspot.com/s/phishing.html"]
+  flags: [needs_internet]
+  severity: crit
+  threat_class: malware
+  expected_fire: "Web threat / SWG (phishing) · Deny → timeout"
+  talking_point: "Sanctioned phishing test page."
+
+- id: web-rep-unwanted-gsb
+  label: "Unwanted software (Google Safe Browsing test)"
+  class: ns-webcc
+  runner: curl
+  argv: ["curl", "-sS", "-A", "WebCC-Demo", "-o", "/dev/null", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://testsafebrowsing.appspot.com/s/unwanted.html"]
+  flags: [needs_internet]
+  severity: warn
+  threat_class: policy
+  expected_fire: "Web threat / SWG (unwanted software) · Deny → timeout"
+  talking_point: "Sanctioned unwanted-software test page."
+
+- id: ip-rep-tor
+  label: "IP Reputation — Tor Proxy nodes (:443)"
+  class: ns-iprep
+  runner: iprep
+  argv: ["iprep"]
+  flags: [needs_internet, hits_live_suspect_hosts]
+  severity: warn
+  threat_class: policy
+  expected_fire: "BrightCloud IP-rep 'Tor Proxy' · Deny → timeouts (reported as a ratio)"
+  talking_point: "Control probe first: if egress is down the whole test is INVALID; otherwise report N-of-M blocked, never a single verdict. Live Tor nodes — flagged."

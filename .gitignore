@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+dist/
+build/
+*.spec
+*.bak
+*.new
+.DS_Store
+# Local runtime state / cached artifacts (never committed)
+/var/
+*.local.yaml
+*.local.json
+# Update signing private keys must never be committed
+*.pem
+!*.pub.pem
+private/

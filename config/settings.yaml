@@ -1,0 +1,49 @@
+# Security Vitals — runtime settings
+# Endpoints and toggles, kept separate from logic (see CONFIRMED.md §4). Edited by
+# hand on the SE laptop; loaded once at startup. Anything security-relevant that a
+# presenter might need to change lives here, not in code.
+
+server:
+  host: "127.0.0.1"        # loopback only — this app executes local commands; it is NOT a LAN service
+  port: 8787
+  open_browser: true       # best-effort; the URL is always printed for the Windows browser
+
+# Live suspect-infrastructure gate.
+# Triggers flagged `hits_live_suspect_hosts` reach REAL suspect hosts / live Tor
+# nodes (Winnti-adjacent domains, thepiratebay, hidemyass, Tor relays). Disabled by
+# default so the console can run on a customer-adjacent network without originating
+# awkward traffic / SIEM entries. Flip to true only in a lab you control.
+enable_live_suspect_hosts: false
+
+tmnids:
+  url: "https://raw.githubusercontent.com/3CORESec/testmynids.org/master/tmNIDS"
+  cache_path: ""           # empty => default under the per-user cache dir (never re-downloaded per click)
+  sha256: ""               # overrides the built-in pin; empty = use the pinned default (verification is ALWAYS on, fail closed)
+  download_timeout_s: 20
+
+run:
+  default_timeout_s: 30
+  # Control egress probe — how the console tells a genuine inline drop (blocked) from a
+  # broken environment (error) for tmNIDS triggers. Before deciding a trigger was
+  # BLOCKED, it confirms general egress by TCP-connecting to this known-good host; if the
+  # control fails, the result is `error`, never a false `blocked`. Set control_host to ""
+  # to disable and fall back to the catalog's expected_on_block predicate.
+  control_host: "1.1.1.1"
+  control_port: 443
+
+webcc:
+  # IP-reputation (ns-iprep) probes live Tor relays. The node list is cached with a TTL
+  # (not refetched per click). Before probing, a control egress probe (run.control_host)
+  # confirms egress; if it fails the whole test is reported `invalid`, and node results
+  # are reported as a ratio ("4 of 6 blocked"), never a single verdict.
+  tor_list_url: "https://raw.githubusercontent.com/SecOps-Institute/Tor-IP-Addresses/master/tor-nodes.lst"
+  tor_list_ttl_s: 3600
+  ip_rep_sample: 6                # probe the first N well-formed relay IPs
+  node_probe_timeout_s: 5
+
+update:
+  # Pinned, non-overridable release source. The updater fails CLOSED without a valid
+  # signature over the manifest (see docs/UPDATE_SECURITY.md). This URL is informational
+  # for operators; the code constant is authoritative.
+  manifest_url: "https://github.com/robertsonc/secvitals/releases/latest/download/manifest.json"
+  check_on_start: false

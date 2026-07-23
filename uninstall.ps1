@@ -82,11 +82,14 @@ if ($distro -and $wslDir -and (Get-Command wsl.exe -ErrorAction SilentlyContinue
     if ($safe) {
         $sh = "d='$wslDir'; case `"`$d`" in /|`$HOME|`$HOME/) echo REFUSE; exit 0;; esac; " +
               "if [ -f `"`$d/secvitals.py`" ]; then rm -rf `"`$d`"; echo REMOVED; else echo NOAPP; fi"
-        $r = (& wsl.exe -d $distro -e bash -lc $sh)
+        # base64 the script so its quotes survive the PowerShell -> wsl.exe -> bash boundary.
+        $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($sh))
+        $r = (& wsl.exe -d $distro -e bash -lc "echo $b64 | base64 -d | bash")
         if ($r | Where-Object { "$_".Trim() -eq "REMOVED" }) { Write-Host "Removed WSL app folder: $wslDir" }
         else { Write-Host "NOTE: left the WSL folder in place ('$wslDir' didn't contain secvitals.py)." }
         if ($PurgeSettings) {
-            & wsl.exe -d $distro -e bash -lc 'rm -rf "$HOME/.cache/secvitals"' | Out-Null
+            $pb64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes('rm -rf "$HOME/.cache/secvitals"'))
+            & wsl.exe -d $distro -e bash -lc "echo $pb64 | base64 -d | bash" | Out-Null
             Write-Host "Purged WSL cache (~/.cache/secvitals)."
         }
     } else {

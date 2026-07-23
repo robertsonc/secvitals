@@ -111,11 +111,15 @@ function Get-DefaultDistro {
 }
 
 function Invoke-Wsl {
-    # Run a bash -lc command in the target distro. Returns stdout lines.
+    # Run a bash command in the target distro. The script is base64-encoded so its own
+    # quoting survives the PowerShell -> wsl.exe -> bash argument boundary intact: Windows
+    # PowerShell mangles embedded double quotes when passing native-exe arguments, which
+    # otherwise breaks any command containing quotes (version probe, $HOME, the file copy).
     param([string]$Command, [switch]$AsRoot)
+    $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Command))
     $a = @("-d", $script:Distro)
     if ($AsRoot) { $a += @("-u", "root") }
-    $a += @("-e", "bash", "-lc", $Command)
+    $a += @("-e", "bash", "-lc", "echo $b64 | base64 -d | bash")
     return (& wsl.exe @a)
 }
 
@@ -138,12 +142,17 @@ function Get-WslHome {
 
 function Get-WslPython {
     # Returns a version string like "3.12", or $null. Security Vitals needs no Tkinter.
+    # `python3 --version` avoids embedded quotes; scanning every line means a login-shell
+    # banner can't be mistaken for the version.
     try {
-        $out = Invoke-Wsl -Command 'command -v python3 >/dev/null 2>&1 && python3 -c "import sys;print(\"%d.%d\"%tuple(sys.version_info[:2]))"'
+        $out = Invoke-Wsl -Command 'command -v python3 >/dev/null 2>&1 && python3 --version 2>&1 || true'
     } catch { return $null }
-    $v = ($out | ForEach-Object { "$_".Trim() } | Where-Object { $_ }) | Select-Object -First 1
-    if ($v -and ($v -match '^(\d+)\.(\d+)$')) {
-        if (([int]$Matches[1] -gt 3) -or ([int]$Matches[1] -eq 3 -and [int]$Matches[2] -ge 8)) { return $v }
+    foreach ($line in @($out)) {
+        if ("$line" -match 'Python\s+(\d+)\.(\d+)') {
+            if (([int]$Matches[1] -gt 3) -or ([int]$Matches[1] -eq 3 -and [int]$Matches[2] -ge 8)) {
+                return "$($Matches[1]).$($Matches[2])"
+            }
+        }
     }
     return $null
 }

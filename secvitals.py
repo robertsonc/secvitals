@@ -1285,7 +1285,15 @@ footer{margin-top:26px;padding-top:12px;border-top:1px solid var(--grid);color:v
 </style></head>
 <body><div class="wrap">
   <header class="head">
-    <div class="logo" aria-hidden="true"><svg viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M2 21h8l3-11 6 20 4-13 3 6h9" stroke-linejoin="round" stroke-linecap="round"/></svg></div>
+    <div class="logo" aria-hidden="true"><svg viewBox="0 0 40 40" fill="none">
+      <g opacity="0.95">
+        <path d="M14.5 20 v-4 a5.5 5.5 0 0 1 11 0 v4" stroke="var(--faint)" stroke-width="2.2" stroke-linecap="round"/>
+        <rect x="10.5" y="20" width="19" height="15" rx="3.5" fill="var(--panel)" stroke="var(--faint)" stroke-width="1.5"/>
+        <circle cx="20" cy="26.4" r="1.6" fill="var(--faint)"/>
+        <rect x="19.3" y="26.9" width="1.4" height="3.6" rx="0.7" fill="var(--faint)"/>
+      </g>
+      <path d="M1 27 H14 L17.5 16 L22 34 L25.5 27 H39" stroke="var(--hpe)" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round"/>
+    </svg></div>
     <div>
       <div class="eyebrow">HPE Aruba · EdgeConnect demo toolbox</div>
       <h1>Security Vitals</h1>

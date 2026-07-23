@@ -11,7 +11,12 @@ build/
 /var/
 *.local.yaml
 *.local.json
-# Update signing private keys must never be committed
+# Update signing private keys must never be committed.
+# These patterns are a BACKSTOP, not the protection: the real protection is that the
+# release private key lives outside the working tree (~/.config/secvitals/, mode 700)
+# and is never copied into it. Never rely on a gitignore rule to keep a key secret.
 *.pem
 !*.pub.pem
 private/
+# Signing output (contains the artifact + manifest + signature; rebuilt per release)
+release/

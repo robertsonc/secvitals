@@ -65,27 +65,94 @@ round-trip test in `tests/test_update.py`).
 On a trusted, offline machine that holds the private key:
 
 ```
-tools/sign_release.sh <version> path/to/secvitals.py path/to/private-key.pem release/
+tools/sign_release.sh <version> path/to/secvitals.py ~/.config/secvitals/secvitals_release_priv.pem release/
 ```
+
+openssl will prompt for the key passphrase. Before it reports success the script
+**verifies its own output** and refuses to leave a publishable release otherwise:
+
+1. the fresh signature must verify against the **public key file** — by default the
+   sibling `*_pub.pem` next to the private key, overridable with `SECV_RELEASE_PUBKEY`;
+2. that public key must match the `UPDATE_PUBKEY` **compiled into the artifact being
+   shipped** (compared by SHA-256 of the DER encoding).
+
+If either check fails the signature file is **deleted**. This matters because signing
+with the wrong key produces a perfectly well-formed release that every client rejects —
+without a local check the first signal would be broken updates in the field.
+
+Note that the verification uses the public key *file*, never one derived from the
+signing key with `openssl rsa -pubout`. A derived key verifies any signature the key
+produced, including one made with entirely the wrong key; only an independent copy of
+the public key answers "did I sign with the key clients actually trust?".
 
 Then publish `release/secvitals.py`, `release/manifest.json`, and
 `release/manifest.json.sig` as the release assets.
 
 ## Key management
 
-- **Generate** a release keypair once, offline:
+The release private key is the single credential that can push code to every install.
+Treat it as such.
+
+- **Generate** a release keypair once, on a trusted machine, **passphrase-protected**:
   ```
-  openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out secvitals_release_priv.pem
-  openssl rsa -in secvitals_release_priv.pem -pubout -out secvitals_release_pub.pem
+  openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -aes-256-cbc \
+    -out ~/.config/secvitals/secvitals_release_priv.pem
+  chmod 700 ~/.config/secvitals
+  chmod 600 ~/.config/secvitals/secvitals_release_priv.pem
+  openssl rsa -in ~/.config/secvitals/secvitals_release_priv.pem -pubout \
+    -out ~/.config/secvitals/secvitals_release_pub.pem
   ```
+  The key lives **outside any git working tree**. The `*.pem` entry in `.gitignore` is
+  a backstop, not the protection.
+
+- **Verify the key is actually encrypted.** If the passphrase prompt is answered with
+  an empty string, openssl silently writes an *unencrypted* key and still exits 0:
+  ```
+  head -1 ~/.config/secvitals/secvitals_release_priv.pem   # must say BEGIN ENCRYPTED PRIVATE KEY
+  openssl pkey -in ~/.config/secvitals/secvitals_release_priv.pem -noout -passin pass:   # must FAIL
+  ```
+  A plain `-----BEGIN PRIVATE KEY-----` header means unencrypted. **Regenerate** — do
+  not encrypt in place, so that any plaintext copy left in free space belongs to a key
+  nothing was ever configured to trust.
+
+- **Back up** the passphrase in a password manager and the key file itself to encrypted
+  offline storage. Losing either means losing the ability to ship *any* update that
+  existing installs will accept; the only recovery is reinstalling every client
+  out-of-band.
+
 - **Embed** the public key: paste `secvitals_release_pub.pem` into `UPDATE_PUBKEY` in
   `secvitals.py`. The public key is safe to commit; **the private key must never be
   committed or placed on an SE laptop.**
-- The value shipped in this repo is a **placeholder/dev key** — replace it with your
-  own before relying on the update channel. Until you do, updates fail closed (nobody
-  holds a private key that matches a key you didn't install), which is the safe state.
-- **Rotate** by shipping a new `UPDATE_PUBKEY` in an app version you distribute
-  out-of-band, then signing subsequent releases with the new key.
+
+### Rotation
+
+Two properties of this design (both verified against the code) make rotation
+order-dependent and leakage unrecoverable:
+
+**Clients trust only the key compiled into the build they are running.** `UPDATE_PUBKEY`
+is a module constant; `check_update`/`download_and_install` default to it and `main`
+passes no override — there is no `--pubkey` and no `--update-url` flag. So a new public
+key can only reach an installed client *inside an update*, and that update must be
+signed with the **old** key or the client refuses it.
+
+Rotate in this order:
+
+1. Generate the new keypair (as above); keep the old key.
+2. Embed the new `UPDATE_PUBKEY` in the source and bump `__version__`.
+3. Sign that release with the **OLD** private key — this is the release that carries the
+   new trust anchor to the field. (`tools/sign_release.sh` will refuse it, because the
+   old public key no longer matches the artifact's embedded key; sign this one release
+   manually with `openssl dgst -sha256 -sign`, deliberately.)
+4. Publish, and confirm clients have taken it up.
+5. Only then sign subsequent releases with the new key. Any install that skipped step 3
+   is stranded and needs a manual reinstall.
+
+**A leaked private key has no revocation path.** There is no revocation list, key ID, or
+kill switch anywhere in the updater — the only checks are signature validity and a
+strictly-increasing version. Anyone holding the key can sign a higher-versioned release
+that every install will accept and execute. If the key leaks, the update channel cannot
+be repaired remotely: distribute a rebuilt app with a new embedded key out-of-band, and
+assume the compromised channel is usable by the attacker until each client is replaced.
 
 ## Residual notes
 

@@ -54,17 +54,17 @@ log = logging.getLogger("secvitals")
 # closed on any verification failure.
 UPDATE_MANIFEST_URL = "https://github.com/robertsonc/secvitals/releases/latest/download/manifest.json"
 
-# PLACEHOLDER / DEV public key. Replace with your own release public key before relying
-# on the update channel (see docs/UPDATE_SECURITY.md). The matching private key is NOT
-# published, so until you install your own key every update fails closed — the safe state.
+# Release verification key (RSA-2048). Rotating this is order-dependent: clients trust
+# only the key in the build they are already running, so a new key must arrive inside a
+# release signed with the OLD one. See the rotation section of docs/UPDATE_SECURITY.md.
 UPDATE_PUBKEY = """-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAohXeujQKdTKz1X+m40+x
-g2/fdCNZe+bHgUl4ylL/XSvAvjm+LR7GyuQaYDihDSmqZJ/bh3FImw71jIFFCwkV
-iJbQA+OpNUBCuGx4S5cHQQLJRINjmsEuzi+rfPvDfpwdbzUoF3MI/Wlc9XVg33qt
-hSglZ7jDsdAM/ssa+qg4Dx4nT+Gs9WXPReSpLPTKgaaCLpa5OZSRlksEJwkKxlA6
-wvd5rpSu61LDm7U9fLSoCScHFfoBLoffzUMFXOKZ1dAEAvnPWPwaMimtYt7Mw5XL
-d8S039/wTLTjbGklBn2dBT+aM5wefmdsfLs78GjQxZZET5iBa1/rvokUdTByQauO
-MwIDAQAB
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqNE7pkVUXTli5dBDijnS
+RopSwNTh+C2F9z971VRJ1mi4FRVpLXQ+zjpLZYRJpZh1jIP5XmePWGEjwcKDnnet
+JhQRZe2Qp9Gf3vrK0exaQZtvpe//TqftO71qBBOlvyTs3tLnm78GMCWkiJB+N6ND
+EFyKWIwe4yfwgnpWmvoPr+P8ZYxw/0bCjy8Q0f5MoXOFjD8Wyr5qYBlaU/Vu1U5X
+74RKP2SotOTRMPxOjFYbf6E4Fk/FqIi6sDsRX1unM3XO9jlU4xC41FU7F+QEMkLk
+YyIG2L3Wgj4zbD1AwP5QDvrIZzHtRvUvq7QHorlkXy7SxgdvCMBEXmIB3f/VrgHX
+RwIDAQAB
 -----END PUBLIC KEY-----
 """
 

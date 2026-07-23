@@ -383,6 +383,12 @@ class Settings:
         return bool(self.control_host)
 
     @property
+    def min_run_interval(self):
+        # Server-side rate limit: minimum spacing between consecutive trigger runs, so a
+        # "run all" (or a fast clicker) can't flood the SD-WAN / EC dashboard / SIEM.
+        return float(_dget(self.raw, "run.min_interval_s", 0.75))
+
+    @property
     def tmnids_url(self):
         return str(_dget(self.raw, "tmnids.url", ""))
 
@@ -904,6 +910,7 @@ class App:
         self.tmnids = TmnidsCache(settings.tmnids_url, settings.tmnids_cache_path,
                                   settings.tmnids_sha256, settings.tmnids_timeout)
         self._run_lock = threading.Lock()   # serialize triggers — clean before/after on stage
+        self._last_run_end = 0.0            # for server-side rate limiting
 
     def run(self, trigger_id, params):
         trigger = self.by_id.get(trigger_id)
@@ -919,6 +926,9 @@ class App:
         if not self._run_lock.acquire(blocking=False):
             return trigger, {"state": ERROR, "reason": "another trigger is already running"}
         try:
+            gap = self.settings.min_run_interval - (time.monotonic() - self._last_run_end)
+            if gap > 0:
+                time.sleep(min(gap, 5.0))       # server-side rate limiting (spacing)
             log.info("run start id=%s", trigger_id)
             result = run_trigger(trigger, params, self.settings, self.tmnids)
             state, reason = classify(trigger, result)
@@ -936,6 +946,7 @@ class App:
                 "argv": _redact(result.argv),
             }
         finally:
+            self._last_run_end = time.monotonic()
             self._run_lock.release()
 
 
@@ -1128,6 +1139,12 @@ h1{margin:.2em 0 0;font-size:clamp(20px,3vw,28px);font-weight:800;letter-spacing
   background:var(--surface);color:var(--dim);font-size:13px}
 .notice b{color:var(--ink)}
 .notice.live{border-color:var(--warn)}
+.toolbar{display:flex;align-items:center;gap:12px;margin:16px 0 4px;flex-wrap:wrap}
+.toolbar .kv{color:var(--dim)}
+button.ghost{appearance:none;border:1px solid var(--grid);border-radius:8px;background:var(--panel);
+  color:var(--ink);font:700 13px/1 "Segoe UI",sans-serif;padding:9px 16px;cursor:pointer}
+button.ghost:hover{border-color:var(--hpe)}
+button.ghost:disabled{color:var(--faint);cursor:not-allowed}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px;margin-top:14px}
 .card{background:var(--surface);border:1px solid var(--grid);border-radius:12px;padding:15px 16px;
   box-shadow:var(--shadow);border-left:3px solid var(--faint);display:flex;flex-direction:column;gap:9px}
@@ -1181,6 +1198,12 @@ footer{margin-top:26px;padding-top:12px;border-top:1px solid var(--grid);color:v
 
   <div id="live-notice" class="notice" style="display:none"></div>
 
+  <div class="toolbar">
+    <button id="run-all" class="ghost">Run all enabled</button>
+    <button id="stop-all" class="ghost" style="display:none">Stop</button>
+    <span id="run-all-status" class="kv"></span>
+  </div>
+
   <div id="grid" class="grid" aria-live="polite"></div>
   <p id="empty" style="color:var(--dim)"></p>
 
@@ -1191,11 +1214,16 @@ footer{margin-top:26px;padding-top:12px;border-top:1px solid var(--grid);color:v
 </div>
 <script>
 const TOKEN = "__TOKEN__";
+const REG = [];                 // [{t, card, btn, state, res}]
+let stopFlag = false;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 const el = (t, c, txt) => { const e = document.createElement(t); if (c) e.className = c; if (txt != null) e.textContent = txt; return e; };
+const fmt = v => (v==null? "—" : v);
 
 async function loadCatalog(){
   const r = await fetch("/api/catalog", {headers:{"Accept":"application/json"}});
   const data = await r.json();
+  const enabledCount = data.triggers.filter(t => !t.gated_disabled).length;
   document.getElementById("foot-state").textContent =
     "catalog " + data.triggers.length + " trigger(s) · live-suspect hosts " +
     (data.enable_live_suspect_hosts ? "ENABLED" : "disabled");
@@ -1207,8 +1235,14 @@ async function loadCatalog(){
       "Set <span class='kv'>enable_live_suspect_hosts: true</span> in config/settings.yaml to run them in a lab.";
   }
   const grid = document.getElementById("grid");
-  grid.innerHTML = "";
+  grid.innerHTML = ""; REG.length = 0;
   for (const t of data.triggers) grid.appendChild(card(t));
+
+  const runBtn = document.getElementById("run-all");
+  runBtn.textContent = "Run all enabled (" + enabledCount + ")";
+  runBtn.disabled = enabledCount === 0;
+  runBtn.addEventListener("click", runAll);
+  document.getElementById("stop-all").addEventListener("click", () => { stopFlag = true; });
 }
 
 function card(t){
@@ -1231,19 +1265,20 @@ function card(t){
   const actions = el("div", "actions");
   const btn = el("button", "fire", t.gated_disabled ? "Disabled" : "Fire trigger");
   btn.disabled = !!t.gated_disabled;
-  const state = el("span", "state", "");
-  state.style.display = "none";
+  const state = el("span", "state", ""); state.style.display = "none";
   actions.appendChild(btn); actions.appendChild(state);
   c.appendChild(actions);
-
   const res = el("div", "result");
   c.appendChild(res);
 
-  btn.addEventListener("click", () => fire(t, btn, state, res));
+  const entry = {t, card: c, btn, state, res};
+  REG.push(entry);
+  btn.addEventListener("click", () => runOne(entry));
   return c;
 }
 
-async function fire(t, btn, state, res){
+async function runOne(entry){
+  const {t, btn, state, res} = entry;
   btn.disabled = true;
   state.style.display = ""; state.className = "state running"; state.textContent = "running…";
   res.className = "result";
@@ -1255,12 +1290,38 @@ async function fire(t, btn, state, res){
     });
     const d = await r.json();
     render(d, state, res);
+    return d.state;
   }catch(e){
     state.className = "state error"; state.textContent = "error";
     res.className = "result show"; res.textContent = "request failed: " + e;
+    return "error";
   }finally{
     btn.disabled = !!t.gated_disabled;
   }
+}
+
+async function runAll(){
+  const runBtn = document.getElementById("run-all");
+  const stopBtn = document.getElementById("stop-all");
+  const status = document.getElementById("run-all-status");
+  const enabled = REG.filter(e => !e.t.gated_disabled);
+  if (!enabled.length) return;
+  stopFlag = false;
+  runBtn.disabled = true; stopBtn.style.display = "";
+  const tally = {allowed:0, blocked:0, error:0, invalid:0};
+  let i = 0;
+  for (const e of enabled){
+    if (stopFlag){ status.textContent = "stopped after " + i + "/" + enabled.length; break; }
+    i++;
+    status.textContent = "running " + i + "/" + enabled.length + ": " + e.t.label;
+    e.card.scrollIntoView({block:"nearest", behavior:"smooth"});
+    const s = await runOne(e);
+    tally[s] = (tally[s]||0) + 1;
+    if (i < enabled.length && !stopFlag) await sleep(500);   // client pacing; server also spaces
+  }
+  if (!stopFlag)
+    status.textContent = "done — " + tally.allowed + " allowed · " + tally.blocked + " blocked · " + tally.error + " error";
+  runBtn.disabled = false; stopBtn.style.display = "none";
 }
 
 function render(d, state, res){
@@ -1278,10 +1339,9 @@ function render(d, state, res){
   if (d.stdout){ res.appendChild(detail("stdout", d.stdout)); }
   if (d.stderr){ res.appendChild(detail("stderr", d.stderr)); }
 }
-const fmt = v => (v==null? "—" : v);
 function detail(label, text){
   const dt = el("details"); dt.appendChild(el("summary", null, label));
-  const pre = el("pre", null, text); dt.appendChild(pre); return dt;
+  dt.appendChild(el("pre", null, text)); return dt;
 }
 
 loadCatalog().catch(e => { document.getElementById("empty").textContent = "failed to load catalog: " + e; });

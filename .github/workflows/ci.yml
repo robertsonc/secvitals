@@ -1,0 +1,34 @@
+name: CI
+
+# Runs the test suite on every push to main and every pull request. The suite is
+# stdlib-only (no dependencies to install) and needs no display: the GUI smoke test
+# drives run_gui against a fake tkinter, and the socket tests use loopback / TEST-NET
+# timeouts — so a bare Ubuntu runner is enough.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.8 is the documented floor (README); 3.12 is current.
+        python-version: ["3.8", "3.10", "3.12"]
+    name: tests (py${{ matrix.python-version }})
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Byte-compile the module
+        run: python -m py_compile secvitals.py
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v

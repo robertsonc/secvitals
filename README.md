@@ -10,47 +10,46 @@ on screen. The console just fires the traffic and honestly reports what it obser
 locally.
 
 ```
-  Source · WSL  →  EdgeConnect · Suricata v7 / WebCC  →  Internet
+  This host  →  EdgeConnect · Suricata v7 / WebCC  →  Internet
 ```
 
-This build covers **north–south** functions: IDS/IPS (tmNIDS) and WebCC / IP reputation.
+This build covers **north–south** functions: IDS/IPS and WebCC / IP reputation.
 East–west is deferred.
 
 ## How it runs
 
-The console is a **Tkinter window on Windows Python**. Each time you fire a trigger it
-runs a short-lived **worker inside WSL** — native `bash` / `curl` / tmNIDS, on the SD-WAN
-egress path — and classifies the result. The worker is invoked as:
+The console is a **Tkinter window on Windows Python**, and everything runs **natively —
+no WSL**. Each trigger reproduces exactly what the corresponding
+[tmNIDS](https://github.com/3CORESec/testmynids.org) test sends, using:
 
-```
-wsl.exe -e python3 - worker <spec>      # this script is streamed to python3 on stdin
-```
+- **`curl.exe`** (ships with Windows 10 1803+) for the HTTP signatures — same flags and
+  exit codes as Linux curl, so the classifier is unchanged;
+- small **built-in stdlib probes** for the rest: a DNS query (`dns`) and a TCP connect /
+  banner grab (`tcp`), plus the IP-reputation probe (`iprep`).
 
-so **nothing is installed inside the distro** and the security-relevant execution stays
-where the Linux tooling and the egress are. `-e python3 -` runs with no login shell, and
-the spec travels as one base64url token, so there is no shell-quoting layer to mangle.
-Run the app natively on Linux (or in WSL with WSLg) and the worker simply runs in-process.
+So the same EdgeConnect / Suricata signatures trip, but **nothing downloads or executes a
+third-party binary** and there's no distro to depend on. (It also runs natively on Linux
+for development.)
 
 ## Install (Windows, one-click)
 
 Double-click **`install.bat`**. A per-user setup window (no admin rights) finds a Windows
-Python **with Tkinter** (installing one from python.org if needed), verifies WSL and adds
-`python3` to your distro if it's missing, copies the app, and creates Start Menu / Desktop
-shortcuts plus a Settings → Apps entry — the same installer experience as NetVitals. See
-[docs/INSTALL.md](docs/INSTALL.md) for options, silent install, updating, and uninstalling.
+Python **with Tkinter** (installing one from python.org if needed), confirms `curl.exe` is
+present, copies the app, and creates Start Menu / Desktop shortcuts plus a Settings → Apps
+entry — the same installer experience as NetVitals. Each app opens in its own window with
+its own taskbar icon. See [docs/INSTALL.md](docs/INSTALL.md) for options, silent install,
+updating, and uninstalling.
 
 ## Run it manually
 
 ```bash
-# Windows (from the install folder): opens the window, fires triggers into WSL
-py secvitals.py
-# Linux / WSLg: opens the window, runs the worker in-process
-python3 secvitals.py
+py secvitals.py          # Windows (from the install folder)
+python3 secvitals.py     # Linux (development)
 ```
 
 No dependencies beyond Python 3.8+ (standard library only); the Windows Python needs
-tcl/tk (Tkinter). Useful flags: `--verbose`, `--config-dir DIR`, `--check-update`,
-`--update`. (`secvitals worker <b64>` is the internal in-WSL execution entry point.)
+tcl/tk (Tkinter), and HTTP triggers need `curl.exe`. Useful flags: `--verbose`,
+`--config-dir DIR`, `--check-update`, `--update`.
 
 ## What the result states mean
 
@@ -72,16 +71,16 @@ same traffic now dropped.
 ## Configuration (separate from logic)
 
 - **`config/catalog.yaml`** — the fixed trigger catalog. The console acts on a catalog
-  `id`; a command is never built from free text. The full catalog entry travels to the
-  worker, which **re-validates it** (`Trigger.from_dict`) before running it.
-- **`config/settings.yaml`** — endpoints and toggles (tmNIDS source + optional SHA-256
-  pin, the control-egress probe, the live-suspect-hosts gate, the update source, and the
-  `wsl.distro` the worker runs in — empty means wsl.exe's default distro).
+  `id`; commands are **fixed** here (a list of argv lists per trigger — a trigger may fire
+  several requests), never built from free text. Optional params are validated against a
+  per-trigger allowlist / pattern before substitution.
+- **`config/settings.yaml`** — endpoints and toggles (the control-egress probe, the
+  live-suspect-hosts gate, the Tor-list source for IP reputation, and the update source).
 
 ### Live suspect-infrastructure gate
 
-Some triggers reach **real** suspect hosts or live Tor nodes (Winnti-adjacent domains,
-`thepiratebay.org`, `hidemyass.com`, Tor relays). They are flagged
+Some triggers reach **real** suspect hosts or live Tor nodes (bad-cert hosts,
+`thepiratebay.org`, `.onion` / Tor relays). They are flagged
 `hits_live_suspect_hosts` and **disabled by default**, so the console can run on a
 customer-adjacent network without originating awkward traffic. Enable them only in a lab
 you control:
@@ -96,18 +95,14 @@ enable_live_suspect_hosts: true
 Because this console executes local commands, it is built defensively:
 
 - **No network surface at all** — there is no HTTP server and no listening socket. The UI
-  is an in-process Tkinter window; nothing off-box (or off-loopback) can reach it.
-- The console acts on a **fixed catalog**; the worker independently **re-validates** every
-  catalog entry it is handed before running anything. Commands run via `subprocess` with
-  an **argv list, never `shell=True`**, with a per-trigger timeout and captured
+  is an in-process Tkinter window; nothing off-box can reach it.
+- **No download-and-execute** — the app runs no third-party binary. Each trigger is an
+  explicit, audited command in the fixed catalog. Commands run via `subprocess` with an
+  **argv list, never `shell=True`**, with a per-trigger timeout and captured
   stdout/stderr/returncode. Optional params are validated against a **per-trigger
-  allowlist / pattern**.
-- The Windows→WSL bridge passes the run spec as a single **base64url token** to
-  `wsl.exe -e python3 -` (no login shell, no shell metacharacters), so the class of
-  quote-mangling bug the installer hit with PowerShell cannot recur.
-- The tmNIDS binary is **SHA-256 pinned and cached** (verified every run, never
-  re-downloaded per click), fetched over pinned TLS. Verification is mandatory and fails
-  closed.
+  allowlist / pattern**; the only built-in token is `{devnull}` (the OS null device).
+- **No shell anywhere** — HTTP triggers exec `curl.exe` directly; `dns` / `tcp` triggers
+  are pure stdlib socket probes. There is no bash, no PowerShell, and no WSL in the path.
 - **Self-update is signed and fails closed** — pinned source, offline RSA signature
   verified before anything is written; on Windows the download retries through the system
   certificate store (SChannel) so a TLS-inspecting proxy doesn't break verification. See
@@ -119,9 +114,9 @@ Because this console executes local commands, it is built defensively:
 python3 -m unittest discover -s tests
 ```
 
-The worker/runner path is covered without Windows or WSL (the `LocalRunner` runs the same
-worker with the local Python); the engine, classifier, YAML loader, and signed updater
-have their own suites.
+The runner (curl via a stub interpreter, the dns/tcp probes, multi-request aggregation),
+the three-state classifier, the catalog/YAML loader, the IP-reputation probe, and the
+signed updater each have their own suite — all run natively, no Windows required.
 
 ## Provenance
 
@@ -139,7 +134,8 @@ full decision record.
 - [x] Phase 0 — scope + reuse + execution-path decisions (`CONFIRMED.md`)
 - [x] Phase 1 — catalog + runner + three-state classifier
 - [x] Hardened self-update channel
-- [x] Phase 2 — full tmNIDS N/S catalog (15 triggers) + run-all with rate limiting
+- [x] Phase 2 — full N/S IDS catalog (15 signatures) + run-all with rate limiting
 - [x] Phase 3 — WebCC (category + web-reputation) + IP reputation (control probe + ratio)
-- [x] Tkinter window (replaces the loopback web UI) + Windows→WSL worker bridge
+- [x] Tkinter window (replaces the loopback web UI)
+- [x] Native Windows execution (curl.exe + stdlib dns/tcp probes) — WSL removed
 - [ ] E/W — deferred (schema reserves `ew`; not implemented)

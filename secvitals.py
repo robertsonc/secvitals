@@ -9,18 +9,19 @@ presenter verifies on the Orchestrator/EC dashboard already on screen.
 
 Design (see CONFIRMED.md):
   * Single code artifact, stdlib only. Self-contained Tkinter window (no browser, no
-    local server). The console runs on Windows Python; each fired trigger is executed
-    by a WORKER shelled into WSL (`wsl.exe -e python3 - worker <spec>`, this file
-    streamed on stdin) so the Linux tooling and the SD-WAN egress do the real work.
-    Run natively on Linux (or in WSL with WSLg) and the worker just runs in-process.
-  * Fixed catalog (config/catalog.yaml). The UI acts on a trigger id / catalog entry;
-    a command is NEVER built from free text. subprocess with an argv list, no
-    shell=True, per-trigger timeout, captured stdout/stderr/returncode. The worker
-    re-validates every catalog entry it is handed (Trigger.from_dict) before running.
-  * Three-state classifier: `blocked` and `error` never collapse.
+    local server). Everything runs NATIVELY — no WSL: curl commands go through the
+    system curl (curl.exe on Windows 10 1803+), and `dns` / `tcp` triggers use small
+    stdlib socket probes. Each trigger reproduces the exact requests a tmNIDS test
+    sends, so the same EdgeConnect / Suricata signatures trip without shelling any
+    third-party binary.
+  * Fixed catalog (config/catalog.yaml). A trigger's commands are FIXED there; nothing
+    is built from free text. subprocess with an argv list, no shell=True, per-trigger
+    timeout, captured stdout/stderr/returncode. A trigger may fire several requests.
+  * Three-state classifier: `blocked` and `error` never collapse. A native probe that
+    doesn't complete is disambiguated by a control egress probe, so a broken environment
+    reports `error`, never a false `blocked`.
 
-This module is import-safe: importing it starts nothing (everything is behind
-main()). `secvitals worker <b64>` is the in-WSL execution entry point.
+This module is import-safe: importing it starts nothing (everything is behind main()).
 """
 
 import argparse
@@ -33,6 +34,7 @@ import logging
 import os
 import re
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -66,32 +68,25 @@ MwIDAQAB
 -----END PUBLIC KEY-----
 """
 
-# The worker is streamed into WSL as `python3 - worker <spec>`, where `__file__` may be
-# "<stdin>" (3.9+) or undefined (older). The worker never needs a real path (its config
-# arrives in the spec), so resolve defensively and let the console-side paths that DO
-# need the file fall back cleanly.
-try:
-    _THIS_FILE = os.path.abspath(__file__)
-    if not os.path.isfile(_THIS_FILE):
-        _THIS_FILE = ""
-except (NameError, OSError):
-    _THIS_FILE = ""
-HERE = os.path.dirname(_THIS_FILE) if _THIS_FILE else os.getcwd()
+_THIS_FILE = os.path.abspath(__file__)          # used by the updater to replace this file
+HERE = os.path.dirname(_THIS_FILE)
 DEFAULT_CONFIG_DIR = os.path.join(HERE, "config")
 DEFAULT_ASSETS_DIR = os.path.join(HERE, "assets")
 
 # Known catalog vocabularies (fixed allowlists).
 CLASSES = {"ns-ids", "ns-webcc", "ns-iprep", "ew"}   # `ew` reserved / deferred
-RUNNERS = {"tmnids", "curl", "iprep"}                 # `iprep` = built-in IP-reputation probe
+# All runners execute NATIVELY (Windows or Linux) — no WSL, no download-and-execute:
+#   curl = curl.exe / curl (ships with Windows 10 1803+); dns / tcp = built-in stdlib
+#   probes; iprep = built-in IP-reputation probe. A trigger reproduces the exact requests
+#   a tmNIDS test sends (curl URLs/headers/UAs, a DNS query, a TCP connect), so it trips
+#   the same EdgeConnect / Suricata signatures without shelling a third-party binary.
+RUNNERS = {"curl", "dns", "tcp", "iprep"}
 FLAGS = {"needs_internet", "needs_et_ruleset", "hits_live_suspect_hosts"}
 SEVERITIES = {"info", "warn", "crit"}
 
-# tmNIDS is a download-and-execute channel, so its bytes are pinned by default and
-# verification is MANDATORY (fail closed). If 3CORESec updates tmNIDS upstream, verify
-# the new binary out-of-band, recompute its SHA-256, and set tmnids.sha256 in
-# settings.yaml (which overrides this constant). See docs/UPDATE_SECURITY.md.
-TMNIDS_SHA256 = "7016952b1713d09aac0b17bc05d1cc9c589c5ab1ed441233b9413717494fa0c4"
-TMNIDS_MAX_BYTES = 4 * 1024 * 1024
+# Windows has no /dev/null; catalog commands use the {devnull} token, substituted to
+# os.devnull at run time (see build_command). It is a fixed safe value, never client input.
+DEVNULL_TOKEN = "{devnull}"
 
 # UI result states — `blocked` and `error` MUST stay distinct.
 ALLOWED, BLOCKED, ERROR, INVALID = "allowed", "blocked", "error", "invalid"
@@ -360,16 +355,6 @@ class Settings:
     raw: dict
 
     @property
-    def wsl_distro(self):
-        # Which WSL distro the console fires the worker into. Empty => wsl.exe's default
-        # distro. Only consulted on Windows (make_runner -> WslRunner).
-        return str(_dget(self.raw, "wsl.distro", "") or "").strip()
-
-    @property
-    def wsl_python(self):
-        return str(_dget(self.raw, "wsl.python", "python3") or "python3").strip()
-
-    @property
     def enable_live_suspect_hosts(self):
         return bool(_dget(self.raw, "enable_live_suspect_hosts", False))
 
@@ -415,25 +400,6 @@ class Settings:
     def node_probe_timeout(self):
         return float(_dget(self.raw, "webcc.node_probe_timeout_s", 5))
 
-    @property
-    def tmnids_url(self):
-        return str(_dget(self.raw, "tmnids.url", ""))
-
-    @property
-    def tmnids_cache_path(self):
-        p = _dget(self.raw, "tmnids.cache_path", "") or ""
-        return p or os.path.join(_cache_dir(), "tmNIDS")
-
-    @property
-    def tmnids_sha256(self):
-        # Config overrides the built-in pin; the pin is never empty, so verification
-        # is always mandatory (fail closed).
-        return ((_dget(self.raw, "tmnids.sha256", "") or "").strip() or TMNIDS_SHA256)
-
-    @property
-    def tmnids_timeout(self):
-        return float(_dget(self.raw, "tmnids.download_timeout_s", 20))
-
 
 @dataclasses.dataclass
 class Trigger:
@@ -441,7 +407,7 @@ class Trigger:
     label: str
     cls: str
     runner: str
-    argv: list
+    commands: list          # list of argv-lists — a trigger may fire several requests
     flags: list
     severity: str
     threat_class: str
@@ -465,9 +431,18 @@ class Trigger:
         runner = d.get("runner")
         if runner not in RUNNERS:
             raise ConfigError(f"{tid}: runner must be one of {sorted(RUNNERS)}, got {runner!r}")
-        argv = d.get("argv")
-        if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
-            raise ConfigError(f"{tid}: argv must be a non-empty list of strings, got {argv!r}")
+        # Accept `commands: [[...], [...]]` (multi-request) or `argv: [...]` (single); the
+        # iprep runner needs neither (its probe is built in).
+        commands = d.get("commands")
+        if commands is None and d.get("argv") is not None:
+            commands = [d.get("argv")]
+        if commands is None and runner == "iprep":
+            commands = [["iprep"]]
+        if not isinstance(commands, list) or not commands:
+            raise ConfigError(f"{tid}: needs a non-empty 'commands' (list of argv lists)")
+        for cmd in commands:
+            if not isinstance(cmd, list) or not cmd or not all(isinstance(a, str) for a in cmd):
+                raise ConfigError(f"{tid}: each command must be a non-empty list of strings, got {cmd!r}")
         flags = d.get("flags") or []
         if not isinstance(flags, list) or any(f not in FLAGS for f in flags):
             raise ConfigError(f"{tid}: flags must be a subset of {sorted(FLAGS)}, got {flags!r}")
@@ -481,13 +456,13 @@ class Trigger:
         _validate_predicate(tid, "expected_on_allow", allow)
         _validate_predicate(tid, "expected_on_block", block)
         params = d.get("params") or []
-        _validate_params(tid, params, argv)
+        _validate_params(tid, params, commands)
         return Trigger(
             id=tid,
             label=str(d.get("label", tid)),
             cls=cls,
             runner=runner,
-            argv=list(argv),
+            commands=[list(c) for c in commands],
             flags=list(flags),
             severity=sev,
             threat_class=str(d.get("threat_class", "")),
@@ -514,31 +489,11 @@ class Trigger:
             "threat_class": self.threat_class,
             "expected_fire": self.expected_fire,
             "talking_point": self.talking_point,
+            "request_count": len(self.commands),
             "params": [{"name": p["name"],
                         "allow": p.get("allow"),
                         "required": p.get("required", True)} for p in self.params],
             "gated_disabled": self.gated_disabled(settings),
-        }
-
-    def to_spec(self):
-        """Serialize back to a from_dict-compatible mapping. The console hands this to
-        the worker, which re-validates it through Trigger.from_dict before running — so
-        the full catalog entry travels, not a free-text command."""
-        return {
-            "id": self.id,
-            "label": self.label,
-            "class": self.cls,
-            "runner": self.runner,
-            "argv": list(self.argv),
-            "flags": list(self.flags),
-            "severity": self.severity,
-            "threat_class": self.threat_class,
-            "expected_fire": self.expected_fire,
-            "talking_point": self.talking_point,
-            "expected_on_allow": dict(self.expected_on_allow),
-            "expected_on_block": dict(self.expected_on_block),
-            "params": [dict(p) for p in self.params],
-            "timeout_s": self.timeout,
         }
 
 
@@ -564,7 +519,10 @@ def _validate_predicate(tid, name, pred):
             raise ConfigError(f"{tid}: {name}.{key} must be a list of integers")
 
 
-def _validate_params(tid, params, argv):
+_BUILTIN_TOKENS = {"devnull"}   # substituted by build_command, not catalog params
+
+
+def _validate_params(tid, params, commands):
     if not isinstance(params, list):
         raise ConfigError(f"{tid}: params must be a list")
     names = set()
@@ -587,10 +545,11 @@ def _validate_params(tid, params, argv):
             except re.error as e:
                 raise ConfigError(f"{tid}: param {name} has an invalid regex pattern: {e}") from e
         names.add(name)
-    used = {tok[1:-1] for tok in argv if isinstance(tok, str) and tok.startswith("{") and tok.endswith("}")}
-    missing = used - names
+    used = {tok[1:-1] for cmd in commands for tok in cmd
+            if isinstance(tok, str) and tok.startswith("{") and tok.endswith("}")}
+    missing = used - names - _BUILTIN_TOKENS
     if missing:
-        raise ConfigError(f"{tid}: argv references undeclared params {sorted(missing)}")
+        raise ConfigError(f"{tid}: commands reference undeclared params {sorted(missing)}")
 
 
 def load_settings(config_dir):
@@ -624,88 +583,6 @@ def load_catalog(config_dir, settings):
     return triggers
 
 
-# ===========================================================================
-# tmNIDS binary cache (download once; never re-download per click)
-# ===========================================================================
-class TmnidsError(Exception):
-    """Raised when the tmNIDS binary cannot be made available."""
-
-
-class TmnidsCache:
-    def __init__(self, url, cache_path, sha256, timeout):
-        self.url = url
-        self.path = cache_path
-        self.sha256 = (sha256 or "").lower()
-        self.timeout = timeout
-        self._lock = threading.Lock()
-
-    def ensure(self):
-        """Return the path to a ready-to-exec tmNIDS binary, downloading it once if
-        needed. Verification against the SHA-256 pin is MANDATORY and fails closed —
-        the binary is downloaded and executed, so TLS host auth alone is not enough
-        (a TLS-terminating SWG is in-path). Raises TmnidsError (→ `error`, never
-        `blocked`)."""
-        with self._lock:
-            if not self.sha256:
-                raise TmnidsError("no tmNIDS SHA-256 pin configured — refusing to run")
-            if os.path.exists(self.path) and os.access(self.path, os.X_OK):
-                self._verify_file(self.path)          # re-verify the cached binary each time
-                return self.path
-            if not self.url:
-                raise TmnidsError("no tmnids.url configured")
-            if not self.url.lower().startswith("https:"):
-                raise TmnidsError(f"tmnids.url must be https, got {self.url!r}")
-            data = self._download()
-            got = hashlib.sha256(data).hexdigest()
-            if not hmac.compare_digest(got, self.sha256):
-                raise TmnidsError(
-                    f"tmNIDS sha256 mismatch — refusing (pinned {self.sha256[:12]}…, got {got[:12]}…). "
-                    "If 3CORESec updated tmNIDS, verify the new binary and set tmnids.sha256 in settings.yaml.")
-            os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-            tmp = self.path + ".dl"
-            try:
-                with open(tmp, "wb") as fh:
-                    fh.write(data)
-                os.chmod(tmp, 0o755)
-                os.replace(tmp, self.path)
-            except OSError as e:
-                _quiet_remove(tmp)
-                raise TmnidsError(f"could not install binary: {e}") from e
-            log.info("tmNIDS cached at %s (%d bytes, sha256 verified)", self.path, len(data))
-            return self.path
-
-    def _verify_file(self, path):
-        try:
-            with open(path, "rb") as fh:
-                got = hashlib.sha256(fh.read()).hexdigest()
-        except OSError as e:
-            raise TmnidsError(f"could not read cached binary: {e}") from e
-        if not hmac.compare_digest(got, self.sha256):
-            raise TmnidsError("cached binary fails the pinned sha256 — refusing to run")
-
-    def _download(self):
-        req = urllib.request.Request(self.url, headers={"User-Agent": "secvitals/%s" % __version__})
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                final = getattr(resp, "url", None) or self.url
-                if not final.lower().startswith("https:"):   # no http, no https->http redirect
-                    raise TmnidsError(f"refusing non-https download URL {final}")
-                data = resp.read(TMNIDS_MAX_BYTES + 1)        # bounded — no memory DoS
-        except (urllib.error.URLError, OSError) as e:
-            raise TmnidsError(f"download failed: {e}") from e
-        if len(data) > TMNIDS_MAX_BYTES:
-            raise TmnidsError("tmNIDS download exceeds the size limit — refusing")
-        if not data:
-            raise TmnidsError("download was empty")
-        return data
-
-
-def _cache_dir():
-    if sys.platform == "win32":
-        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-        return os.path.join(base, "SecurityVitals", "cache")
-    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
-    return os.path.join(base, "secvitals")
 
 
 def _quiet_remove(path):
@@ -756,42 +633,45 @@ def _parse_tor_ips(text):
 
 
 # ===========================================================================
-# Runner  —  subprocess with an argv list, no shell=True, per-trigger timeout
+# Runner  —  native execution: curl.exe / stdlib probes, argv lists, no shell
 # ===========================================================================
+# Every trigger runs NATIVELY (Windows or Linux): curl commands go through curl.exe /
+# curl; `dns` and `tcp` triggers use small stdlib socket probes. A trigger may fire
+# several requests (Trigger.commands) — e.g. the five malware User-Agents — reproducing
+# exactly what the corresponding tmNIDS test sends so the same signatures trip, without
+# shelling any third-party binary. `blocked` and `error` still never collapse.
 @dataclasses.dataclass
-class RunResult:
-    argv: list = dataclasses.field(default_factory=list)
+class SubResult:
+    argv: list = dataclasses.field(default_factory=list)   # command as displayed
     rc: int = None
+    http_code: int = None
     stdout: str = ""
     stderr: str = ""
-    http_code: int = None
-    duration_s: float = 0.0
+    ok: bool = None            # dns/tcp probe: did the expected thing happen?
+    error_reason: str = None   # environment failure for THIS request (→ error)
     timed_out: bool = False
-    error_reason: str = None   # set => classified as `error`
-    control_ok: bool = None    # egress control probe (tmnids); None = not run
+
+
+@dataclasses.dataclass
+class RunResult:
+    subs: list = dataclasses.field(default_factory=list)
+    duration_s: float = 0.0
+    control_ok: bool = None    # egress control probe (dns/tcp only); None = not run
+    error_reason: str = None   # trigger-level error (e.g. param error) → error
 
 
 class ParamError(Exception):
-    """Raised when client-supplied params fail per-trigger validation."""
+    """Raised when supplied params fail per-trigger validation."""
 
 
-# curl exit codes (see CONFIRMED.md §5)
+# curl exit codes (see CONFIRMED.md §5) — identical on Windows and Linux curl.
 BLOCKED_RC = {28, 7, 56}          # timeout, connection refused, recv reset — consistent with a drop
 BROKEN_RC = {6, 5, 35, 60, 77}    # DNS, proxy DNS, TLS handshake, cert — environment, not policy
 
-_ENV_ERR_SIGS = (
-    "could not resolve", "couldn't resolve", "name or service not known",
-    "temporary failure in name resolution", "no address associated",
-    "no route to host", "network is unreachable", "connection refused by proxy",
-    "ssl certificate problem", "certificate verify failed",
-)
 
-_TMNIDS_SELECTOR = re.compile(r"-([1-9]|1[0-5]|99)$")
-
-
-def build_argv(trigger, params):
-    """Build the exact argv from the FIXED catalog template plus validated params.
-    A command is never constructed from raw client input."""
+def _resolve_params(trigger, params):
+    """Validate supplied params against the per-trigger allowlist/pattern once; the same
+    resolved values fill every command. Commands are never built from free text."""
     params = params or {}
     if not isinstance(params, dict):
         raise ParamError("params must be an object")
@@ -825,70 +705,155 @@ def build_argv(trigger, params):
         else:
             raise ParamError(f"param {name!r} has no allowlist or pattern")  # fail closed
         resolved[name] = val
+    return resolved
+
+
+def build_command(template, resolved):
+    """Resolve one fixed command template into a concrete argv: the {devnull} token plus
+    any validated params. Anything in braces that isn't a resolved param is refused."""
     argv = []
-    for tok in trigger.argv:
-        if isinstance(tok, str) and tok.startswith("{") and tok.endswith("}"):
+    for tok in template:
+        if tok == DEVNULL_TOKEN:
+            argv.append(os.devnull)
+        elif isinstance(tok, str) and tok.startswith("{") and tok.endswith("}"):
             nm = tok[1:-1]
             if nm not in resolved:
-                raise ParamError(f"unresolved argv token {tok}")
+                raise ParamError(f"unresolved token {tok}")
             argv.append(resolved[nm])
         else:
             argv.append(tok)
     return argv
 
 
-def run_trigger(trigger, params, settings, tmnids_cache):
-    """Execute one trigger and return a RunResult. Never raises for expected
-    failure modes — those become error_reason (→ `error`)."""
+def run_trigger(trigger, params, settings):
+    """Run every command of one trigger natively and return a RunResult. Never raises for
+    expected failure modes — those become per-request error_reason (→ `error`)."""
     try:
-        argv = build_argv(trigger, params)
+        resolved = _resolve_params(trigger, params)
     except ParamError as e:
         return RunResult(error_reason=f"invalid parameters: {e}")
 
-    if trigger.runner == "tmnids":
-        if len(argv) < 2 or not _TMNIDS_SELECTOR.fullmatch(argv[1]):
-            return RunResult(argv=argv, error_reason=f"tmnids selector not allowed: {argv[1:]!r}")
-        try:
-            binpath = tmnids_cache.ensure()
-        except TmnidsError as e:
-            return RunResult(argv=argv, error_reason=f"tmNIDS binary unavailable: {e}")
-        argv = [binpath] + list(argv[1:])
-
     start = time.monotonic()
-    try:
-        proc = subprocess.run(argv, capture_output=True, timeout=trigger.timeout, check=False)
-    except FileNotFoundError as e:
-        return RunResult(argv=argv, error_reason=f"executable not found: {e}",
-                         duration_s=time.monotonic() - start)
-    except PermissionError as e:
-        return RunResult(argv=argv, error_reason=f"permission denied: {e}",
-                         duration_s=time.monotonic() - start)
-    except subprocess.TimeoutExpired as e:
-        return RunResult(argv=argv, rc=None, timed_out=True,
-                         stdout=_dec(e.stdout), stderr=_dec(e.stderr),
-                         duration_s=time.monotonic() - start)
-    except OSError as e:
-        return RunResult(argv=argv, error_reason=f"could not execute: {e}",
-                         duration_s=time.monotonic() - start)
+    subs, need_control = [], False
+    for template in trigger.commands:
+        try:
+            argv = build_command(template, resolved)
+        except ParamError as e:
+            subs.append(SubResult(argv=list(template), error_reason=f"invalid parameters: {e}"))
+            continue
+        if trigger.runner == "curl":
+            subs.append(_run_curl(argv, trigger.timeout))
+        elif trigger.runner == "dns":
+            s = _run_dns(argv, trigger.timeout)
+            subs.append(s)
+            need_control = need_control or (s.ok is False and not s.error_reason)
+        elif trigger.runner == "tcp":
+            s = _run_tcp(argv, trigger.timeout)
+            subs.append(s)
+            need_control = need_control or (s.ok is False and not s.error_reason)
+        else:
+            subs.append(SubResult(argv=argv, error_reason=f"unsupported runner {trigger.runner!r}"))
 
-    dur = time.monotonic() - start
-    out, err = _dec(proc.stdout), _dec(proc.stderr)
-    res = RunResult(argv=argv, rc=proc.returncode, stdout=out, stderr=err, duration_s=dur)
-    if trigger.runner == "curl":
-        res.http_code = _parse_http_code(out)
-    else:
-        # Non-curl (tmNIDS): distinguish a genuine inline drop (`blocked`) from a broken
-        # environment (`error`), and never report a false `blocked`.
-        if _env_error_signature(err):
-            res.error_reason = "environment error (name resolution / route / TLS): " + _first_line(err)
-        elif not _pred_match(trigger.expected_on_allow, res) and settings.control_enabled:
-            # The expected response did not come back. A control egress probe to a known-
-            # good host tells us whether general egress works (=> this specific flow was
-            # dropped => blocked) or the whole environment is broken (=> error). This is
-            # reliable where a hardcoded English stderr blocklist is not.
-            res.control_ok = _tcp_probe(settings.control_host, settings.control_port,
-                                        min(6.0, trigger.timeout))
+    res = RunResult(subs=subs, duration_s=time.monotonic() - start)
+    # A native probe (dns/tcp) that didn't complete could be an inline drop OR a broken
+    # environment — a control egress probe to a known-good host tells the two apart, so a
+    # broken environment is `error`, never a false `blocked`. curl doesn't need this: its
+    # own exit code already separates a drop (7/28/56) from an environment failure (60/…).
+    if need_control and settings.control_enabled:
+        res.control_ok = _tcp_probe(settings.control_host, settings.control_port,
+                                    min(6.0, trigger.timeout))
     return res
+
+
+def _run_curl(argv, timeout):
+    try:
+        proc = subprocess.run(argv, capture_output=True, timeout=timeout, check=False)
+    except FileNotFoundError as e:
+        return SubResult(argv=argv, error_reason=f"curl not found ({e}) — Windows 10 1803+ ships curl.exe")
+    except subprocess.TimeoutExpired as e:
+        return SubResult(argv=argv, timed_out=True, stdout=_dec(e.stdout), stderr=_dec(e.stderr))
+    except OSError as e:
+        return SubResult(argv=argv, error_reason=f"could not execute curl: {e}")
+    out, err = _dec(proc.stdout), _dec(proc.stderr)
+    return SubResult(argv=argv, rc=proc.returncode, http_code=_parse_http_code(out),
+                     stdout=out, stderr=err)
+
+
+def _run_dns(argv, timeout):
+    """`dns` command: ["dns", "<name>", "@<server>"] — a native A-record query."""
+    qname, server = None, "8.8.8.8"
+    for a in argv[1:]:
+        if a.startswith("@"):
+            server = a[1:] or server
+        elif qname is None:
+            qname = a
+    if not qname:
+        return SubResult(argv=argv, error_reason="dns: no query name in command")
+    ok, detail, err = _dns_query(qname, server, min(float(timeout), 8.0))
+    if err:
+        return SubResult(argv=argv, ok=False, error_reason=err)
+    return SubResult(argv=argv, ok=ok, stdout=detail)
+
+
+def _run_tcp(argv, timeout):
+    """`tcp` command: ["tcp-connect", "<host>", "<port>"] — a native TCP connect/banner."""
+    if len(argv) < 3:
+        return SubResult(argv=argv, error_reason="tcp: command needs a host and port")
+    host, port = argv[1], argv[2]
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return SubResult(argv=argv, error_reason=f"tcp: bad port {port!r}")
+    ok, detail, err = _tcp_banner(host, port, min(float(timeout), 8.0))
+    if err:
+        return SubResult(argv=argv, ok=False, error_reason=err)
+    return SubResult(argv=argv, ok=ok, stdout=detail)
+
+
+def _dns_query(qname, server="8.8.8.8", timeout=5.0):
+    """Send a minimal DNS A-query over UDP and wait for a response. Returns
+    (ok, detail, err): ok True if ANY response came back (the query crossed the wire and
+    the resolver was reachable), ok False on timeout (no response — possibly a policy
+    drop), err set only for a local/environment failure."""
+    try:
+        labels = qname.rstrip(".").split(".")
+        q = b"".join(bytes([len(p)]) + p.encode("ascii") for p in labels) + b"\x00"
+        packet = struct.pack(">HHHHHH", 0x1337, 0x0100, 1, 0, 0, 0) + q + struct.pack(">HH", 1, 1)
+    except (UnicodeError, ValueError) as e:
+        return (False, "", f"dns: bad query name {qname!r}: {e}")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.settimeout(timeout)
+        sock.sendto(packet, (server, 53))
+        data, _ = sock.recvfrom(4096)
+        rcode = data[3] & 0x0F if len(data) >= 4 else -1
+        answers = struct.unpack(">H", data[6:8])[0] if len(data) >= 8 else 0
+        return (True, f"DNS {qname} @{server}: response (rcode={rcode}, answers={answers})", None)
+    except socket.timeout:
+        return (False, f"DNS {qname} @{server}: no response (timeout)", None)
+    except OSError as e:
+        return (False, "", f"dns: {e}")
+    finally:
+        sock.close()
+
+
+def _tcp_banner(host, port, timeout):
+    """Connect and read any greeting banner. Returns (ok, detail, err): ok True if the
+    TCP connection established, ok False on refuse/timeout (possibly a policy drop), err
+    set only for name-resolution / local failures (environment, not policy)."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            sock.settimeout(min(timeout, 3.0))
+            try:
+                banner = sock.recv(128)
+            except OSError:
+                banner = b""
+        txt = banner.decode("latin-1", "replace").strip()
+        return (True, f"TCP {host}:{port} connected" + (f" — {txt[:80]!r}" if txt else ""), None)
+    except socket.gaierror as e:
+        return (False, "", f"tcp: could not resolve {host}: {e}")
+    except (socket.timeout, ConnectionRefusedError, OSError) as e:
+        return (False, f"TCP {host}:{port}: {e.__class__.__name__}", None)
 
 
 def _tcp_probe(host, port, timeout):
@@ -915,11 +880,6 @@ def _first_line(s):
     return ""
 
 
-def _env_error_signature(stderr):
-    low = (stderr or "").lower()
-    return any(sig in low for sig in _ENV_ERR_SIGS)
-
-
 def _parse_http_code(stdout):
     """curl is invoked with -w '%{http_code}|...' as the LAST stdout line."""
     for line in reversed((stdout or "").splitlines()):
@@ -930,7 +890,7 @@ def _parse_http_code(stdout):
 
 
 # ===========================================================================
-# Classifier  —  three states that never collapse
+# Classifier  —  three states that never collapse; multi-request triggers aggregate
 # ===========================================================================
 def classify_curl(rc, http_code):
     if rc == 0:
@@ -944,61 +904,59 @@ def classify_curl(rc, http_code):
     return ERROR   # unknown rc is an error, not a block — fail toward honest
 
 
-def _pred_match(pred, result):
-    if not pred:
-        return False
-    if "rc" in pred and result.rc != pred["rc"]:
-        return False
-    if pred.get("rc_nonzero") and (result.rc is None or result.rc == 0):
-        return False
-    if "body_contains" in pred and pred["body_contains"] not in (result.stdout or ""):
-        return False
-    if "http_code" in pred and result.http_code != pred["http_code"]:
-        return False
-    if "http_code_in" in pred and result.http_code not in (pred.get("http_code_in") or []):
-        return False
-    return True
+def _classify_sub(trigger, s, control_ok):
+    if s.error_reason:
+        return ERROR, s.error_reason
+    if s.timed_out:
+        return ERROR, f"timed out after {trigger.timeout:g}s"
+    if trigger.runner == "curl":
+        return classify_curl(s.rc, s.http_code), f"curl rc={s.rc}, http={s.http_code}"
+    # dns / tcp native probe
+    if s.ok:
+        return ALLOWED, s.stdout or "reached"
+    if control_ok is True:
+        return BLOCKED, "egress control OK but the probe did not complete — dropped inline"
+    if control_ok is False:
+        return ERROR, "egress control probe failed — environment, not policy"
+    return ERROR, "probe did not complete and egress control was unavailable"
 
 
 def classify(trigger, result):
-    """Return (state, reason). state ∈ {allowed, blocked, error}."""
+    """Return (state, reason). state ∈ {allowed, blocked, error}. For a multi-request
+    trigger, aggregate honestly: `blocked` only when every REACHABLE request was dropped,
+    `error` only when all failed on the environment; the split is always shown."""
     if result.error_reason:
         return ERROR, result.error_reason
-    if result.timed_out:
-        # Honest: a full-process timeout is more likely a hung environment than a
-        # clean inline drop (tmNIDS' own sub-request would self-time-out first).
-        return ERROR, f"timed out after {trigger.timeout:g}s"
-    if trigger.runner == "curl":
-        state = classify_curl(result.rc, result.http_code)
-        return state, f"curl rc={result.rc}, http={result.http_code}"
-    # tmNIDS / default: expectation-driven, with control-probe disambiguation.
-    if _pred_match(trigger.expected_on_allow, result):
-        return ALLOWED, "matched expected_on_allow"
-    if result.control_ok is True:
-        return BLOCKED, "egress control OK but the trigger's expected response did not return — dropped inline"
-    if result.control_ok is False:
-        return ERROR, "egress control probe failed — environment, not policy"
-    # No control signal (control probe disabled): fall back to the catalog's declared
-    # block predicate, as an operator-accepted, less-certain path.
-    if _pred_match(trigger.expected_on_block, result):
-        return BLOCKED, "matched expected_on_block (egress control disabled)"
-    return ERROR, f"result matched neither expected_on_allow nor expected_on_block (rc={result.rc})"
+    subs = result.subs or []
+    if not subs:
+        return ERROR, "no requests were run"
+    states = [_classify_sub(trigger, s, result.control_ok)[0] for s in subs]
+    if len(subs) == 1:
+        return states[0], _classify_sub(trigger, subs[0], result.control_ok)[1]
+    a, b, e = states.count(ALLOWED), states.count(BLOCKED), states.count(ERROR)
+    summary = f"{a} allowed / {b} blocked / {e} error across {len(subs)} requests"
+    reachable = a + b
+    if reachable == 0:
+        return ERROR, summary + " — all failed on the environment, not policy"
+    if b == reachable:
+        return BLOCKED, summary + " — every reachable request was dropped inline"
+    if a == reachable:
+        return ALLOWED, summary
+    return (BLOCKED if b > a else ALLOWED), summary + " (mixed — see details)"
 
 
 # ===========================================================================
 # Application state
 # ===========================================================================
 class App:
-    def __init__(self, settings, triggers, config_dir):
+    def __init__(self, settings, triggers, config_dir=None):
         self.settings = settings
         self.triggers = triggers
         self.by_id = {t.id: t for t in triggers}
         self.config_dir = config_dir
-        self.tmnids = TmnidsCache(settings.tmnids_url, settings.tmnids_cache_path,
-                                  settings.tmnids_sha256, settings.tmnids_timeout)
         self.tor_cache = TorNodeCache(settings.tor_list_url, settings.tor_list_ttl)
         self._run_lock = threading.Lock()   # serialize triggers — clean before/after on stage
-        self._last_run_end = 0.0            # for server-side rate limiting
+        self._last_run_end = 0.0            # rate limiting between runs
 
     def run(self, trigger_id, params):
         trigger = self.by_id.get(trigger_id)
@@ -1016,26 +974,27 @@ class App:
         try:
             gap = self.settings.min_run_interval - (time.monotonic() - self._last_run_end)
             if gap > 0:
-                time.sleep(min(gap, 5.0))       # server-side rate limiting (spacing)
+                time.sleep(min(gap, 5.0))       # rate limiting (spacing between runs)
             log.info("run start id=%s", trigger_id)
             if trigger.runner == "iprep":
                 out = self._run_iprep(trigger)
                 log.info("run done id=%s state=%s", trigger_id, out.get("state"))
                 return trigger, out
-            result = run_trigger(trigger, params, self.settings, self.tmnids)
+            result = run_trigger(trigger, params, self.settings)
             state, reason = classify(trigger, result)
-            log.info("run done id=%s state=%s rc=%s dur=%.2fs argv=%s",
-                     trigger_id, state, result.rc, result.duration_s, _redact(result.argv))
+            log.info("run done id=%s state=%s reqs=%d dur=%.2fs",
+                     trigger_id, state, len(result.subs), result.duration_s)
+            first = result.subs[0] if result.subs else None
             return trigger, {
                 "state": state,
                 "reason": reason,
-                "rc": result.rc,
-                "http_code": result.http_code,
+                "rc": (first.rc if first else None),
+                "http_code": (first.http_code if first else None),
                 "duration_s": round(result.duration_s, 3),
                 "expected_fire": trigger.expected_fire,
-                "stdout": _clip(result.stdout, 4000),
-                "stderr": _clip(result.stderr, 4000),
-                "argv": _redact(result.argv),
+                "requests": len(result.subs),
+                "stdout": _clip(_format_subs(result.subs), 6000),
+                "stderr": "",
             }
         finally:
             self._last_run_end = time.monotonic()
@@ -1097,204 +1056,42 @@ def _redact(argv):
     return out
 
 
-# ===========================================================================
-# Worker  —  runs inside WSL (native bash / curl); fires ONE trigger, prints JSON
-# ===========================================================================
-# The Tkinter console runs on Windows Python. It cannot classify curl / run tmNIDS
-# itself (those are Linux tools, and the classifier is tuned to Linux curl exit
-# codes), so for each fired trigger it shells ONE worker into WSL:
-#
-#     wsl.exe -e python3 - worker <base64url-spec>          (THIS file streamed on stdin)
-#
-# `-e python3 -` execs python with no login shell (no profile output, no shell
-# quoting) and reads the program from stdin, so nothing has to be installed inside
-# the distro — the console streams its own source. The spec is one base64url token
-# (argv- and shell-safe: no spaces, quotes or metacharacters). The worker rebuilds
-# the trigger from the FIXED catalog entry (re-validated through Trigger.from_dict),
-# runs the exact same engine (build_argv / run_trigger / classify / App.run) natively
-# where the SD-WAN egress is, and writes ONE framed JSON result line. `blocked` and
-# `error` still never collapse — that logic is unchanged and simply runs in the worker.
-RESULT_MARKER = "@@SECV-RESULT@@ "
-
-
-def _spec_b64(spec):
-    """Encode a run spec as one argv-/shell-safe base64url token (no spaces or quotes)."""
-    return base64.urlsafe_b64encode(json.dumps(spec).encode("utf-8")).decode("ascii")
-
-
-def _worker_run(spec):
-    """Execute one trigger described by `spec` and return the result dict — the SAME
-    shape the (removed) web layer's App.run produced. Runs in WSL / natively."""
-    if not isinstance(spec, dict):
-        return {"state": ERROR, "reason": "worker: spec is not an object"}
-    settings = Settings(raw=spec.get("settings") or {})
-    tdict = spec.get("trigger")
-    if not isinstance(tdict, dict):
-        return {"state": ERROR, "reason": "worker: spec.trigger is missing"}
-    try:
-        trigger = Trigger.from_dict(tdict, settings.default_timeout)   # re-validate the catalog entry
-    except ConfigError as e:
-        return {"state": ERROR, "reason": f"worker: invalid trigger spec: {e}"}
-    app = App(settings, [trigger], config_dir=None)
-    _t, out = app.run(trigger.id, spec.get("params") or {})
-    return out
-
-
-def worker_main(payload_b64):
-    """Entry for `secvitals worker <b64>`. Never raises; always writes exactly one
-    framed JSON result line so the console-side runner can parse it deterministically."""
-    try:
-        raw = base64.urlsafe_b64decode((payload_b64 or "").encode("ascii"))
-        spec = json.loads(raw.decode("utf-8"))
-        out = _worker_run(spec)
-    except Exception as e:                       # last-resort: still emit a usable result
-        out = {"state": ERROR, "reason": f"worker error: {e.__class__.__name__}: {e}"}
-    sys.stdout.write(RESULT_MARKER + json.dumps(out) + "\n")
-    sys.stdout.flush()
-    return 0
-
-
-# ===========================================================================
-# Runner  —  console-side bridge that drives one worker and returns its result dict
-# ===========================================================================
-class RunnerError(Exception):
-    """Raised when the worker could not be started or produced no parseable result."""
-
-
-def _extract_result(stdout_text):
-    """Pull the single framed JSON result line out of the worker's stdout, tolerating
-    any banner a distro might print ahead of it."""
-    for line in (stdout_text or "").splitlines():
-        if line.startswith(RESULT_MARKER):
-            try:
-                return json.loads(line[len(RESULT_MARKER):])
-            except ValueError as e:
-                raise RunnerError(f"worker result was not valid JSON: {e}") from e
-    raise RunnerError("worker produced no result line")
-
-
-def _outer_timeout(settings, trigger_dict):
-    """A generous outer bound for the whole worker call: the trigger's own timeout (or
-    the iprep probe budget) plus process start-up / interpreter overhead."""
-    base = float(trigger_dict.get("timeout_s") or settings.default_timeout)
-    if trigger_dict.get("runner") == "iprep":
-        base = max(base, settings.ip_rep_sample * settings.node_probe_timeout + 12)
-    return base + 25.0
-
-
-class BaseRunner:
-    kind = "base"
-
-    def run(self, spec, timeout):
-        raise NotImplementedError
-
-    def describe(self):
-        return self.kind
-
-
-class LocalRunner(BaseRunner):
-    """Runs the worker with the local Python — native Linux / dev, WSLg, or the console
-    itself running inside a WSL session. Also the runner the tests and the headless
-    render exercise, so the whole worker path is covered without Windows."""
-    kind = "local"
-
-    def __init__(self, python=None, script=None):
-        self.python = python or sys.executable
-        self.script = script or _THIS_FILE
-
-    def run(self, spec, timeout):
-        argv = [self.python, self.script, "worker", _spec_b64(spec)]
-        try:
-            proc = subprocess.run(argv, capture_output=True, text=True,
-                                  timeout=timeout, check=False)
-        except subprocess.TimeoutExpired:
-            raise RunnerError(f"worker timed out after {timeout:g}s")
-        except OSError as e:
-            raise RunnerError(f"could not start the worker: {e}") from e
-        try:
-            return _extract_result(proc.stdout)
-        except RunnerError:
-            hint = (proc.stderr or proc.stdout or "").strip()
-            raise RunnerError(f"worker returned no result (rc={proc.returncode}). {_clip(hint, 300)}")
-
-    def describe(self):
-        return f"local · {os.path.basename(self.python)}"
-
-
-class WslRunner(BaseRunner):
-    """Windows -> WSL bridge. Streams THIS script into `wsl.exe -e python3 -` (so nothing
-    is installed in the distro) and passes the run spec as one base64url argv token. `-e`
-    execs python3 directly with no login shell, so no profile output or shell quoting sits
-    between the console and the worker — the class of bug the installer hit with PowerShell
-    can't recur here."""
-    kind = "wsl"
-
-    def __init__(self, distro="", python="python3", source=b""):
-        self.distro = distro or ""
-        self.python = python or "python3"
-        self.source = source or b""
-
-    def _argv(self, b64):
-        a = ["wsl.exe"]
-        if self.distro:
-            a += ["-d", self.distro]
-        a += ["-e", self.python, "-", "worker", b64]
-        return a
-
-    def run(self, spec, timeout):
-        if not self.source:
-            raise RunnerError("internal error: the console could not read its own source to run the worker")
-        try:
-            proc = subprocess.run(
-                self._argv(_spec_b64(spec)), input=self.source,
-                capture_output=True, timeout=timeout, check=False,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        except subprocess.TimeoutExpired:
-            raise RunnerError(f"worker timed out after {timeout:g}s")
-        except OSError as e:
-            raise RunnerError(f"could not start wsl.exe — is WSL installed? ({e})") from e
-        out = (proc.stdout or b"").decode("utf-8", "replace")
-        err = (proc.stderr or b"").decode("utf-8", "replace")
-        try:
-            return _extract_result(out)
-        except RunnerError:
-            hint = err.strip() or out.strip()
-            raise RunnerError(
-                f"the WSL worker returned no result (rc={proc.returncode}). "
-                f"{_clip(hint, 300) or 'no output — check that python3 is installed in the WSL distro.'}")
-
-    def describe(self):
-        return f"WSL · {self.distro or 'default distro'}"
-
-
-def _read_self_source():
-    if not _THIS_FILE:
-        return b""
-    try:
-        with open(_THIS_FILE, "rb") as fh:
-            return fh.read()
-    except OSError:
-        return b""
-
-
-def make_runner(settings):
-    """Pick the execution bridge. On Windows the console fires into WSL; anywhere else
-    (native Linux, or the console running inside WSL with WSLg) it runs the worker with
-    the local Python."""
-    if sys.platform == "win32":
-        return WslRunner(distro=settings.wsl_distro, python=settings.wsl_python,
-                         source=_read_self_source())
-    return LocalRunner()
+def _format_subs(subs):
+    """Render each of a trigger's requests + its outcome for the details pane."""
+    lines = []
+    for i, s in enumerate(subs or [], 1):
+        head = f"[{i}] $ " + " ".join(_redact(s.argv))
+        meta = []
+        if s.rc is not None:
+            meta.append(f"rc={s.rc}")
+        if s.http_code is not None:
+            meta.append(f"http={s.http_code}")
+        if s.ok is not None:
+            meta.append("reached" if s.ok else "no-response")
+        if s.timed_out:
+            meta.append("timed-out")
+        if s.error_reason:
+            meta.append(f"error: {s.error_reason}")
+        if meta:
+            head += "\n      " + "   ".join(meta)
+        probe = _first_line(s.stdout) if s.ok is not None else ""
+        if probe:
+            head += "\n      " + probe
+        err = _first_line(s.stderr)
+        if err:
+            head += "\n      [stderr] " + err
+        lines.append(head)
+    return "\n".join(lines)
 
 
 # ===========================================================================
 # Tkinter console  —  self-contained window (no browser, no local server)
 # ===========================================================================
 # HPE visual identity mirrored from netvitals: same palette, EKG heartbeat, dark
-# cards. Trigger cards are rendered from the fixed local catalog; a click fires ONE
-# worker through the runner and renders the three honest states (allowed / blocked /
-# error, plus the iprep ratio) — blocked is the product win, error is the environment,
-# and the two never collapse.
+# cards. Trigger cards are rendered from the fixed local catalog; a click fires the
+# trigger in-process (App.run on a background thread) and renders the three honest states
+# (allowed / blocked / error, plus the iprep ratio) — blocked is the product win, error is
+# the environment, and the two never collapse.
 GUI_BG = "#1a1d21"
 GUI_SURFACE = "#23272e"
 GUI_PANEL = "#2c313a"
@@ -1348,6 +1145,24 @@ def _draw_logo(cv):
                    fill=GUI_HPE, width=2, capstyle="round", joinstyle="round")
 
 
+def _set_window_icon(root):
+    """Give the window — and, on Windows, the taskbar — the lock+EKG icon. The
+    AppUserModelID makes Windows group the app under its OWN taskbar button/icon instead
+    of a generic pythonw one, so Security Vitals and Network Vitals each show their logo."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("HPEAruba.SecurityVitals")
+        except Exception:
+            pass
+        ico = os.path.join(DEFAULT_ASSETS_DIR, "secvitals.ico")
+        try:
+            if os.path.isfile(ico):
+                root.iconbitmap(default=ico)
+        except Exception:                      # non-fatal: a missing/bad icon just falls back
+            pass
+
+
 def _gui_button(parent, text, cmd, primary=False):
     return tk.Button(parent, text=text, command=cmd,
                      bg=(GUI_HPE if primary else GUI_PANEL),
@@ -1357,7 +1172,7 @@ def _gui_button(parent, text, cmd, primary=False):
                      font=(GUI_FONT, 9, "bold"), cursor="hand2")
 
 
-def run_gui(settings, triggers, runner, config_dir=None):
+def run_gui(settings, triggers, app, config_dir=None):
     """Build and run the console window. Raises RuntimeError when no display is
     available (headless without Xvfb / no X server)."""
     global tk
@@ -1372,11 +1187,12 @@ def run_gui(settings, triggers, runner, config_dir=None):
     root.geometry("980x700")
     root.minsize(600, 440)
     root.configure(bg=GUI_BG)
+    _set_window_icon(root)
 
     by_id = {t.id: t for t in triggers}
     cards = {}                                  # trigger id -> widget/var bundle
     run_state = {"running": False, "stop": False}
-    ui_queue = queue.Queue()                    # worker threads -> main thread ONLY
+    ui_queue = queue.Queue()                    # background run threads -> main thread ONLY
 
     def pump():
         try:
@@ -1392,9 +1208,6 @@ def run_gui(settings, triggers, runner, config_dir=None):
             root.after(80, pump)
         except tk.TclError:
             pass
-
-    def _make_spec(t, params=None):
-        return {"trigger": t.to_spec(), "params": params or {}, "settings": settings.raw}
 
     def _set_pill(tid, state):
         c = cards.get(tid)
@@ -1424,15 +1237,10 @@ def run_gui(settings, triggers, runner, config_dir=None):
             kv.append(f"http={out['http_code']}")
         if out.get("duration_s") is not None:
             kv.append(f"{out['duration_s']}s")
+        if out.get("requests", 1) > 1:
+            kv.append(f"{out['requests']} requests")
         c["kv"].configure(text="    ".join(kv))
-        detail = ""
-        if out.get("argv"):
-            detail += "$ " + " ".join(str(a) for a in out["argv"]) + "\n\n"
-        if out.get("stdout"):
-            detail += out["stdout"].rstrip() + "\n"
-        if out.get("stderr"):
-            detail += "\n[stderr]\n" + out["stderr"].rstrip() + "\n"
-        c["detail"] = detail.strip()
+        c["detail"] = (out.get("stdout") or "").strip()
         if c["detail"]:
             c["detail_btn"].pack(anchor="w", pady=(6, 0))
         else:
@@ -1449,31 +1257,26 @@ def run_gui(settings, triggers, runner, config_dir=None):
         if c:
             c["fire"].configure(state="disabled")
         _set_pill(tid, "running")
-        timeout = _outer_timeout(settings, t.to_spec())
 
         def work():
             try:
-                out = runner.run(_make_spec(t), timeout)
-            except RunnerError as e:
-                out = {"state": ERROR, "reason": str(e)}
+                _t, out = app.run(tid, {})
+            except Exception as e:                 # never let a run thread die silently
+                out = {"state": ERROR, "reason": f"{e.__class__.__name__}: {e}"}
             ui_queue.put(lambda: set_result(tid, out))
         threading.Thread(target=work, daemon=True).start()
 
     def run_all_worker(ids):
-        interval = settings.min_run_interval
         n = len(ids)
         for i, tid in enumerate(ids):
             if run_state["stop"]:
                 break
-            t = by_id[tid]
             try:
-                out = runner.run(_make_spec(t), _outer_timeout(settings, t.to_spec()))
-            except RunnerError as e:
-                out = {"state": ERROR, "reason": str(e)}
+                _t, out = app.run(tid, {})           # App.run rate-limits between runs itself
+            except Exception as e:
+                out = {"state": ERROR, "reason": f"{e.__class__.__name__}: {e}"}
             ui_queue.put(lambda tid=tid, out=out: set_result(tid, out))
             ui_queue.put(lambda i=i: status_var.set(f"Run all — {i + 1}/{n}"))
-            if i < n - 1 and not run_state["stop"]:
-                time.sleep(min(interval, 5.0))
         ui_queue.put(run_all_done)
 
     def start_run_all():
@@ -1521,8 +1324,8 @@ def run_gui(settings, triggers, runner, config_dir=None):
     meta.pack(side="right", anchor="e")
     tk.Label(meta, text=f"v{__version__}", fg=GUI_DIM, bg=GUI_BG,
              font=(GUI_MONO, 9)).pack(anchor="e")
-    tk.Label(meta, text=runner.describe(), fg=GUI_FAINT, bg=GUI_BG,
-             font=(GUI_MONO, 9)).pack(anchor="e")
+    tk.Label(meta, text=f"native · {'Windows' if sys.platform == 'win32' else sys.platform}",
+             fg=GUI_FAINT, bg=GUI_BG, font=(GUI_MONO, 9)).pack(anchor="e")
 
     # ---- toolbar ----------------------------------------------------------
     bar = tk.Frame(root, bg=GUI_BG, padx=16)
@@ -1545,7 +1348,7 @@ def run_gui(settings, triggers, runner, config_dir=None):
                         font=(GUI_MONO, 8), padx=8, pady=3,
                         highlightbackground=(GUI_HPE if sensor else GUI_GRID), highlightthickness=1)
 
-    node("Source · WSL").pack(side="left")
+    node("Source · this host").pack(side="left")
     tk.Label(path, text="→", fg=GUI_FAINT, bg=GUI_BG).pack(side="left", padx=5)
     node("EdgeConnect · Suricata v7 / WebCC", sensor=True).pack(side="left")
     tk.Label(path, text="→", fg=GUI_FAINT, bg=GUI_BG).pack(side="left", padx=5)
@@ -1696,7 +1499,7 @@ def run_gui(settings, triggers, runner, config_dir=None):
                 except Exception:                 # screenshot is best-effort only
                     pass
             root.destroy()
-        # Optionally exercise the whole fire -> worker -> set_result path in the real
+        # Optionally exercise the whole fire -> run_trigger -> set_result path in the real
         # window (catches result-rendering bugs a static layout pass can't).
         if os.environ.get("SECV_SELFTEST_FIRE"):
             for t in triggers:
@@ -2110,14 +1913,7 @@ def parse_args(argv):
 
 
 def main(argv=None):
-    raw = list(sys.argv[1:]) if argv is None else list(argv)
-
-    # Worker mode is the in-WSL execution entry point. It is dispatched BEFORE argparse
-    # so the protocol stays a fixed two-token contract: `worker <base64url-spec>`.
-    if raw and raw[0] == "worker":
-        return worker_main(raw[1] if len(raw) > 1 else "")
-
-    args = parse_args(raw)
+    args = parse_args(list(sys.argv[1:]) if argv is None else list(argv))
     setup_logging(args.verbose)
 
     if args.check_update or args.update:
@@ -2131,10 +1927,11 @@ def main(argv=None):
         log.error("configuration error: %s", e)
         return 2
 
-    runner = make_runner(settings)
-    log.info("%s %s — %d triggers, runner=%s", APP_NAME, __version__, len(triggers), runner.describe())
+    app = App(settings, triggers, args.config_dir)
+    log.info("%s %s — %d triggers, native execution on %s",
+             APP_NAME, __version__, len(triggers), sys.platform)
     try:
-        run_gui(settings, triggers, runner, args.config_dir)
+        run_gui(settings, triggers, app, args.config_dir)
     except RuntimeError as e:
         log.error("%s", e)
         print(f"{APP_NAME} is a desktop app and needs a display.\n"

@@ -33,9 +33,11 @@ class TestParseIps(unittest.TestCase):
 class TestIprep(unittest.TestCase):
     def setUp(self):
         self._orig_probe = sv._tcp_probe
+        self._orig_probe_flow = sv._tcp_probe_flow
 
     def tearDown(self):
         sv._tcp_probe = self._orig_probe
+        sv._tcp_probe_flow = self._orig_probe_flow
 
     def test_control_disabled_is_error(self):
         app, trig = mk_app(control_host="")
@@ -59,6 +61,7 @@ class TestIprep(unittest.TestCase):
             seq["n"] += 1
             return seq["n"] > 3              # first 3 nodes blocked, 4th reached
         sv._tcp_probe = fake
+        sv._tcp_probe_flow = lambda h, p, to: (fake(h, p, to), sv._flow("TCP", dst_ip=h, dst_port=p))
         out = app._run_iprep(trig)
         self.assertEqual(out["state"], sv.RATIO)
         self.assertEqual(out["ratio"], {"blocked": 3, "reached": 1, "total": 4})

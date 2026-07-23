@@ -38,8 +38,8 @@ and a simpler install (no distro provisioning).
 - **Catalog:** the 15 IDS signatures are reproduced natively as `commands` (a list of
   argv-lists per trigger, so multi-request tests like the 5 malware UAs fire in full).
   Runners are now `curl` / `dns` / `tcp` / `iprep`. The `{devnull}` token maps to the OS
-  null device. Fidelity of each reproduced request to its ET/Suricata SID is verified on
-  the EdgeConnect dashboard (the one thing not checkable from a dev box).
+  null device. Fidelity of each reproduced request to its ET/IDS SID is verified on
+  the inline stack's management console (the one thing not checkable from a dev box).
 - **Removed:** the Worker/Runner/WSL bridge, `TmnidsCache` + the tmNIDS binary pin + the
   `tmnids`/`wsl` settings, `expected_on_allow/block` predicates. Multi-request triggers
   **aggregate honestly** — `blocked` only when every reachable request was dropped; the
@@ -70,10 +70,10 @@ strictly stronger than a loopback bind + CSRF token.
 **New architecture (see README / INSTALL):**
 
 - **Console:** a Tkinter window on **Windows Python** (mirrors netvitals' `run_gui` form
-  factor: HPE palette, EKG heartbeat, dark cards). Same palette constants as §2b.
+  factor: shared palette, EKG heartbeat, dark cards). Same palette constants as §2b.
 - **Execution:** each fired trigger runs a short-lived **worker in WSL** —
   `wsl.exe -e python3 - worker <base64url-spec>`, this script streamed on stdin — so the
-  Linux tooling and SD-WAN egress do the real work and **nothing is installed in the
+  Linux tooling and network egress do the real work and **nothing is installed in the
   distro**. `-e python3 -` uses no login shell; the spec is one base64url token, so no
   shell-quoting layer exists to mangle (the class of bug the installer hit in PR #3).
   On Linux / WSLg the worker runs in-process.
@@ -93,16 +93,16 @@ Every non-negotiable below still holds; the loopback/CSRF item (§9) is replaced
 
 ## 1. What Security Vitals is
 
-A local, single-host demo console. The host already sits behind HPE Aruba
-EdgeConnect; traffic egresses via the SD-WAN and is inspected by EdgeConnect
-(ECOS Suricata v7) and the SSE Secure Web Gateway / BrightCloud WebCC. On a
+A local, single-host demo console. The host already sits behind an inline security
+stack; traffic egresses the network and is inspected by the inline **IDS/IPS** and
+**Secure Web Gateway** (web categorization / reputation). On a
 button click the app **fires security-trigger traffic** and **classifies the
 local result** (allowed / blocked / error). **It does not poll any management
-API** — verification happens on the Orchestrator/EC dashboard already on screen.
+API** — verification happens on the inline stack's management console already on screen.
 
-Scope this build: **north–south (N/S)** only — IDS/IPS (tmNIDS) + WebCC/IP
-reputation. **East–west (E/W) is deferred**; only the catalog schema leaves room
-for it (see §7).
+Scope this build: **north–south (N/S)** only — IDS/IPS (tmNIDS) + web-categorization/
+reputation + IP reputation. **East–west (E/W) is deferred**; only the catalog schema
+leaves room for it (see §7).
 
 ---
 
@@ -127,13 +127,13 @@ app cannot satisfy *"bind the local server to loopback."*
 
 **Decision:** Build secvitals as a **stdlib `http.server` bound to `127.0.0.1` +
 a single-page web UI** the presenter opens in the Windows browser. Reuse
-netvitals' **HPE visual identity** — the exact palette/font constants at
+netvitals' **shared visual identity** — the exact palette/font constants at
 `netquality.py:1916-1929`:
 
 | token | value | role |
 |---|---|---|
-| `HPE_GREEN` | `#01A982` | signature green / primary accent |
-| `HPE_GREEN_DK` | `#017a5e` | hover / pressed |
+| `ACCENT_GREEN` | `#01A982` | signature green / primary accent |
+| `ACCENT_GREEN_DK` | `#017a5e` | hover / pressed |
 | `BG` | `#1a1d21` | app background |
 | `PANEL` | `#23272e` | card/panel |
 | `PANEL_HI` | `#2c313a` | raised/hover panel, flat buttons |
@@ -205,13 +205,13 @@ verification failure.
 
 ## 3. Host & execution path — DECISION: **app runs inside WSL** (preferred)
 
-`demo-notes.txt` establishes the signal path: **Windows + WSL → EdgeConnect →
-Internet**; WSL2 NATs through the Windows host, so EC alerts show the host LAN IP
-(e.g. `10.13.1.100`) as source, zone Untrust outbound.
+`demo-notes.txt` establishes the signal path: **Windows + WSL → inline security stack →
+Internet**; WSL2 NATs through the Windows host, so the inline stack's alerts show the host
+LAN IP (e.g. `10.13.1.100`) as source, zone Untrust outbound.
 
 **Chosen:** the **preferred** path — the app runs **inside WSL**, serves on
 `127.0.0.1`, and the presenter opens it in the **Windows browser**. Traffic path
-is unchanged (still NATs through the host onto the SD-WAN); execution is **native
+is unchanged (still NATs through the host onto the network); execution is **native
 bash** — no `wsl.exe` shelling, no nested quoting, no CRLF stripping. This is why
 the existing `.cmd` files need `tr -d '\r'`: crossing the Windows→WSL boundary is
 the thing we avoid by living inside WSL.
@@ -255,7 +255,7 @@ adds pip-install steps on the SE laptop and to the update path.
 - **Classes:** `ns-ids` (tmNIDS), `ns-webcc` (web category + web reputation),
   `ns-iprep` (IP reputation). `ew` is a **reserved** class value only (deferred).
   (The YAML example's `ns-swg` is superseded by the more specific `ns-webcc` /
-  `ns-iprep` from the WebCC section.)
+  `ns-iprep` from the web-gateway section.)
 - **`ns-ids` seed = tmNIDS 15 signatures.** Core invocation = **cached
   `tmNIDS -N`** (binary cached at a fixed path, downloaded once, `chmod +x`, reused
   — never re-downloaded per click). `ns-uid` (tmNIDS `-1`, SID 2100498) is the
@@ -263,7 +263,7 @@ adds pip-install steps on the SE laptop and to the update path.
 - **Flags surfaced in the UI:** `needs_internet`, `needs_et_ruleset`,
   `hits_live_suspect_hosts`.
 - **`hits_live_suspect_hosts`** (tmNIDS 4 `example.livehost.live`/Winnti, tmNIDS 5
-  live Tor nodes, parts of 11; WebCC `thepiratebay.org`, `hidemyass.com`, the Tor
+  live Tor nodes, parts of 11; SWG `thepiratebay.org`, `hidemyass.com`, the Tor
   IP-rep probes): reach real suspect infrastructure. **Decision: disabled by
   default**, visibly flagged in the UI, and **toggleable by config**, so the
   console can run on a customer-adjacent network without originating
@@ -277,7 +277,7 @@ Do not merely stream stdout. The **exit code + response body** carry the signal:
 |---|---|---|
 | IDS (detect only) | command succeeds, response returns | `sent · allowed` |
 | IPS (inline drop) | connection reset / timeout / non-zero rc | `sent · blocked` |
-| WebCC / IP-rep deny | **silent drop** — timeout/reset, no block page | `sent · blocked` |
+| SWG / IP-rep deny | **silent drop** — timeout/reset, no block page | `sent · blocked` |
 | Trigger failed | DNS failure, TLS error, no route, binary missing | `error` + reason |
 
 `blocked` and `error` **must never collapse** — that distinction is the whole
@@ -297,7 +297,7 @@ otherwise          -> "error"     # unknown rc is an error, not a block — fail
 Retain `rc` + stderr in the result object, show on demand; `error` renders
 visually distinct from `blocked` (different colour + label).
 
-**WebCC specifics:** there is **no block page** — deny = silent drop (timeout/
+**Secure Web Gateway specifics:** there is **no block page** — deny = silent drop (timeout/
 reset). No block-page/redirect detection, no "blocked by policy" banner implying
 a page was served. **Prerequisite surfaced in the UI:** the category/reputation
 must be set to **Deny** in policy for a test to block; an `allowed` result most
@@ -344,7 +344,7 @@ so the schema doesn't paint us into a corner:
 - **Tier 1** (policy/port probe, no listener): SYN to a denied port in another
   zone; timeout = policy drop, RST = allowed-but-closed, SYN-ACK = allowed-open;
   needs a target **IP** + a **control port** to disambiguate timeouts; skip UDP.
-- **Tier 2** (payload signature, listener required): Suricata content rules carry
+- **Tier 2** (payload signature, listener required): IDS content rules carry
   `flow:established,to_server` (confirmed in `trigger_suricata.sh:49`), so payload
   is only evaluated after a completed 3-way handshake — needs a **second
   deployable** reflector/listener with its own update surface. Not until the
@@ -362,9 +362,9 @@ so the schema doesn't paint us into a corner:
   UI replaces them (the underlying test lists are kept as catalog data).
 - The **`local` mode** of `trigger_suricata.sh` / `Trigger-Suricata.ps1` /
   `Trigger-IDPS.ps1` — it `sudo tee -a`'s a rule (sid 9000001) into
-  `local.rules` and reloads/restarts Suricata (`trigger_suricata.sh:45-66`). Edits
-  rules, needs privilege, targets a self-hosted sensor not ECOS, foot-gun on
-  stage. Dropped as a button (kept, if at all, only as a separate gated CLI).
+  `local.rules` and reloads/restarts the local IDS engine (`trigger_suricata.sh:45-66`).
+  Edits rules, needs privilege, targets a self-hosted sensor rather than the inline stack
+  under test, foot-gun on stage. Dropped as a button (kept, if at all, only as a separate gated CLI).
 - netvitals' `--update-url` override, mutable-`main` source, and version-only
   trust gate — replaced by the pinned + signed design in §6.
 - netvitals' traffic/measurement/scoring engine and all its sockets.
@@ -393,7 +393,7 @@ so the schema doesn't paint us into a corner:
 - [x] `blocked` vs `error` never collapse — three-state classifier; the tmNIDS path
   uses a **control egress probe** so a broken environment reports `error`, never a
   false `blocked`; live-suspect hosts flagged + disable-able (default off).
-- [x] *(Phase 3)* three-state **WebCC** classifier (curl rc-set); IP-rep control probe
+- [x] *(Phase 3)* three-state **SWG** classifier (curl rc-set); IP-rep control probe
   (fail => whole test `invalid`) + **ratio** reporting (never a single verdict); Tor list
   cached with a TTL; Deny-prerequisite + silent-drop notice in the UI; EICAR labelled as
   URL/category reputation, not file scanning.
@@ -412,7 +412,7 @@ hardening, curl-code honesty, and dropping the unimplemented `tcp443` runner).
   end-to-end in the reused UI shell. Prove allow/blocked/error before breadth.
 - **Phase 2 — Full N/S catalog:** remaining tmNIDS triggers, flags surfaced,
   "run all" with sane sequencing + rate limiting.
-- **Phase 3 — WebCC + IP reputation** (last phase): category/web-rep/ip-rep
+- **Phase 3 — Secure Web Gateway + IP reputation** (last phase): category/web-rep/ip-rep
   triggers, three-state classifier, control probe, Deny-prerequisite notice.
   **E/W deferred — not started.**
 - **Phase 4 — Native Tkinter window** (§0a): replace the loopback web UI with a

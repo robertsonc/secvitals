@@ -1,20 +1,19 @@
 # Security Vitals
 
-A local, single-host **security-trigger console** for HPE Aruba EdgeConnect demos. Fire
+A local, single-host **security-trigger console** for inline security-stack demos. Fire
 security-trigger traffic on a button click and read the **local result** — `allowed`,
 `blocked`, or `error` — in a **self-contained window** (Tkinter, like NetVitals — no
-browser, no local server). The traffic egresses the SD-WAN and is inspected by
-EdgeConnect (ECOS Suricata v7) and the SSE Secure Web Gateway / BrightCloud WebCC; **the
-console polls no management API.** You verify on the Orchestrator / EC dashboard already
-on screen. The console just fires the traffic and honestly reports what it observed
-locally.
+browser, no local server). The traffic egresses the network and is inspected by the
+inline **IDS/IPS** and **Secure Web Gateway**; **the console polls no management API.**
+You verify on the inline stack's management console already on screen. The console just
+fires the traffic and honestly reports what it observed locally.
 
 ```
-  This host  →  EdgeConnect · Suricata v7 / WebCC  →  Internet
+  This host  →  IDS/IPS + Secure Web Gateway  →  Internet
 ```
 
-This build covers **north–south** functions: IDS/IPS and WebCC / IP reputation.
-East–west is deferred.
+This build covers **north–south** functions: IDS/IPS and web categorization / reputation
+and IP reputation. East–west is deferred.
 
 ## How it runs
 
@@ -27,7 +26,7 @@ no WSL**. Each trigger reproduces exactly what the corresponding
 - small **built-in stdlib probes** for the rest: a DNS query (`dns`) and a TCP connect /
   banner grab (`tcp`), plus the IP-reputation probe (`iprep`).
 
-So the same EdgeConnect / Suricata signatures trip, but **nothing downloads or executes a
+So the same IDS/IPS signatures trip, but **nothing downloads or executes a
 third-party binary** and there's no distro to depend on. (It also runs natively on Linux
 for development.)
 
@@ -55,18 +54,18 @@ tcl/tk (Tkinter), and HTTP triggers need `curl.exe`. Useful flags: `--verbose`,
 
 | State | What happened locally | Reading it |
 |---|---|---|
-| **allowed** | the trigger ran and the expected response came back | IDS is in **detect-only** mode, or WebCC policy allows the category |
-| **blocked** | the flow was dropped inline (reset / timeout / policy deny) | **IPS / WebCC enforcement is working** — the money shot |
+| **allowed** | the trigger ran and the expected response came back | IDS is in **detect-only** mode, or SWG policy allows the category |
+| **blocked** | the flow was dropped inline (reset / timeout / policy deny) | **IPS / SWG enforcement is working** — the money shot |
 | **error** | the trigger couldn't run or the environment is broken (DNS, TLS, no route, binary missing) | not a policy result — fix the environment; never read as a block |
-| **ratio** | IP reputation reached N-of-M live suspect nodes | a ratio, not a single verdict; the EC IP-rep stats are authoritative |
+| **ratio** | IP reputation reached N-of-M live suspect nodes | a ratio, not a single verdict; the inline IP-reputation stats are authoritative |
 | **disabled** | a live-suspect-hosts trigger is gated off | enable it only in a lab (see below) |
 
 `blocked` and `error` are **never** collapsed. An environment failure is reported as
 `error`, never as a false `blocked` — a false "blocked" would misrepresent the product.
 
-The classic before/after: run a trigger in IDS mode → `allowed` + an alert on the EC
-dashboard. Flip the security policy to inline/IPS and run the same trigger → `blocked`,
-same traffic now dropped.
+The classic before/after: run a trigger in IDS mode → `allowed` + an alert on the inline
+stack's console. Flip the security policy to inline/IPS and run the same trigger →
+`blocked`, same traffic now dropped.
 
 ## Configuration (separate from logic)
 
@@ -121,7 +120,7 @@ signed updater each have their own suite — all run natively, no Windows requir
 ## Provenance
 
 Reuses from the `netvitals` app: the **form factor** — a self-contained Tkinter window
-with the HPE visual identity (palette, dark theme, EKG heartbeat) — the **installer UI**
+with the shared visual identity (palette, dark theme, EKG heartbeat) — the **installer UI**
 (the WinForms setup experience: Windows Python + Tkinter, a `pythonw` shortcut, Add/Remove
 Programs), and the **self-update mechanism** (ported and hardened — netvitals' updater had
 no authenticity check). Everything else is new. The original demo scripts and cheatsheets
@@ -135,7 +134,7 @@ full decision record.
 - [x] Phase 1 — catalog + runner + three-state classifier
 - [x] Hardened self-update channel
 - [x] Phase 2 — full N/S IDS catalog (15 signatures) + run-all with rate limiting
-- [x] Phase 3 — WebCC (category + web-reputation) + IP reputation (control probe + ratio)
+- [x] Phase 3 — Secure Web Gateway (category + web-reputation) + IP reputation (control probe + ratio)
 - [x] Tkinter window (replaces the loopback web UI)
 - [x] Native Windows execution (curl.exe + stdlib dns/tcp probes) — WSL removed
 - [ ] E/W — deferred (schema reserves `ew`; not implemented)

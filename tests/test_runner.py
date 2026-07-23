@@ -98,6 +98,32 @@ class TestRunCurl(unittest.TestCase):
         self.assertEqual(sv.classify(t, r)[0], sv.ALLOWED)
 
 
+class TestCurlFlowCapture(unittest.TestCase):
+    def test_marker_parsed_and_stripped(self):
+        # The stub prints curl's http_code line plus our injected 5-tuple marker line.
+        out = "200|\n%s|10.0.0.5|51000|93.184.216.34|80" % sv.FLOW_MARK
+        t = mk_trigger("curl", commands=[_curl_stub(0, out)])
+        r = sv.run_trigger(t, {}, sv.Settings(raw={}))
+        s = r.subs[0]
+        self.assertEqual(s.http_code, 200)
+        self.assertNotIn(sv.FLOW_MARK, s.stdout)            # marker never reaches the details pane
+        self.assertEqual(s.flow, {"proto": "TCP", "src_ip": "10.0.0.5", "src_port": "51000",
+                                  "dst_ip": "93.184.216.34", "dst_port": "80", "host": ""})
+
+    def test_flow_argv_extends_writeout(self):
+        argv = sv._curl_flow_argv(["curl", "-w", "%{http_code}|", "http://x"])
+        self.assertIn(sv.FLOW_MARK, argv[argv.index("-w") + 1])
+        added = sv._curl_flow_argv(["curl", "http://x"])     # no -w in the command
+        self.assertEqual(added[-2], "-w")
+        self.assertIn(sv.FLOW_MARK, added[-1])
+
+    def test_format_flows_hides_all_empty(self):
+        self.assertEqual(sv._format_flows([sv._flow("TCP")]), "")
+        table = sv._format_flows([sv._flow("TCP", "10.0.0.1", "5000", "1.2.3.4", "80", host="x.example")])
+        self.assertIn("SRC-PORT", table)
+        self.assertIn("1.2.3.4", table)
+
+
 class TestDnsProbe(unittest.TestCase):
     def test_no_response_needs_control(self):
         # 192.0.2.1 is TEST-NET-1 (RFC5737) — guaranteed no DNS reply, so the probe times

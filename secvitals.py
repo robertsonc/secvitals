@@ -2,17 +2,17 @@
 """Security Vitals — a local security-trigger console.
 
 Fires security-trigger traffic on a button click and classifies the LOCAL result
-(allowed / blocked / error). The host sits behind HPE Aruba EdgeConnect; traffic
-egresses the SD-WAN and is inspected by EdgeConnect (ECOS Suricata v7) and the SSE
-Secure Web Gateway / BrightCloud WebCC. This app polls no management API — the
-presenter verifies on the Orchestrator/EC dashboard already on screen.
+(allowed / blocked / error). The host sits behind an inline security stack; traffic
+egresses and is inspected by the network's IDS/IPS and Secure Web Gateway. This app
+polls no management API — the presenter verifies on the inline stack's management
+console already on screen.
 
 Design (see CONFIRMED.md):
   * Single code artifact, stdlib only. Self-contained Tkinter window (no browser, no
     local server). Everything runs NATIVELY — no WSL: curl commands go through the
     system curl (curl.exe on Windows 10 1803+), and `dns` / `tcp` triggers use small
     stdlib socket probes. Each trigger reproduces the exact requests a tmNIDS test
-    sends, so the same EdgeConnect / Suricata signatures trip without shelling any
+    sends, so the same IDS/IPS signatures trip without shelling any
     third-party binary.
   * Fixed catalog (config/catalog.yaml). A trigger's commands are FIXED there; nothing
     is built from free text. subprocess with an argv list, no shell=True, per-trigger
@@ -42,7 +42,7 @@ import time
 import urllib.error
 import urllib.request
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 APP_NAME = "Security Vitals"
 
 log = logging.getLogger("secvitals")
@@ -79,7 +79,7 @@ CLASSES = {"ns-ids", "ns-webcc", "ns-iprep", "ew"}   # `ew` reserved / deferred
 #   curl = curl.exe / curl (ships with Windows 10 1803+); dns / tcp = built-in stdlib
 #   probes; iprep = built-in IP-reputation probe. A trigger reproduces the exact requests
 #   a tmNIDS test sends (curl URLs/headers/UAs, a DNS query, a TCP connect), so it trips
-#   the same EdgeConnect / Suricata signatures without shelling a third-party binary.
+#   the same IDS/IPS signatures without shelling a third-party binary.
 RUNNERS = {"curl", "dns", "tcp", "iprep"}
 FLAGS = {"needs_internet", "needs_et_ruleset", "hits_live_suspect_hosts"}
 SEVERITIES = {"info", "warn", "crit"}
@@ -381,7 +381,7 @@ class Settings:
     @property
     def min_run_interval(self):
         # Server-side rate limit: minimum spacing between consecutive trigger runs, so a
-        # "run all" (or a fast clicker) can't flood the SD-WAN / EC dashboard / SIEM.
+        # "run all" (or a fast clicker) can't flood the inline security stack / SIEM.
         return float(_dget(self.raw, "run.min_interval_s", 0.75))
 
     @property
@@ -650,6 +650,7 @@ class SubResult:
     ok: bool = None            # dns/tcp probe: did the expected thing happen?
     error_reason: str = None   # environment failure for THIS request (→ error)
     timed_out: bool = False
+    flow: dict = None          # 5-tuple actually put on the wire (see _flow)
 
 
 @dataclasses.dataclass
@@ -667,6 +668,87 @@ class ParamError(Exception):
 # curl exit codes (see CONFIRMED.md §5) — identical on Windows and Linux curl.
 BLOCKED_RC = {28, 7, 56}          # timeout, connection refused, recv reset — consistent with a drop
 BROKEN_RC = {6, 5, 35, 60, 77}    # DNS, proxy DNS, TLS handshake, cert — environment, not policy
+
+
+# ---------------------------------------------------------------------------
+# 5-tuple capture — what actually went on the wire, for correlating a click with the
+# flow / event records in the inline stack's management console. Every runner reports the same shape:
+# src-ip, src-port, protocol, dst-ip, dst-port (+ the dialled hostname, when there is
+# one). Nothing here changes what is SENT; it only records the endpoints.
+#
+# curl is the awkward case: the socket lives in another process, so the endpoints come
+# back through curl's own --write-out. The catalog's `-w` format is extended IN CODE
+# rather than in catalog.yaml, because a self-update ships secvitals.py alone — an
+# install that updates in place keeps its existing catalog, and would otherwise never
+# report a tuple. The displayed command stays exactly what the catalog declares.
+FLOW_MARK = "SECV-5TUPLE"
+_FLOW_WRITEOUT = "\\n" + FLOW_MARK + "|%{local_ip}|%{local_port}|%{remote_ip}|%{remote_port}\\n"
+_FLOW_RE = re.compile(r"^" + FLOW_MARK + r"\|([^|\n]*)\|([^|\n]*)\|([^|\n]*)\|([^|\n]*)[ \t]*$",
+                      re.MULTILINE)
+
+
+def _flow(proto, src_ip="", src_port="", dst_ip="", dst_port="", host=""):
+    """One 5-tuple record. Unknown fields stay empty and render as '—' — never guessed."""
+    def clean(v):
+        v = "" if v is None else str(v).strip()
+        # An old curl that doesn't know a --write-out variable echoes it literally.
+        return "" if ("%" in v or "{" in v or v in ("0", "0.0.0.0", "::")) else v[:64]
+    dst_ip, host = clean(dst_ip), clean(host)
+    if not dst_ip and _is_ip_literal(host):     # the command dialled an address, not a name
+        dst_ip = host
+    return {"proto": proto, "src_ip": clean(src_ip), "src_port": clean(src_port),
+            "dst_ip": dst_ip, "dst_port": clean(dst_port), "host": host}
+
+
+def _is_ip_literal(s):
+    if not s:
+        return False
+    if ":" in s:                                 # IPv6 literal
+        return all(c in "0123456789abcdefABCDEF:" for c in s)
+    parts = s.split(".")
+    return len(parts) == 4 and all(p.isdigit() and len(p) <= 3 and int(p) < 256 for p in parts)
+
+
+def _url_endpoint(argv):
+    """(host, port) from the first http(s) URL in a curl argv — the destination the
+    command asked for, used when curl never got far enough to report a peer."""
+    for tok in argv or []:
+        if isinstance(tok, str) and tok.startswith(("http://", "https://")):
+            scheme, _, rest = tok.partition("://")
+            authority = rest.split("/", 1)[0].rpartition("@")[2]
+            if authority.startswith("["):                      # IPv6 literal
+                host, _, tail = authority[1:].partition("]")
+                port = tail[1:] if tail.startswith(":") else ""
+            else:
+                host, _, port = authority.partition(":")
+            return host, (port or ("443" if scheme == "https" else "80"))
+    return "", ""
+
+
+def _curl_flow_argv(argv):
+    """The argv actually executed: the catalog's command with the 5-tuple fields appended
+    to its --write-out format (or a --write-out added, if it has none)."""
+    out = list(argv)
+    for i, tok in enumerate(out):
+        if tok == "-w" and i + 1 < len(out):
+            out[i + 1] = out[i + 1] + _FLOW_WRITEOUT
+            return out
+    return out + ["-w", _FLOW_WRITEOUT]
+
+
+def _take_curl_flow(stdout, argv):
+    """Split curl's stdout into (stdout without the marker line, flow). The marker line is
+    ours, not the trigger's output, so it never reaches the details pane."""
+    host, url_port = _url_endpoint(argv)
+    m = _FLOW_RE.search(stdout or "")
+    if not m:
+        return stdout, _flow("TCP", dst_port=url_port, host=host)
+    src_ip, src_port, dst_ip, dst_port = m.groups()
+    cleaned = _FLOW_RE.sub("", stdout).replace("\n\n", "\n").strip("\n")
+    flow = _flow("TCP", src_ip, src_port, dst_ip, dst_port, host)
+    if not flow["dst_port"]:              # curl too old to report the peer port
+        flow["dst_port"] = url_port
+    return cleaned, flow
 
 
 def _resolve_params(trigger, params):
@@ -766,17 +848,19 @@ def run_trigger(trigger, params, settings):
 
 
 def _run_curl(argv, timeout):
+    exec_argv = _curl_flow_argv(argv)          # argv stays the catalog's, for display
     try:
-        proc = subprocess.run(argv, capture_output=True, timeout=timeout, check=False)
+        proc = subprocess.run(exec_argv, capture_output=True, timeout=timeout, check=False)
     except FileNotFoundError as e:
         return SubResult(argv=argv, error_reason=f"curl not found ({e}) — Windows 10 1803+ ships curl.exe")
     except subprocess.TimeoutExpired as e:
-        return SubResult(argv=argv, timed_out=True, stdout=_dec(e.stdout), stderr=_dec(e.stderr))
+        out, flow = _take_curl_flow(_dec(e.stdout), argv)
+        return SubResult(argv=argv, timed_out=True, stdout=out, stderr=_dec(e.stderr), flow=flow)
     except OSError as e:
         return SubResult(argv=argv, error_reason=f"could not execute curl: {e}")
-    out, err = _dec(proc.stdout), _dec(proc.stderr)
+    out, flow = _take_curl_flow(_dec(proc.stdout), argv)
     return SubResult(argv=argv, rc=proc.returncode, http_code=_parse_http_code(out),
-                     stdout=out, stderr=err)
+                     stdout=out, stderr=_dec(proc.stderr), flow=flow)
 
 
 def _run_dns(argv, timeout):
@@ -789,10 +873,10 @@ def _run_dns(argv, timeout):
             qname = a
     if not qname:
         return SubResult(argv=argv, error_reason="dns: no query name in command")
-    ok, detail, err = _dns_query(qname, server, min(float(timeout), 8.0))
+    ok, detail, err, flow = _dns_query(qname, server, min(float(timeout), 8.0))
     if err:
-        return SubResult(argv=argv, ok=False, error_reason=err)
-    return SubResult(argv=argv, ok=ok, stdout=detail)
+        return SubResult(argv=argv, ok=False, error_reason=err, flow=flow)
+    return SubResult(argv=argv, ok=ok, stdout=detail, flow=flow)
 
 
 def _run_tcp(argv, timeout):
@@ -804,65 +888,95 @@ def _run_tcp(argv, timeout):
         port = int(port)
     except (TypeError, ValueError):
         return SubResult(argv=argv, error_reason=f"tcp: bad port {port!r}")
-    ok, detail, err = _tcp_banner(host, port, min(float(timeout), 8.0))
+    ok, detail, err, flow = _tcp_banner(host, port, min(float(timeout), 8.0))
     if err:
-        return SubResult(argv=argv, ok=False, error_reason=err)
-    return SubResult(argv=argv, ok=ok, stdout=detail)
+        return SubResult(argv=argv, ok=False, error_reason=err, flow=flow)
+    return SubResult(argv=argv, ok=ok, stdout=detail, flow=flow)
+
+
+def _sock_flow(sock, proto, host, dst_ip="", dst_port=""):
+    """The 5-tuple of a live socket. getsockname() is what the stack actually bound, so
+    the src-port here is the one the management console will show for this flow."""
+    src_ip = src_port = ""
+    try:
+        local = sock.getsockname()
+        src_ip, src_port = local[0], local[1]
+    except OSError:
+        pass
+    if not dst_ip:
+        try:
+            peer = sock.getpeername()
+            dst_ip, dst_port = peer[0], peer[1]
+        except OSError:
+            pass
+    return _flow(proto, src_ip, src_port, dst_ip, dst_port, host)
 
 
 def _dns_query(qname, server="8.8.8.8", timeout=5.0):
     """Send a minimal DNS A-query over UDP and wait for a response. Returns
-    (ok, detail, err): ok True if ANY response came back (the query crossed the wire and
-    the resolver was reachable), ok False on timeout (no response — possibly a policy
+    (ok, detail, err, flow): ok True if ANY response came back (the query crossed the wire
+    and the resolver was reachable), ok False on timeout (no response — possibly a policy
     drop), err set only for a local/environment failure."""
     try:
         labels = qname.rstrip(".").split(".")
         q = b"".join(bytes([len(p)]) + p.encode("ascii") for p in labels) + b"\x00"
         packet = struct.pack(">HHHHHH", 0x1337, 0x0100, 1, 0, 0, 0) + q + struct.pack(">HH", 1, 1)
     except (UnicodeError, ValueError) as e:
-        return (False, "", f"dns: bad query name {qname!r}: {e}")
+        return (False, "", f"dns: bad query name {qname!r}: {e}", None)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    flow = _flow("UDP", dst_ip=server, dst_port=53, host=qname)
     try:
         sock.settimeout(timeout)
         sock.sendto(packet, (server, 53))
+        flow = _sock_flow(sock, "UDP", qname, server, 53)   # bound only once sent
         data, _ = sock.recvfrom(4096)
         rcode = data[3] & 0x0F if len(data) >= 4 else -1
         answers = struct.unpack(">H", data[6:8])[0] if len(data) >= 8 else 0
-        return (True, f"DNS {qname} @{server}: response (rcode={rcode}, answers={answers})", None)
+        return (True, f"DNS {qname} @{server}: response (rcode={rcode}, answers={answers})",
+                None, flow)
     except socket.timeout:
-        return (False, f"DNS {qname} @{server}: no response (timeout)", None)
+        return (False, f"DNS {qname} @{server}: no response (timeout)", None, flow)
     except OSError as e:
-        return (False, "", f"dns: {e}")
+        return (False, "", f"dns: {e}", flow)
     finally:
         sock.close()
 
 
 def _tcp_banner(host, port, timeout):
-    """Connect and read any greeting banner. Returns (ok, detail, err): ok True if the
-    TCP connection established, ok False on refuse/timeout (possibly a policy drop), err
-    set only for name-resolution / local failures (environment, not policy)."""
+    """Connect and read any greeting banner. Returns (ok, detail, err, flow): ok True if
+    the TCP connection established, ok False on refuse/timeout (possibly a policy drop),
+    err set only for name-resolution / local failures (environment, not policy)."""
+    flow = _flow("TCP", dst_port=port, host=host)
     try:
         with socket.create_connection((host, port), timeout=timeout) as sock:
+            flow = _sock_flow(sock, "TCP", host)
             sock.settimeout(min(timeout, 3.0))
             try:
                 banner = sock.recv(128)
             except OSError:
                 banner = b""
         txt = banner.decode("latin-1", "replace").strip()
-        return (True, f"TCP {host}:{port} connected" + (f" — {txt[:80]!r}" if txt else ""), None)
+        return (True, f"TCP {host}:{port} connected" + (f" — {txt[:80]!r}" if txt else ""),
+                None, flow)
     except socket.gaierror as e:
-        return (False, "", f"tcp: could not resolve {host}: {e}")
+        return (False, "", f"tcp: could not resolve {host}: {e}", flow)
     except (socket.timeout, ConnectionRefusedError, OSError) as e:
-        return (False, f"TCP {host}:{port}: {e.__class__.__name__}", None)
+        return (False, f"TCP {host}:{port}: {e.__class__.__name__}", None, flow)
+
+
+def _tcp_probe_flow(host, port, timeout):
+    """(ok, flow) for a TCP connect to host:port — the probe plus the 5-tuple it used."""
+    flow = _flow("TCP", dst_port=port, host=host)
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout) as sock:
+            return True, _sock_flow(sock, "TCP", host)
+    except (OSError, ValueError):
+        return False, flow
 
 
 def _tcp_probe(host, port, timeout):
     """Return True iff a TCP connection to host:port completes within `timeout`."""
-    try:
-        with socket.create_connection((host, int(port)), timeout=timeout):
-            return True
-    except OSError:
-        return False
+    return _tcp_probe_flow(host, port, timeout)[0]
 
 
 def _dec(b):
@@ -994,6 +1108,7 @@ class App:
                 "expected_fire": trigger.expected_fire,
                 "requests": len(result.subs),
                 "stdout": _clip(_format_subs(result.subs), 6000),
+                "flow": _clip(_format_flows([s.flow for s in result.subs]), 4000),
                 "stderr": "",
             }
         finally:
@@ -1022,9 +1137,11 @@ class App:
             return {"state": ERROR, "expected_fire": trigger.expected_fire,
                     "reason": "the Tor node list was empty"}
         blocked = reached = 0
-        details = []
+        details, flows = [], []
         for ip in sample:
-            if _tcp_probe(ip, 443, s.node_probe_timeout):
+            ok, flow = _tcp_probe_flow(ip, 443, s.node_probe_timeout)
+            flows.append(flow)
+            if ok:
                 reached += 1
                 details.append(f"{ip}:443  reached  (not blocked by IP reputation)")
             else:
@@ -1035,9 +1152,10 @@ class App:
             "ratio": {"blocked": blocked, "reached": reached, "total": len(sample)},
             "reason": (f"{blocked} of {len(sample)} Tor nodes blocked by IP reputation "
                        "(control OK). A ratio, not a single verdict — a lone reach may be a "
-                       "live relay; the EC IP-rep stats are authoritative."),
+                       "live relay; the inline IP-reputation stats are authoritative."),
             "expected_fire": trigger.expected_fire,
             "stdout": "\n".join(details),
+            "flow": _clip(_format_flows(flows), 4000),
         }
 
 
@@ -1084,10 +1202,37 @@ def _format_subs(subs):
     return "\n".join(lines)
 
 
+FLOW_COLUMNS = [("#", "n"), ("PROTO", "proto"), ("SRC-IP", "src_ip"), ("SRC-PORT", "src_port"),
+                ("DST-IP", "dst_ip"), ("DST-PORT", "dst_port"), ("DST-HOST", "host")]
+
+
+def _format_flows(flows):
+    """Render the 5-tuples one request per row, aligned, for correlating this run with the
+    flow / event records in the inline stack's management console. An endpoint the run never learned prints
+    as '—' rather than a plausible-looking guess."""
+    rows = []
+    for i, f in enumerate(flows or [], 1):
+        if not f:
+            continue
+        r = {"n": str(i)}
+        for key in ("proto", "src_ip", "src_port", "dst_ip", "dst_port", "host"):
+            r[key] = str(f.get(key) or "") or "—"
+        if r["host"] == r["dst_ip"]:
+            r["host"] = "—"                      # the command dialled a literal address
+        rows.append(r)
+    if not rows or all(r["src_ip"] == "—" and r["dst_ip"] == "—" for r in rows):
+        return ""
+    widths = [max(len(title), *(len(r[key]) for r in rows)) for title, key in FLOW_COLUMNS]
+    out = ["  ".join(t.ljust(w) for (t, _), w in zip(FLOW_COLUMNS, widths)).rstrip()]
+    for r in rows:
+        out.append("  ".join(r[k].ljust(w) for (_, k), w in zip(FLOW_COLUMNS, widths)).rstrip())
+    return "\n".join(out)
+
+
 # ===========================================================================
 # Tkinter console  —  self-contained window (no browser, no local server)
 # ===========================================================================
-# HPE visual identity mirrored from netvitals: same palette, EKG heartbeat, dark
+# Visual identity mirrored from netvitals: same palette, EKG heartbeat, dark
 # cards. Trigger cards are rendered from the fixed local catalog; a click fires the
 # trigger in-process (App.run on a background thread) and renders the three honest states
 # (allowed / blocked / error, plus the iprep ratio) — blocked is the product win, error is
@@ -1100,8 +1245,8 @@ GUI_GRID = "#363b44"
 GUI_INK = "#f2f4f5"
 GUI_DIM = "#9aa3ad"
 GUI_FAINT = "#6f787c"
-GUI_HPE = "#01A982"
-GUI_HPE_DK = "#017a5e"
+GUI_ACCENT = "#01A982"
+GUI_ACCENT_DK = "#017a5e"
 GUI_INFO = "#00B0E6"
 GUI_WARN = "#FF8300"
 GUI_CRIT = "#E0574a"
@@ -1111,28 +1256,22 @@ GUI_MONO = "Consolas"
 
 SEV_COLOR = {"info": GUI_INFO, "warn": GUI_WARN, "crit": GUI_CRIT}
 
-# state -> (foreground, pill text). blocked = product win (green); allowed = traffic
-# passed / detect-only (blue); error = environment, never a false block (red);
-# ratio = N-of-M (blue); invalid = gated off (amber).
-STATE_STYLE = {
-    ALLOWED: (GUI_INFO, "ALLOWED"),
-    BLOCKED: (GUI_HPE, "BLOCKED"),
-    ERROR:   (GUI_CRIT, "ERROR"),
-    INVALID: (GUI_GOLD, "DISABLED"),
-    RATIO:   (GUI_INFO, "RATIO"),
-    "running": (GUI_DIM, "running…"),
-    "idle":  (GUI_FAINT, "not run"),
-}
+# The row status line reports WHEN a trigger last ran and HOW MANY times — not a local
+# verdict. The inline security stack's own console is authoritative for
+# allowed-vs-blocked; the console's own read of the run still shows up in the expanded
+# row and in the details. Colour is used only to flag a run that did NOT fire (error /
+# gated off), because that is an environment problem the presenter needs to see at a glance.
+STATE_FG = {ERROR: GUI_CRIT, INVALID: GUI_GOLD}
 CLASS_LABEL = {
-    "ns-ids":   "NORTH-SOUTH · IDS / IPS  (tmNIDS → ECOS Suricata v7)",
-    "ns-webcc": "NORTH-SOUTH · WEB CATEGORIES & REPUTATION  (WebCC / SWG)",
+    "ns-ids":   "NORTH-SOUTH · IDS / IPS",
+    "ns-webcc": "NORTH-SOUTH · WEB CATEGORIES & REPUTATION  (SWG)",
     "ns-iprep": "NORTH-SOUTH · IP REPUTATION",
     "ew":       "EAST-WEST",
 }
 
 
 def _draw_logo(cv):
-    """Padlock silhouette (shadow) crossed by an HPE-green EKG pulse — the same mark as
+    """Padlock silhouette (shadow) crossed by a green EKG pulse — the same mark as
     the web build's SVG, drawn on a 42x40 canvas."""
     f = GUI_FAINT
     cv.create_arc(14, 10, 26, 22, start=0, extent=180, style="arc", outline=f, width=2)  # shackle
@@ -1142,7 +1281,7 @@ def _draw_logo(cv):
     cv.create_oval(18.5, 25, 21.5, 28, fill=f, outline=f)                                # keyhole
     cv.create_line(20, 27, 20, 31, fill=f, width=2)
     cv.create_line(1, 27, 14, 27, 17.5, 16, 22, 34, 25.5, 27, 41, 27,                    # EKG pulse
-                   fill=GUI_HPE, width=2, capstyle="round", joinstyle="round")
+                   fill=GUI_ACCENT, width=2, capstyle="round", joinstyle="round")
 
 
 def _set_window_icon(root):
@@ -1152,7 +1291,7 @@ def _set_window_icon(root):
     if sys.platform == "win32":
         try:
             import ctypes
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("HPEAruba.SecurityVitals")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("SecurityVitals.Console")
         except Exception:
             pass
         ico = os.path.join(DEFAULT_ASSETS_DIR, "secvitals.ico")
@@ -1165,9 +1304,9 @@ def _set_window_icon(root):
 
 def _gui_button(parent, text, cmd, primary=False):
     return tk.Button(parent, text=text, command=cmd,
-                     bg=(GUI_HPE if primary else GUI_PANEL),
+                     bg=(GUI_ACCENT if primary else GUI_PANEL),
                      fg=("#04120e" if primary else GUI_INK),
-                     activebackground=GUI_HPE_DK, activeforeground="white",
+                     activebackground=GUI_ACCENT_DK, activeforeground="white",
                      relief="flat", bd=0, highlightthickness=0, padx=14, pady=6,
                      font=(GUI_FONT, 9, "bold"), cursor="hand2")
 
@@ -1209,27 +1348,22 @@ def run_gui(settings, triggers, app, config_dir=None):
         except tk.TclError:
             pass
 
-    def _set_pill(tid, state):
+    def _set_status(tid, text, fg=GUI_FAINT):
         c = cards.get(tid)
-        if not c:
-            return
-        fg, text = STATE_STYLE.get(state, (GUI_CRIT, str(state).upper()))
-        c["pill"].configure(text=text, fg=fg)
-        c["pillbox"].configure(highlightbackground=fg)
+        if c:
+            c["status"].configure(text=text, fg=fg)
 
     def set_result(tid, out):
         c = cards.get(tid)
         if not c:
             return
         state = out.get("state", ERROR)
-        fg, text = STATE_STYLE.get(state, (GUI_CRIT, str(state).upper()))
-        if state == RATIO:
-            r = out.get("ratio") or {}
-            text = f"{r.get('blocked', '?')}/{r.get('total', '?')} BLOCKED"
-        c["pill"].configure(text=text, fg=fg)
-        c["pillbox"].configure(highlightbackground=fg)
+        c["runs"] += 1
+        runs = f"{c['runs']} run" + ("" if c["runs"] == 1 else "s")
+        _set_status(tid, f"last run {time.strftime('%H:%M:%S')}  ·  {runs}",
+                    STATE_FG.get(state, GUI_DIM))
         c["reason"].configure(text=out.get("reason", ""))
-        c["reason"].pack(anchor="w", fill="x", pady=(6, 0))
+        c["reason"].pack(anchor="w", fill="x", pady=(2, 0))
         kv = []
         if out.get("rc") is not None:
             kv.append(f"rc={out['rc']}")
@@ -1240,11 +1374,8 @@ def run_gui(settings, triggers, app, config_dir=None):
         if out.get("requests", 1) > 1:
             kv.append(f"{out['requests']} requests")
         c["kv"].configure(text="    ".join(kv))
-        c["detail"] = (out.get("stdout") or "").strip()
-        if c["detail"]:
-            c["detail_btn"].pack(anchor="w", pady=(6, 0))
-        else:
-            c["detail_btn"].pack_forget()
+        c["set_pane"]("cmd", (out.get("stdout") or "").strip())
+        c["set_pane"]("flow", (out.get("flow") or "").strip())
         c["fire"].configure(state="normal")
 
     def fire(tid):
@@ -1256,7 +1387,7 @@ def run_gui(settings, triggers, app, config_dir=None):
         c = cards.get(tid)
         if c:
             c["fire"].configure(state="disabled")
-        _set_pill(tid, "running")
+        _set_status(tid, "running…", GUI_DIM)
 
         def work():
             try:
@@ -1292,7 +1423,7 @@ def run_gui(settings, triggers, app, config_dir=None):
             c = cards.get(tid)
             if c:
                 c["fire"].configure(state="disabled")
-            _set_pill(tid, "running")
+            _set_status(tid, "running…", GUI_DIM)
         threading.Thread(target=run_all_worker, args=(ids,), daemon=True).start()
 
     def run_all_done():
@@ -1316,16 +1447,12 @@ def run_gui(settings, triggers, app, config_dir=None):
     _draw_logo(logo)
     titlebox = tk.Frame(header, bg=GUI_BG)
     titlebox.pack(side="left", anchor="w")
-    tk.Label(titlebox, text="HPE ARUBA · EDGECONNECT DEMO TOOLBOX", fg=GUI_HPE, bg=GUI_BG,
-             font=(GUI_MONO, 8, "bold")).pack(anchor="w")
     tk.Label(titlebox, text=APP_NAME, fg=GUI_INK, bg=GUI_BG,
              font=(GUI_FONT, 20, "bold")).pack(anchor="w")
     meta = tk.Frame(header, bg=GUI_BG)
     meta.pack(side="right", anchor="e")
     tk.Label(meta, text=f"v{__version__}", fg=GUI_DIM, bg=GUI_BG,
              font=(GUI_MONO, 9)).pack(anchor="e")
-    tk.Label(meta, text=f"native · {'Windows' if sys.platform == 'win32' else sys.platform}",
-             fg=GUI_FAINT, bg=GUI_BG, font=(GUI_MONO, 9)).pack(anchor="e")
 
     # ---- toolbar ----------------------------------------------------------
     bar = tk.Frame(root, bg=GUI_BG, padx=16)
@@ -1338,23 +1465,6 @@ def run_gui(settings, triggers, app, config_dir=None):
     status_var = tk.StringVar(value="")
     tk.Label(bar, textvariable=status_var, fg=GUI_DIM, bg=GUI_BG,
              font=(GUI_MONO, 9)).pack(side="left", padx=14)
-
-    # ---- traffic-path strip ----------------------------------------------
-    path = tk.Frame(root, bg=GUI_BG, padx=16, pady=4)
-    path.pack(fill="x")
-
-    def node(text, sensor=False):
-        return tk.Label(path, text=text, fg=(GUI_HPE if sensor else GUI_DIM), bg=GUI_PANEL,
-                        font=(GUI_MONO, 8), padx=8, pady=3,
-                        highlightbackground=(GUI_HPE if sensor else GUI_GRID), highlightthickness=1)
-
-    node("Source · this host").pack(side="left")
-    tk.Label(path, text="→", fg=GUI_FAINT, bg=GUI_BG).pack(side="left", padx=5)
-    node("EdgeConnect · Suricata v7 / WebCC", sensor=True).pack(side="left")
-    tk.Label(path, text="→", fg=GUI_FAINT, bg=GUI_BG).pack(side="left", padx=5)
-    node("Internet").pack(side="left")
-    tk.Label(path, text="   verify on the Orchestrator / EC dashboard — this console polls no API",
-             fg=GUI_FAINT, bg=GUI_BG, font=(GUI_FONT, 9)).pack(side="left", padx=8)
 
     # ---- live-infrastructure gate notice ---------------------------------
     gated = [t for t in triggers if t.gated_disabled(settings)]
@@ -1382,50 +1492,96 @@ def run_gui(settings, triggers, app, config_dir=None):
     scroll.bind_all("<Button-4>", lambda e: scroll.yview_scroll(-1, "units"))
     scroll.bind_all("<Button-5>", lambda e: scroll.yview_scroll(1, "units"))
 
+    def _make_pane(parent, title):
+        """L3 detail pane: a toggle line + a text box that only appears once there is
+        content and the presenter opens it. Returns (set_content, reset)."""
+        state = {"open": False, "text": ""}
+        btn = tk.Label(parent, fg=GUI_FAINT, bg=GUI_SURFACE, font=(GUI_MONO, 9), cursor="hand2")
+        box = tk.Text(parent, height=8, bg=GUI_BG, fg=GUI_INK, insertbackground=GUI_INK,
+                      font=(GUI_MONO, 9), relief="flat", highlightthickness=1,
+                      highlightbackground=GUI_GRID, wrap="none", padx=8, pady=6)
+
+        def _render():
+            btn.configure(text=("▾ " if state["open"] else "▸ ") + title)
+            if state["open"]:
+                box.configure(state="normal")
+                box.delete("1.0", "end")
+                box.insert("1.0", state["text"] or "(no output)")
+                box.configure(state="disabled")
+                box.pack(fill="x", pady=(4, 0))
+            else:
+                box.pack_forget()
+
+        def toggle(_e=None):
+            state["open"] = not state["open"]
+            _render()
+        btn.bind("<Button-1>", toggle)
+
+        def set_content(text):
+            state["text"] = text or ""
+            if state["text"]:
+                btn.pack(anchor="w", pady=(8, 0))
+            else:
+                btn.pack_forget()
+                state["open"] = False
+            _render()
+
+        def reset():
+            state["open"] = False
+            box.pack_forget()
+            btn.pack_forget()
+            state["text"] = ""
+        return set_content, reset
+
     def build_card(t):
         disabled = t.gated_disabled(settings)
+        expand = {"open": False}
         wrap = tk.Frame(inner, bg=GUI_GRID)                       # 1px border via padding
-        wrap.pack(fill="x", padx=8, pady=5)
+        wrap.pack(fill="x", padx=8, pady=3)
         row = tk.Frame(wrap, bg=GUI_SURFACE)
         row.pack(fill="x", padx=1, pady=1)
         accent = tk.Frame(row, bg=SEV_COLOR.get(t.severity, GUI_FAINT), width=3)
         accent.pack(side="left", fill="y")
-        card = tk.Frame(row, bg=GUI_SURFACE, padx=14, pady=12)
+        card = tk.Frame(row, bg=GUI_SURFACE)
         card.pack(side="left", fill="both", expand=True)
 
-        top = tk.Frame(card, bg=GUI_SURFACE)
-        top.pack(fill="x")
-        tk.Label(top, text=t.label, fg=(GUI_FAINT if disabled else GUI_INK), bg=GUI_SURFACE,
-                 font=(GUI_FONT, 12, "bold"), anchor="w", justify="left").pack(side="left")
+        # ---- L1: always-visible summary header (click to expand) ----------
+        head = tk.Frame(card, bg=GUI_SURFACE, padx=12, pady=8, cursor="hand2")
+        head.pack(fill="x")
+        caret = tk.Label(head, text="▸", fg=GUI_FAINT, bg=GUI_SURFACE, font=(GUI_MONO, 10))
+        caret.pack(side="left", padx=(0, 8))
+        tk.Label(head, text=t.label, fg=(GUI_FAINT if disabled else GUI_INK), bg=GUI_SURFACE,
+                 font=(GUI_FONT, 11, "bold"), anchor="w", justify="left").pack(side="left")
+        if "hits_live_suspect_hosts" in t.flags:
+            tk.Label(head, text="LIVE", fg=GUI_WARN, bg=GUI_SURFACE, font=(GUI_MONO, 8),
+                     padx=6, pady=1, highlightbackground=GUI_WARN, highlightthickness=1).pack(side="left", padx=8)
+        status = tk.Label(head, text=("disabled (live)" if disabled else "not run"),
+                          fg=(GUI_GOLD if disabled else GUI_FAINT), bg=GUI_SURFACE, font=(GUI_MONO, 9))
+        status.pack(side="right")
 
-        pillbox = tk.Frame(top, bg=GUI_SURFACE, highlightbackground=GUI_FAINT, highlightthickness=1)
-        pillbox.pack(side="right")
-        pill = tk.Label(pillbox, text="not run", fg=GUI_FAINT, bg=GUI_SURFACE,
-                        font=(GUI_MONO, 9, "bold"), padx=8, pady=2)
-        pill.pack()
+        # ---- L2: context + action, hidden until the row is expanded -------
+        body_l2 = tk.Frame(card, bg=GUI_SURFACE, padx=12, pady=(0, 10))
 
-        chips = tk.Frame(card, bg=GUI_SURFACE)
-        chips.pack(fill="x", pady=(6, 0))
+        chips = tk.Frame(body_l2, bg=GUI_SURFACE)
+        chips.pack(fill="x", pady=(2, 0))
 
         def chip(text, fg, bd):
             tk.Label(chips, text=text, fg=fg, bg=GUI_SURFACE, font=(GUI_MONO, 8),
                      padx=6, pady=1, highlightbackground=bd, highlightthickness=1).pack(side="left", padx=(0, 5))
 
-        chip(t.cls, GUI_HPE, GUI_HPE_DK)
+        chip(t.cls, GUI_ACCENT, GUI_ACCENT_DK)
         if t.threat_class:
             chip(t.threat_class, GUI_DIM, GUI_GRID)
         chip(t.severity, SEV_COLOR.get(t.severity, GUI_DIM), SEV_COLOR.get(t.severity, GUI_GRID))
-        if "hits_live_suspect_hosts" in t.flags:
-            chip("LIVE", GUI_WARN, GUI_WARN)
 
         if t.expected_fire:
-            tk.Label(card, text=t.expected_fire, fg=GUI_DIM, bg=GUI_SURFACE, font=(GUI_MONO, 9),
+            tk.Label(body_l2, text=t.expected_fire, fg=GUI_DIM, bg=GUI_SURFACE, font=(GUI_MONO, 9),
                      anchor="w", justify="left", wraplength=820).pack(fill="x", pady=(8, 0))
         if t.talking_point:
-            tk.Label(card, text=t.talking_point, fg=GUI_FAINT, bg=GUI_SURFACE, font=(GUI_FONT, 9),
+            tk.Label(body_l2, text=t.talking_point, fg=GUI_FAINT, bg=GUI_SURFACE, font=(GUI_FONT, 9),
                      anchor="w", justify="left", wraplength=820).pack(fill="x", pady=(4, 0))
 
-        actions = tk.Frame(card, bg=GUI_SURFACE)
+        actions = tk.Frame(body_l2, bg=GUI_SURFACE)
         actions.pack(fill="x", pady=(10, 0))
         fire_btn = _gui_button(actions, "Fire", lambda tid=t.id: fire(tid), primary=True)
         if disabled:
@@ -1434,40 +1590,37 @@ def run_gui(settings, triggers, app, config_dir=None):
         kv = tk.Label(actions, text="", fg=GUI_DIM, bg=GUI_SURFACE, font=(GUI_MONO, 9))
         kv.pack(side="left", padx=12)
 
-        reason = tk.Label(card, text="", fg=GUI_INK, bg=GUI_SURFACE, font=(GUI_FONT, 9),
+        reason = tk.Label(body_l2, text="", fg=GUI_INK, bg=GUI_SURFACE, font=(GUI_FONT, 9),
                           anchor="w", justify="left", wraplength=860)
 
-        detail_state = {"open": False}
-        detail_btn = tk.Label(card, text="▸ details", fg=GUI_FAINT, bg=GUI_SURFACE,
-                              font=(GUI_MONO, 9), cursor="hand2")
-        detail_txt = tk.Text(card, height=8, bg=GUI_BG, fg=GUI_INK, insertbackground=GUI_INK,
-                             font=(GUI_MONO, 9), relief="flat", highlightthickness=1,
-                             highlightbackground=GUI_GRID, wrap="word", padx=8, pady=6)
+        # ---- L3: detail panes, each disclosed on demand -------------------
+        set_cmd, reset_cmd = _make_pane(body_l2, "command/payload details")
+        set_flow, reset_flow = _make_pane(body_l2, "5-tuple details")
 
-        def toggle_detail(_e=None):
-            detail_state["open"] = not detail_state["open"]
-            if detail_state["open"]:
-                detail_txt.configure(state="normal")
-                detail_txt.delete("1.0", "end")
-                detail_txt.insert("1.0", cards[t.id].get("detail", "") or "(no output)")
-                detail_txt.configure(state="disabled")
-                detail_txt.pack(fill="x", pady=(6, 0))
-                detail_btn.configure(text="▾ details")
-            else:
-                detail_txt.pack_forget()
-                detail_btn.configure(text="▸ details")
-        detail_btn.bind("<Button-1>", toggle_detail)
+        def set_pane(which, text):
+            (set_cmd if which == "cmd" else set_flow)(text)
 
         if disabled:
             reason.configure(text=("Reaches live suspect infrastructure — enable "
                                    "enable_live_suspect_hosts in a controlled lab to run it."),
                              fg=GUI_GOLD)
             reason.pack(anchor="w", fill="x", pady=(6, 0))
-            pill.configure(text="DISABLED", fg=GUI_GOLD)
-            pillbox.configure(highlightbackground=GUI_GOLD)
 
-        cards[t.id] = {"pill": pill, "pillbox": pillbox, "reason": reason, "kv": kv,
-                       "fire": fire_btn, "detail_btn": detail_btn, "detail": ""}
+        def toggle_expand(_e=None):
+            expand["open"] = not expand["open"]
+            caret.configure(text="▾" if expand["open"] else "▸")
+            if expand["open"]:
+                body_l2.pack(fill="x")
+            else:
+                body_l2.pack_forget()
+        for w in (head, caret):
+            w.bind("<Button-1>", toggle_expand)
+        # Clicking the label/status also toggles (they cover most of the row).
+        for child in head.winfo_children():
+            child.bind("<Button-1>", toggle_expand)
+
+        cards[t.id] = {"status": status, "reason": reason, "kv": kv, "fire": fire_btn,
+                       "set_pane": set_pane, "runs": 0}
 
     order, seen = [], set()
     for t in triggers:
@@ -1475,7 +1628,7 @@ def run_gui(settings, triggers, app, config_dir=None):
             seen.add(t.cls)
             order.append(t.cls)
     for cls in order:
-        tk.Label(inner, text=CLASS_LABEL.get(cls, cls), fg=GUI_HPE, bg=GUI_BG,
+        tk.Label(inner, text=CLASS_LABEL.get(cls, cls), fg=GUI_ACCENT, bg=GUI_BG,
                  font=(GUI_MONO, 9, "bold")).pack(anchor="w", padx=10, pady=(14, 2))
         for t in [x for x in triggers if x.cls == cls]:
             build_card(t)

@@ -9,12 +9,12 @@
 #   * iprep — the built-in IP-reputation probe (control probe + ratio).
 #
 # These reproduce EXACTLY what the corresponding tmNIDS test sends (3CORESec
-# testmynids.org), so the same EdgeConnect / ECOS Suricata v7 signatures trip — but
+# testmynids.org), so the same IDS/IPS signatures trip — but
 # nothing downloads or executes a third-party binary. `{devnull}` is substituted to the
 # OS null device at run time (Windows has no /dev/null).
 #
-# Local classification (see CONFIRMED.md §5): the EC / Orchestrator dashboard is
-# authoritative. Locally, a completed request (curl rc 0 / a DNS response / a TCP connect)
+# Local classification (see CONFIRMED.md §5): the inline security stack's management
+# console is authoritative. Locally, a completed request (curl rc 0 / a DNS response / a TCP connect)
 # means the trigger traffic was SENT and not dropped inline (IDS detect-only => allowed).
 # A drop (curl rc 28/7/56, or a probe timeout with the control egress probe still OK)
 # reads as an inline block (sent·blocked); if egress itself is down it reads as `error`,
@@ -232,9 +232,9 @@
   talking_point: "Base64 beacon body + a tell-tale user-agent — the shape of real command-and-control."
 
 # ---------------------------------------------------------------------------
-# EdgeConnect Secure Web Services (BrightCloud WebCC) + IP reputation.
+# Secure Web Gateway (web categorization / reputation) + IP reputation.
 #
-# WebCC denies by SILENTLY DROPPING the flow — there is NO block page. A deny is observed
+# The SWG denies by SILENTLY DROPPING the flow — there is NO block page. A deny is observed
 # as a connect timeout / reset (curl rc 28/7/56 -> blocked); a completed response (rc 0,
 # HTTP 2xx) is `allowed`. Environment failures (DNS/TLS: rc 6/35/60/…) are `error`, never
 # a false blocked. PREREQUISITE: the category/reputation must be set to Deny in policy for
@@ -246,11 +246,11 @@
   class: ns-webcc
   runner: curl
   commands:
-    - ["curl", "-sS", "-A", "WebCC-Demo", "-o", "{devnull}", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://www.bet365.com/"]
+    - ["curl", "-sS", "-A", "SecVitals-Demo", "-o", "{devnull}", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://www.bet365.com/"]
   flags: [needs_internet]
   severity: info
   threat_class: policy
-  expected_fire: "WebCC category Gambling · Deny → timeout (silent drop)"
+  expected_fire: "SWG category Gambling · Deny → timeout (silent drop)"
   talking_point: "Web-category filtering by hostname/SNI — no decryption needed."
 
 - id: web-cat-social
@@ -258,11 +258,11 @@
   class: ns-webcc
   runner: curl
   commands:
-    - ["curl", "-sS", "-A", "WebCC-Demo", "-o", "{devnull}", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://www.facebook.com/"]
+    - ["curl", "-sS", "-A", "SecVitals-Demo", "-o", "{devnull}", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://www.facebook.com/"]
   flags: [needs_internet]
   severity: info
   threat_class: policy
-  expected_fire: "WebCC category Social Networking · Deny → timeout"
+  expected_fire: "SWG category Social Networking · Deny → timeout"
   talking_point: "The everyday acceptable-use category."
 
 - id: web-cat-streaming
@@ -270,11 +270,11 @@
   class: ns-webcc
   runner: curl
   commands:
-    - ["curl", "-sS", "-A", "WebCC-Demo", "-o", "{devnull}", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://www.youtube.com/"]
+    - ["curl", "-sS", "-A", "SecVitals-Demo", "-o", "{devnull}", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://www.youtube.com/"]
   flags: [needs_internet]
   severity: info
   threat_class: policy
-  expected_fire: "WebCC category Streaming Media · Deny → timeout"
+  expected_fire: "SWG category Streaming Media · Deny → timeout"
   talking_point: "Bandwidth-heavy category, common policy target."
 
 - id: web-cat-proxy
@@ -282,11 +282,11 @@
   class: ns-webcc
   runner: curl
   commands:
-    - ["curl", "-sS", "-A", "WebCC-Demo", "-o", "{devnull}", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://www.hidemyass.com/"]
+    - ["curl", "-sS", "-A", "SecVitals-Demo", "-o", "{devnull}", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://www.hidemyass.com/"]
   flags: [needs_internet]
   severity: warn
   threat_class: policy
-  expected_fire: "WebCC category Proxy Avoidance / Anonymizer · Deny → timeout"
+  expected_fire: "SWG category Proxy Avoidance / Anonymizer · Deny → timeout"
   talking_point: "Category + reputation overlap — anonymizers dodge policy."
 
 - id: web-cat-p2p
@@ -294,11 +294,11 @@
   class: ns-webcc
   runner: curl
   commands:
-    - ["curl", "-sS", "-A", "WebCC-Demo", "-o", "{devnull}", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://thepiratebay.org/"]
+    - ["curl", "-sS", "-A", "SecVitals-Demo", "-o", "{devnull}", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://thepiratebay.org/"]
   flags: [needs_internet, hits_live_suspect_hosts]
   severity: warn
   threat_class: policy
-  expected_fire: "WebCC category Peer-to-Peer / Torrent · Deny → timeout"
+  expected_fire: "SWG category Peer-to-Peer / Torrent · Deny → timeout"
   talking_point: "Live piracy site — flagged; enable only in a lab."
 
 - id: web-cat-crypto
@@ -306,11 +306,11 @@
   class: ns-webcc
   runner: curl
   commands:
-    - ["curl", "-sS", "-A", "WebCC-Demo", "-o", "{devnull}", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://www.coinbase.com/"]
+    - ["curl", "-sS", "-A", "SecVitals-Demo", "-o", "{devnull}", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://www.coinbase.com/"]
   flags: [needs_internet]
   severity: info
   threat_class: policy
-  expected_fire: "WebCC category Cryptocurrency · Deny → timeout"
+  expected_fire: "SWG category Cryptocurrency · Deny → timeout"
   talking_point: "Finance/crypto category exemplar."
 
 - id: web-rep-eicar
@@ -318,7 +318,7 @@
   class: ns-webcc
   runner: curl
   commands:
-    - ["curl", "-sS", "-A", "WebCC-Demo", "-o", "{devnull}", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://secure.eicar.org/eicar.com.txt"]
+    - ["curl", "-sS", "-A", "SecVitals-Demo", "-o", "{devnull}", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://secure.eicar.org/eicar.com.txt"]
   flags: [needs_internet]
   severity: crit
   threat_class: malware
@@ -330,7 +330,7 @@
   class: ns-webcc
   runner: curl
   commands:
-    - ["curl", "-sS", "-A", "WebCC-Demo", "-o", "{devnull}", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://testsafebrowsing.appspot.com/s/malware.html"]
+    - ["curl", "-sS", "-A", "SecVitals-Demo", "-o", "{devnull}", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://testsafebrowsing.appspot.com/s/malware.html"]
   flags: [needs_internet]
   severity: crit
   threat_class: malware
@@ -342,7 +342,7 @@
   class: ns-webcc
   runner: curl
   commands:
-    - ["curl", "-sS", "-A", "WebCC-Demo", "-o", "{devnull}", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://testsafebrowsing.appspot.com/s/phishing.html"]
+    - ["curl", "-sS", "-A", "SecVitals-Demo", "-o", "{devnull}", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://testsafebrowsing.appspot.com/s/phishing.html"]
   flags: [needs_internet]
   severity: crit
   threat_class: malware
@@ -354,7 +354,7 @@
   class: ns-webcc
   runner: curl
   commands:
-    - ["curl", "-sS", "-A", "WebCC-Demo", "-o", "{devnull}", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://testsafebrowsing.appspot.com/s/unwanted.html"]
+    - ["curl", "-sS", "-A", "SecVitals-Demo", "-o", "{devnull}", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://testsafebrowsing.appspot.com/s/unwanted.html"]
   flags: [needs_internet]
   severity: warn
   threat_class: policy
@@ -370,5 +370,5 @@
   flags: [needs_internet, hits_live_suspect_hosts]
   severity: warn
   threat_class: policy
-  expected_fire: "BrightCloud IP-rep 'Tor Proxy' · Deny → timeouts (reported as a ratio)"
+  expected_fire: "IP reputation 'Tor Proxy' · Deny → timeouts (reported as a ratio)"
   talking_point: "Control probe first: if egress is down the whole test is INVALID; otherwise report N-of-M blocked, never a single verdict. Live Tor nodes — flagged."

@@ -42,7 +42,7 @@ import time
 import urllib.error
 import urllib.request
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 APP_NAME = "Security Vitals"
 
 log = logging.getLogger("secvitals")
@@ -1560,7 +1560,9 @@ def run_gui(settings, triggers, app, config_dir=None):
         status.pack(side="right")
 
         # ---- L2: context + action, hidden until the row is expanded -------
-        body_l2 = tk.Frame(card, bg=GUI_SURFACE, padx=12, pady=(0, 10))
+        # NB: a widget's own -pady is a single distance; the (top, bottom) tuple form is
+        # only valid on .pack() (see toggle_expand), never in the constructor.
+        body_l2 = tk.Frame(card, bg=GUI_SURFACE, padx=12)
 
         chips = tk.Frame(body_l2, bg=GUI_SURFACE)
         chips.pack(fill="x", pady=(2, 0))
@@ -1610,7 +1612,7 @@ def run_gui(settings, triggers, app, config_dir=None):
             expand["open"] = not expand["open"]
             caret.configure(text="▾" if expand["open"] else "▸")
             if expand["open"]:
-                body_l2.pack(fill="x")
+                body_l2.pack(fill="x", pady=(0, 10))
             else:
                 body_l2.pack_forget()
         for w in (head, caret):

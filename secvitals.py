@@ -42,7 +42,7 @@ import time
 import urllib.error
 import urllib.request
 
-__version__ = "0.1.2"
+__version__ = "0.6.0"
 APP_NAME = "Security Vitals"
 
 log = logging.getLogger("secvitals")
@@ -387,7 +387,62 @@ class Settings:
 
     @property
     def control_enabled(self):
-        return bool(self.control_host)
+        return bool(self.control_endpoints)
+
+    @property
+    def origin_failover(self):
+        """Fixed map of origin host -> alternate host, applied ONLY when a request
+        honestly ERRORS (DNS/TLS failure), never past a blocked or allowed result.
+
+        EMPTY BY DEFAULT. It preserves signal count when an origin is down, but it also
+        changes what is on the wire: an alternate that does not serve the same content
+        can turn a real signal into a benign request that never trips anything. Enable it
+        only with an alternate you control and have checked."""
+        raw = _dget(self.raw, "run.origin_failover", None)
+        out = {}
+        if isinstance(raw, dict):
+            for key, value in raw.items():
+                if (isinstance(key, str) and isinstance(value, str)
+                        and key.strip() and value.strip()):
+                    out[key.strip()] = value.strip()
+        return out
+
+    @property
+    def control_endpoints(self):
+        """Ordered control endpoints as (kind, host, port).
+
+        A SINGLE control host is a single point of failure for the whole blocked-vs-error
+        decision: if the customer's policy happens to deny 1.1.1.1, every native probe
+        drop degrades to `error` and real blocks are masked. Egress is considered up if
+        ANY endpoint answers.
+
+        `kind` is "tcp" or "dns" so the control can be transport-matched — a network that
+        permits DNS while denying outbound TCP/443 would otherwise produce a false
+        `error` for DNS triggers."""
+        raw = _dget(self.raw, "run.control_endpoints", None)
+        out = []
+        if isinstance(raw, list) and raw:
+            for entry in raw:
+                if not isinstance(entry, dict):
+                    continue
+                host = str(entry.get("host", "") or "").strip()
+                if not host:
+                    continue
+                kind = str(entry.get("kind", "tcp") or "tcp").strip().lower()
+                if kind not in ("tcp", "dns"):
+                    kind = "tcp"
+                try:
+                    port = int(entry.get("port", 53 if kind == "dns" else 443))
+                except (TypeError, ValueError):
+                    continue
+                if 1 <= port <= 65535:
+                    out.append((kind, host, port))
+        if out:
+            return out
+        # Fall back to the historical single endpoint so existing installs behave the same.
+        if self.control_host:
+            return [("tcp", self.control_host, self.control_port)]
+        return []
 
     @property
     def min_run_interval(self):
@@ -687,6 +742,7 @@ class SubResult:
     error_reason: str = None   # environment failure for THIS request (→ error)
     timed_out: bool = False
     flow: dict = None          # 5-tuple actually put on the wire (see _flow)
+    failover_from: str = ""    # original origin, when an ERROR triggered a failover
 
 
 @dataclasses.dataclass
@@ -694,6 +750,7 @@ class RunResult:
     subs: list = dataclasses.field(default_factory=list)
     duration_s: float = 0.0
     control_ok: bool = None    # egress control probe (dns/tcp only); None = not run
+    control_detail: str = ""   # which endpoint answered, for the details pane
     error_reason: str = None   # trigger-level error (e.g. param error) → error
 
 
@@ -759,6 +816,24 @@ def _url_endpoint(argv):
                 host, _, port = authority.partition(":")
             return host, (port or ("443" if scheme == "https" else "80"))
     return "", ""
+
+
+def _swap_url_host(argv, old_host, new_host):
+    """Rewrite ONLY the host of http(s) URLs in a fixed command. Every other token —
+    headers, user-agents, payload bodies — is untouched, so the signal itself is
+    unchanged; only where it is sent differs."""
+    out = []
+    for tok in argv:
+        if isinstance(tok, str) and tok.startswith(("http://", "https://")):
+            scheme, _, rest = tok.partition("://")
+            authority, slash, tail = rest.partition("/")
+            userinfo, at, hostport = authority.rpartition("@")
+            host, colon, port = hostport.partition(":")
+            if host == old_host:
+                hostport = new_host + colon + port
+                tok = scheme + "://" + userinfo + at + hostport + slash + tail
+        out.append(tok)
+    return out
 
 
 def _curl_flow_argv(argv):
@@ -860,7 +935,7 @@ def run_trigger(trigger, params, settings):
             subs.append(SubResult(argv=list(template), error_reason=f"invalid parameters: {e}"))
             continue
         if trigger.runner == "curl":
-            subs.append(_run_curl(argv, trigger.timeout))
+            subs.append(_run_curl_with_failover(argv, trigger.timeout, settings))
         elif trigger.runner == "dns":
             s = _run_dns(argv, trigger.timeout)
             subs.append(s)
@@ -878,9 +953,32 @@ def run_trigger(trigger, params, settings):
     # broken environment is `error`, never a false `blocked`. curl doesn't need this: its
     # own exit code already separates a drop (7/28/56) from an environment failure (60/…).
     if need_control and settings.control_enabled:
-        res.control_ok = _tcp_probe(settings.control_host, settings.control_port,
-                                    min(6.0, trigger.timeout))
+        res.control_ok, res.control_detail = probe_control(
+            settings, min(6.0, trigger.timeout),
+            prefer_kind=("dns" if trigger.runner == "dns" else "tcp"))
     return res
+
+
+def _run_curl_with_failover(argv, timeout, settings):
+    """Run a curl command; on an ENVIRONMENT error only, retry once against a configured
+    alternate origin.
+
+    Never applied past a blocked or allowed result: a policy outcome is the answer, and
+    retrying it elsewhere would launder it. The retry is kept only if it produced a real
+    policy result — otherwise the original honest error stands."""
+    sub = _run_curl(argv, timeout)
+    if classify_curl(sub.rc, sub.http_code) != ERROR or sub.rc not in BROKEN_RC:
+        return sub
+    host, _port = _url_endpoint(argv)
+    alternate = settings.origin_failover.get(host) if host else None
+    if not alternate:
+        return sub
+    retry = _run_curl(_swap_url_host(argv, host, alternate), timeout)
+    if classify_curl(retry.rc, retry.http_code) == ERROR:
+        return sub                      # the failover did not help — keep the truth
+    retry.failover_from = host
+    log.info("origin failover: %s -> %s", host, alternate)
+    return retry
 
 
 def _run_curl(argv, timeout):
@@ -1015,6 +1113,33 @@ def _tcp_probe(host, port, timeout):
     return _tcp_probe_flow(host, port, timeout)[0]
 
 
+def probe_control(settings, timeout=6.0, prefer_kind=None):
+    """Is general egress working? Returns (ok, detail).
+
+    Tries every configured control endpoint and succeeds if ANY answers, so one filtered
+    control host can no longer mask real inline blocks. Endpoints matching `prefer_kind`
+    are tried first: a DNS trigger should be disambiguated by a DNS control where one
+    exists, because a network that permits DNS while denying TCP/443 would otherwise
+    report a false `error`."""
+    endpoints = settings.control_endpoints
+    if not endpoints:
+        return None, "no control endpoint configured"
+    if prefer_kind:
+        endpoints = ([e for e in endpoints if e[0] == prefer_kind]
+                     + [e for e in endpoints if e[0] != prefer_kind])
+    tried = []
+    for kind, host, port in endpoints:
+        if kind == "dns":
+            ok, _detail, err, _flow = _dns_query("example.com", host, min(timeout, 5.0))
+            ok = bool(ok) and not err
+        else:
+            ok = _tcp_probe(host, port, min(timeout, 6.0))
+        tried.append(f"{kind}:{host}:{port}={'ok' if ok else 'fail'}")
+        if ok:
+            return True, "egress confirmed via " + tried[-1]
+    return False, "all control endpoints failed (" + ", ".join(tried) + ")"
+
+
 def _dec(b):
     if b is None:
         return ""
@@ -1138,6 +1263,119 @@ def classify(trigger, result):
 
 
 # ===========================================================================
+# Catalog provenance  —  prove the traffic matches the reviewed catalog
+# ===========================================================================
+# The update channel authenticates secvitals.py, but NOT the catalog — and the catalog is
+# what decides where traffic goes. Anyone able to write the config directory could point
+# a trigger somewhere else while every other guardrail (argv-only, no shell, validated
+# params) still held. Signing it closes that gap.
+#
+# Fail-VISIBLE, not fail-closed, by default: existing installs have no signature and must
+# keep working, so an unsigned catalog is reported honestly rather than refused. Use
+# --strict-catalog (or strict_catalog in settings) to refuse anything not verified.
+CATALOG_VERIFIED, CATALOG_UNSIGNED, CATALOG_MODIFIED = "verified", "unsigned", "modified"
+
+
+def catalog_signature_status(config_dir, pubkey=UPDATE_PUBKEY):
+    """(status, detail) for config/catalog.yaml against config/catalog.yaml.sig.
+
+    Uses the same RSA-2048/SHA-256 verifier as the update channel, so there is one
+    signature implementation to trust rather than two."""
+    catalog = os.path.join(config_dir or DEFAULT_CONFIG_DIR, "catalog.yaml")
+    sig_path = catalog + ".sig"
+    try:
+        with open(catalog, "rb") as fh:
+            payload = fh.read()
+    except OSError as e:
+        return CATALOG_MODIFIED, f"catalog could not be read: {e}"
+    if not os.path.exists(sig_path):
+        return CATALOG_UNSIGNED, ("no catalog.yaml.sig alongside the catalog — its "
+                                  "contents are not authenticated")
+    try:
+        with open(sig_path, "rb") as fh:
+            signature = fh.read()
+    except OSError as e:
+        return CATALOG_MODIFIED, f"catalog signature could not be read: {e}"
+    if not pubkey or "BEGIN" not in pubkey:
+        return CATALOG_MODIFIED, "no verification key is configured"
+    if verify_rsa_sha256(pubkey, payload, signature):
+        return CATALOG_VERIFIED, ("catalog signature verified — the fired traffic matches "
+                                  "the reviewed catalog")
+    return CATALOG_MODIFIED, ("catalog signature did NOT verify — this catalog is not the "
+                              "one that was signed")
+
+
+# ===========================================================================
+# Environment readiness  —  a pre-flight gate, NOT a policy predictor
+# ===========================================================================
+# This answers exactly one question: "can this console run its triggers from here?"
+# It deliberately does NOT try to predict whether any given trigger will be blocked.
+# Confusing readiness with policy would put a guess on stage next to real results, so
+# every message below stays inside the readiness framing.
+_CURL_CHECK = {"present": None, "version": ""}
+_CURL_LOCK = threading.Lock()
+
+
+def curl_present(_runner=None):
+    """Is a usable curl on PATH? Cached — the binary does not appear mid-demo."""
+    with _CURL_LOCK:
+        if _CURL_CHECK["present"] is not None:
+            return _CURL_CHECK["present"], _CURL_CHECK["version"]
+    run = _runner or (lambda: subprocess.run(["curl", "--version"], capture_output=True,
+                                             timeout=10, check=False))
+    present, version = False, ""
+    try:
+        proc = run()
+        present = proc.returncode == 0
+        version = _first_line(_dec(proc.stdout))
+    except (OSError, subprocess.SubprocessError) as e:
+        present, version = False, str(e)
+    with _CURL_LOCK:
+        _CURL_CHECK["present"], _CURL_CHECK["version"] = present, version
+    return present, version
+
+
+def reset_environment_cache():
+    with _CURL_LOCK:
+        _CURL_CHECK["present"], _CURL_CHECK["version"] = None, ""
+
+
+def environment_report(settings, triggers=None):
+    """Readiness facts, plus a plain-language verdict. Never a policy prediction."""
+    present, version = curl_present()
+    control_ok, control_detail = probe_control(settings, 6.0)
+    checks = [
+        {"name": "curl", "ok": present,
+         "detail": (version if present else
+                    "curl was not found on PATH — HTTP triggers cannot run "
+                    "(Windows 10 1803+ ships curl.exe)")},
+        {"name": "egress control", "ok": bool(control_ok), "detail": control_detail},
+    ]
+    if triggers is not None:
+        needs_curl = sum(1 for t in triggers if t.runner == "curl")
+        checks.append({"name": "catalog", "ok": True,
+                       "detail": f"{len(triggers)} triggers loaded, {needs_curl} need curl"})
+    ready = all(c["ok"] for c in checks)
+    return {
+        "ready": ready,
+        "checks": checks,
+        "verdict": ("Ready: the console can run its triggers from here."
+                    if ready else
+                    "Not ready: fix the failing check(s) below before the demo."),
+        "note": ("This is a readiness check only. It says nothing about whether any "
+                 "trigger will be allowed or blocked — that is what firing them is for."),
+    }
+
+
+def format_environment_report(report):
+    out = ["PRE-FLIGHT — can this console run its triggers from here?", ""]
+    for check in report["checks"]:
+        out.append(f"  [{'ok  ' if check['ok'] else 'FAIL'}] {check['name']:<16} {check['detail']}")
+    out += ["", report["verdict"], "", report["note"]]
+    return "\n".join(out)
+
+
+# ===========================================================================
 # Application state
 # ===========================================================================
 class App:
@@ -1159,6 +1397,17 @@ class App:
                 "state": INVALID,
                 "reason": ("this trigger reaches live suspect infrastructure and is disabled "
                            "(enable_live_suspect_hosts is false)"),
+                "expected_fire": trigger.expected_fire,
+            }
+        # A missing curl is an environment fact, and the same one for every HTTP trigger.
+        # Reporting it as INVALID with a fix beats a wall of identical `error` cards that
+        # a presenter has to decode mid-demo.
+        if trigger.runner == "curl" and not curl_present()[0]:
+            return trigger, {
+                "state": INVALID,
+                "reason": ("curl was not found on PATH, so this trigger cannot run. "
+                           "Windows 10 1803+ ships curl.exe; install or repair it. "
+                           "This is not a policy result."),
                 "expected_fire": trigger.expected_fire,
             }
         if not self._run_lock.acquire(blocking=False):
@@ -1205,10 +1454,11 @@ class App:
         if not s.control_enabled:
             return {"state": ERROR, "expected_fire": trigger.expected_fire,
                     "reason": "IP reputation needs a control probe — set run.control_host"}
-        if not _tcp_probe(s.control_host, s.control_port, 6.0):
+        control_ok, control_detail = probe_control(s, 6.0)
+        if not control_ok:
             return {"state": INVALID, "expected_fire": trigger.expected_fire,
-                    "reason": (f"control probe to {s.control_host}:{s.control_port} failed — "
-                               "egress is broken, so the whole test is invalid (not blocked)")}
+                    "reason": (f"control probe failed ({control_detail}) — egress is "
+                               "broken, so the whole test is invalid (not blocked)")}
         try:
             nodes = self.tor_cache.get()
         except (urllib.error.URLError, OSError, ValueError) as e:
@@ -1276,6 +1526,9 @@ def _format_subs(subs):
             meta.append("timed-out")
         if s.error_reason:
             meta.append(f"error: {s.error_reason}")
+        if s.failover_from:
+            meta.append(f"ORIGIN FAILOVER from {s.failover_from} — verify the alternate "
+                        "serves the same content")
         if meta:
             head += "\n      " + "   ".join(meta)
         probe = _first_line(s.stdout) if s.ok is not None else ""
@@ -2494,6 +2747,13 @@ def parse_args(argv):
                         "non-zero only for error/invalid or a usage problem")
     p.add_argument("--format", choices=("text", "json"), default="text",
                    help="output format for --list / --dry-run / --run (default: text)")
+    p.add_argument("--preflight", action="store_true",
+                   help="check that this console can run its triggers from here (curl, "
+                        "egress control), then exit. A readiness gate — NOT a prediction "
+                        "of what policy will allow or block")
+    p.add_argument("--strict-catalog", action="store_true",
+                   help="refuse to start unless config/catalog.yaml carries a valid "
+                        "signature (default: report the status and continue)")
     p.add_argument("--version", action="version", version=f"{APP_NAME} {__version__}")
     return p.parse_args(argv)
 
@@ -2513,6 +2773,18 @@ def main(argv=None):
         log.error("configuration error: %s", e)
         return 2
 
+    # Catalog provenance: report it always, refuse only when asked to.
+    cat_status, cat_detail = catalog_signature_status(args.config_dir)
+    strict = args.strict_catalog or bool(_dget(settings.raw, "run.strict_catalog", False))
+    if cat_status == CATALOG_VERIFIED:
+        log.info("catalog: %s", cat_detail)
+    else:
+        log.warning("catalog %s: %s", cat_status, cat_detail)
+    if strict and cat_status != CATALOG_VERIFIED:
+        log.error("refusing to start: --strict-catalog is set and the catalog is %s",
+                  cat_status)
+        return 2
+
     # Preview / headless paths: no window, and --list/--dry-run send nothing at all.
     if args.list_triggers or args.dry_run:
         manifest = signal_manifest(triggers, settings)
@@ -2521,6 +2793,16 @@ def main(argv=None):
         else:
             print(format_signal_manifest(manifest, verbose=bool(args.dry_run)))
         return 0
+
+    if args.preflight:
+        report = environment_report(settings, triggers)
+        report["catalog"] = {"status": cat_status, "detail": cat_detail}
+        if args.format == "json":
+            print(json.dumps(report, indent=2))
+        else:
+            print(format_environment_report(report))
+            print(f"\n  catalog: {cat_status} — {cat_detail}")
+        return 0 if report["ready"] else 1
 
     app = App(settings, triggers, args.config_dir)
     planned = sum(t.on_wire_count(settings) for t in triggers if not t.gated_disabled(settings))

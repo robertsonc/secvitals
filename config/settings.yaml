@@ -28,8 +28,29 @@ webcc:
   # are reported as a ratio ("4 of 6 blocked"), never a single verdict.
   tor_list_url: "https://raw.githubusercontent.com/SecOps-Institute/Tor-IP-Addresses/master/tor-nodes.lst"
   tor_list_ttl_s: 3600
-  ip_rep_sample: 6                # probe the first N well-formed relay IPs
+  ip_rep_sample: 6                # probe the first N well-formed addresses per feed
   node_probe_timeout_s: 5
+
+  # Additional IP-reputation feeds. A catalog trigger names one with a FIXED token
+  # (["iprep", "<name>"]) — never a URL — so a trigger can only ever reach a destination
+  # an operator put here. Feeds must be https and are parsed strictly: a line must be
+  # exactly an IPv4 address, so comment headers and CIDR ranges are skipped rather than
+  # guessed at. Every feed-backed trigger is gated (hits_live_suspect_hosts): these are
+  # real suspect addresses.
+  # `tor` is always available from tor_list_url above and does not need an entry here.
+  reputation_feeds:
+    botnet-c2:
+      label: "Botnet C2 (Feodo Tracker)"
+      url: "https://feodotracker.abuse.ch/downloads/ipblocklist.txt"
+      port: 443
+    scanner:
+      label: "SSH brute-force sources (blocklist.de)"
+      url: "https://lists.blocklist.de/lists/ssh.txt"
+      port: 22
+    spammer:
+      label: "Mail-abuse sources (blocklist.de)"
+      url: "https://lists.blocklist.de/lists/mail.txt"
+      port: 25
 
 update:
   # Pinned, non-overridable release source. The updater fails CLOSED without a valid

@@ -13,11 +13,13 @@ fires the traffic and honestly reports what it observed locally.
 ```
 
 This build covers **north–south** functions: IDS/IPS, web categorization / reputation,
-IP reputation, and DLP / content inspection. East–west is deferred.
+IP reputation (Tor, botnet-C2, scanner and spammer feeds), DNS security, and DLP /
+content inspection — with IPv6 and HTTP/3 parity twins to expose transport blind spots.
+East–west is deferred.
 
 **The known quantity.** The catalog is fixed, so the number of signals a run puts on the
-wire is exact and repeatable: **55 signals across 35 triggers** by default, or **71
-across 41** once the live-suspect gate is on. Ask for it before you fire — `--list` for
+wire is exact and repeatable: **66 signals across 41 triggers** by default, or **100
+across 50** once the live-suspect gate is on. Ask for it before you fire — `--list` for
 the summary, `--dry-run` for every command that would be sent (both send nothing), or the
 **Signal manifest** button in the window.
 
@@ -96,6 +98,16 @@ stack's console. Flip the security policy to inline/IPS and run the same trigger
   per-trigger allowlist / pattern before substitution.
 - **`config/settings.yaml`** — endpoints and toggles (the control-egress probe, the
   live-suspect-hosts gate, the Tor-list source for IP reputation, and the update source).
+
+### Protocol parity, honestly
+
+`ns-uid-v6`, `web-cat-social-v6` and `web-cat-social-h3` re-send existing payloads over
+IPv6 and HTTP/3 to expose a control that inspects IPv4/TCP and ignores the rest. Because
+`curl -6` exits 7 on a host with no IPv6 route — which would otherwise read as
+`blocked` — these triggers declare `requires: [ipv6]` / `[http3]`, and the transport is
+checked **before anything is sent**. If this host can't use the transport, the result is
+`error` with a plain reason, and nothing goes on the wire. It is never reported as a
+block. See [docs/milestones/M3-coverage-breadth.md](docs/milestones/M3-coverage-breadth.md).
 
 ### Live suspect-infrastructure gate
 

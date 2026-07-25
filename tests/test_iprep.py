@@ -15,9 +15,13 @@ class FakeTor:
         return self.ips
 
 
+FEED_URL = "https://example.invalid/tor.txt"
+
+
 def mk_app(control_host="1.1.1.1", sample=3):
     settings = sv.Settings(raw={"run": {"control_host": control_host, "control_port": 443},
-                                "webcc": {"ip_rep_sample": sample, "node_probe_timeout_s": 1}})
+                                "webcc": {"ip_rep_sample": sample, "node_probe_timeout_s": 1,
+                                          "tor_list_url": FEED_URL}})
     trig = sv.Trigger.from_dict({"id": "ip-rep-tor", "label": "tor", "class": "ns-iprep",
                                  "runner": "iprep", "argv": ["iprep"],
                                  "flags": ["needs_internet"]}, 30.0)
@@ -52,7 +56,7 @@ class TestIprep(unittest.TestCase):
 
     def test_ratio(self):
         app, trig = mk_app(sample=4)
-        app.tor_cache = FakeTor(["10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"])
+        app.feed_cache = lambda feed: FakeTor(["10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"])
         seq = {"n": 0}
 
         def fake(host, port, timeout):
@@ -73,14 +77,14 @@ class TestIprep(unittest.TestCase):
         class BadTor:
             def get(self):
                 raise OSError("no network")
-        app.tor_cache = BadTor()
+        app.feed_cache = lambda feed: BadTor()
         sv._tcp_probe = lambda h, p, t: True   # control OK
         out = app._run_iprep(trig)
         self.assertEqual(out["state"], sv.ERROR)
 
     def test_empty_node_list_is_error(self):
         app, trig = mk_app()
-        app.tor_cache = FakeTor([])
+        app.feed_cache = lambda feed: FakeTor([])
         sv._tcp_probe = lambda h, p, t: True
         out = app._run_iprep(trig)
         self.assertEqual(out["state"], sv.ERROR)
@@ -88,7 +92,8 @@ class TestIprep(unittest.TestCase):
     def test_iprep_gated_by_default_via_app_run(self):
         # ip-rep-tor carries hits_live_suspect_hosts; with the gate off it must not run.
         settings = sv.Settings(raw={"enable_live_suspect_hosts": False,
-                                    "run": {"control_host": "1.1.1.1"}})
+                                    "run": {"control_host": "1.1.1.1"},
+                                    "webcc": {"tor_list_url": FEED_URL}})
         trig = sv.Trigger.from_dict({"id": "ip-rep-tor", "label": "tor", "class": "ns-iprep",
                                      "runner": "iprep", "argv": ["iprep"],
                                      "flags": ["needs_internet", "hits_live_suspect_hosts"]}, 30.0)

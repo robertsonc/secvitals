@@ -536,6 +536,148 @@
   threat_class: policy
   expected_fire: "IP reputation 'Tor Proxy' · Deny → timeouts (reported as a ratio)"
   talking_point: "Control probe first: if egress is down the whole test is INVALID; otherwise report N-of-M blocked, never a single verdict. Live Tor nodes — flagged."
+
+- id: ip-rep-botnet
+  label: "IP Reputation — botnet C2 (Feodo Tracker)"
+  class: ns-iprep
+  runner: iprep
+  commands:
+    - ["iprep", "botnet-c2"]
+  flags: [needs_internet, hits_live_suspect_hosts]
+  severity: crit
+  threat_class: c2
+  expected_fire: "IP reputation 'Botnet C2 / Malware' · Deny → timeouts (reported as a ratio)"
+  talking_point: "Known live C2 infrastructure from an abuse.ch feed — the category a customer most wants blocked outbound. A ratio, never a verdict: a node may simply be offline."
+
+- id: ip-rep-scanner
+  label: "IP Reputation — SSH brute-force sources (:22)"
+  class: ns-iprep
+  runner: iprep
+  commands:
+    - ["iprep", "scanner"]
+  flags: [needs_internet, hits_live_suspect_hosts]
+  severity: warn
+  threat_class: recon
+  expected_fire: "IP reputation 'Scanner / brute-force' · Deny → timeouts (reported as a ratio)"
+  talking_point: "Outbound to hosts that scan the internet — reputation catches the destination regardless of the port or payload."
+
+- id: ip-rep-spammer
+  label: "IP Reputation — mail-abuse sources (:25)"
+  class: ns-iprep
+  runner: iprep
+  commands:
+    - ["iprep", "spammer"]
+  flags: [needs_internet, hits_live_suspect_hosts]
+  severity: warn
+  threat_class: policy
+  expected_fire: "IP reputation 'Spam source' · Deny → timeouts (reported as a ratio)"
+  talking_point: "Outbound SMTP to known spam sources — the shape of a compromised host relaying mail."
+
+# ---------------------------------------------------------------------------
+# DNS security — DGA, tunnelling, and DNS-over-HTTPS.
+#
+# DNS is where a lot of C2 and policy signal lives, and it is cheap to inspect. These use
+# the built-in stdlib DNS probe (no resolver library), and an NXDOMAIN counts as a
+# successful send: the QUESTION crossing the wire is what a DNS signature inspects, so
+# whether the name resolves is beside the point.
+# ---------------------------------------------------------------------------
+
+- id: ns-dns-dga
+  label: "DGA-style domains (algorithmically generated)"
+  class: ns-ids
+  runner: dns
+  commands:
+    - ["dns", "kqxwjvbnmzptrhgd.com", "@8.8.8.8"]
+    - ["dns", "xzmqvlbtrwnkhdfp.net", "@8.8.8.8"]
+    - ["dns", "vbnmqwertzuiopas.biz", "@8.8.8.8"]
+  flags: [needs_internet]
+  severity: warn
+  threat_class: c2
+  expected_fire: "ET DNS / DGA heuristics — high-entropy algorithmically generated domain lookups"
+  talking_point: "Malware that can't hard-code a C2 address generates thousands of names a day and tries them all. The randomness itself is the signal."
+  console_hint: "DNS or threat log — filter by the query names below; expect a DGA or suspicious-domain classification."
+
+- id: ns-dns-tunnel
+  label: "DNS tunnelling (long TXT-style labels)"
+  class: ns-ids
+  runner: dns
+  commands:
+    - ["dns", "aGVsbG8td29ybGQtdGhpcy1pcy1hLXR1bm5lbC10ZXN0LXBheWxvYWQ.t.example.com", "@8.8.8.8", "type=TXT"]
+    - ["dns", "c2Vjdml0YWxzLWRucy10dW5uZWwtdGVzdC1zZWdtZW50LXR3bw.t.example.com", "@8.8.8.8", "type=TXT"]
+    - ["dns", "dGhpcmQtc2VnbWVudC1vZi10aGUtc3ludGhldGljLXR1bm5lbA.t.example.com", "@8.8.8.8", "type=NULL"]
+  flags: [needs_internet]
+  severity: crit
+  threat_class: c2
+  expected_fire: "ET DNS — DNS tunnelling / exfiltration (long base32-style labels, TXT and NULL queries)"
+  talking_point: "Data smuggled inside the query name itself. The giveaway is the shape: long high-entropy labels and TXT/NULL record types, under one parent domain."
+  console_hint: "DNS or threat log — filter by the parent domain t.example.com; expect a DNS-tunnelling detection."
+
+- id: ns-doh
+  label: "DNS-over-HTTPS (resolver bypass)"
+  class: ns-ids
+  runner: curl
+  commands:
+    - ["curl", "-s", "-S", "-o", "{devnull}", "-w", "%{http_code}|", "--connect-timeout", "6", "--max-time", "10", "-H", "accept: application/dns-json", "https://cloudflare-dns.com/dns-query?name=example.com&type=A"]
+    - ["curl", "-s", "-S", "-o", "{devnull}", "-w", "%{http_code}|", "--connect-timeout", "6", "--max-time", "10", "-H", "accept: application/dns-json", "https://dns.google/resolve?name=example.com&type=A"]
+  flags: [needs_internet]
+  severity: warn
+  threat_class: policy
+  expected_fire: "ET POLICY — DNS over HTTPS (DoH) resolver usage"
+  talking_point: "DoH hides DNS inside ordinary HTTPS, taking every DNS control out of the path. Most policies want it denied so resolution stays visible."
+  console_hint: "Web filtering log — expect the DoH provider category, or an application-control hit for DNS-over-HTTPS."
+
+# ---------------------------------------------------------------------------
+# Protocol-parity twins — IPv6 and HTTP/3 (QUIC).
+#
+# These exist to find a BLIND SPOT: a control that inspects IPv4/TCP-443 but quietly
+# ignores IPv6 or QUIC. They also introduce a specific way to lie, so they are handled
+# carefully. `requires:` declares the transport each one needs; if this host has no IPv6
+# route, or curl was built without HTTP/3, the trigger reports `error` with a plain
+# reason and is NEVER reported as blocked — the app refuses to credit the customer's
+# stack with a drop it never made. See unmet_requirement() in secvitals.py.
+# ---------------------------------------------------------------------------
+
+- id: ns-uid-v6
+  label: "Linux UID over IPv6 (address-family parity)"
+  class: ns-ids
+  runner: curl
+  requires: [ipv6]
+  commands:
+    - ["curl", "-6", "-s", "-S", "-o", "{devnull}", "-w", "%{http_code}|", "--connect-timeout", "6", "--max-time", "10", "http://testmynids.org/uid/index.html"]
+  flags: [needs_internet, needs_et_ruleset]
+  severity: warn
+  threat_class: recon
+  expected_fire: "SID 2100498 over IPv6 — the same signature must fire on the v6 path"
+  talking_point: "The identical payload, over IPv6. If it alerts on v4 and not v6, the inspection policy has an address-family blind spot."
+  console_hint: "IDS/IPS alert log — filter by the IPv6 5-tuple below; expect the SAME SID as the IPv4 trigger."
+
+- id: web-cat-social-v6
+  label: "Social Networking over IPv6 (SWG parity)"
+  class: ns-webcc
+  runner: curl
+  requires: [ipv6]
+  commands:
+    - ["curl", "-6", "-sS", "-A", "SecVitals-Demo", "-o", "{devnull}", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://www.facebook.com/"]
+  flags: [needs_internet]
+  severity: info
+  threat_class: policy
+  expected_fire: "SWG category Social Networking over IPv6 · Deny → timeout"
+  talking_point: "Category filtering has to work the same over IPv6. Plenty of deployments discover here that it doesn't."
+  console_hint: "Web filtering log — filter by the IPv6 destination; expect the same category and action as the IPv4 request."
+
+- id: web-cat-social-h3
+  label: "Social Networking over HTTP/3 (QUIC parity)"
+  class: ns-webcc
+  runner: curl
+  requires: [http3]
+  commands:
+    - ["curl", "--http3", "-sS", "-A", "SecVitals-Demo", "-o", "{devnull}", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://www.facebook.com/"]
+  flags: [needs_internet]
+  severity: warn
+  threat_class: policy
+  expected_fire: "SWG category Social Networking over HTTP/3 · Deny → timeout"
+  talking_point: "QUIC is UDP/443, not TCP. A gateway that only inspects TCP sees nothing here — which is exactly why browsers reaching QUIC first is a policy problem worth showing."
+  console_hint: "Web filtering log — look for a UDP/443 flow. No entry at all is itself the finding."
   console_hint: "IP reputation / threat-intel hits — filter by the destination IPs below; the appliance's own reputation counters are authoritative, not our ratio."
 
 # ---------------------------------------------------------------------------

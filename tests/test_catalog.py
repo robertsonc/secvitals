@@ -28,22 +28,23 @@ class TestLoad(unittest.TestCase):
         for t in triggers:
             by_class.setdefault(t.cls, []).append(t)
 
-        # North-south IDS: the 15 tmNIDS signatures + the modern-exploit pack,
-        # all reproduced natively (curl / dns / tcp — no tmNIDS binary).
+        # North-south IDS: the 15 tmNIDS signatures + the modern-exploit pack + the
+        # DNS-security pack and the IPv6 parity twin, all reproduced natively.
         ns_ids = by_class["ns-ids"]
-        self.assertEqual(len(ns_ids), 19)
+        self.assertEqual(len(ns_ids), 23)
         self.assertTrue(all(t.runner in ("curl", "dns", "tcp") for t in ns_ids))
         self.assertEqual({t.runner for t in ns_ids}, {"curl", "dns", "tcp"})
 
         # WebCC (curl) + DLP (curl) + 1 IP-rep (iprep)
-        self.assertEqual(len(by_class.get("ns-webcc", [])), 18)
+        self.assertEqual(len(by_class.get("ns-webcc", [])), 20)
         self.assertEqual(len(by_class.get("ns-dlp", [])), 3)
-        self.assertEqual(len(by_class.get("ns-iprep", [])), 1)
+        self.assertEqual(len(by_class.get("ns-iprep", [])), 4)
         for t in by_class["ns-webcc"] + by_class["ns-dlp"]:
             self.assertEqual(t.runner, "curl")
             self.assertEqual(t.commands[0][0], "curl")
-        self.assertEqual(by_class["ns-iprep"][0].runner, "iprep")
-        self.assertEqual(len(triggers), 41)
+        for t in by_class["ns-iprep"]:
+            self.assertEqual(t.runner, "iprep")
+        self.assertEqual(len(triggers), 50)
 
         # multi-request triggers reproduce every request the tmNIDS test sends
         malua = next(t for t in triggers if t.id == "ns-malua")
@@ -52,7 +53,8 @@ class TestLoad(unittest.TestCase):
         # live-suspect triggers gated off by default
         gated = {t.id for t in triggers if t.gated_disabled(settings)}
         self.assertEqual(gated, {"ns-badcert", "ns-tor", "web-cat-p2p",
-                                 "web-cat-hacking", "web-cat-adult", "ip-rep-tor"})
+                                 "web-cat-hacking", "web-cat-adult", "ip-rep-tor",
+                                 "ip-rep-botnet", "ip-rep-scanner", "ip-rep-spammer"})
 
     def test_exploit_payloads_are_inert_literals(self):
         """The modern-exploit pack must carry FIXED literal payloads aimed at the benign

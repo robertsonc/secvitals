@@ -28,19 +28,22 @@ class TestLoad(unittest.TestCase):
         for t in triggers:
             by_class.setdefault(t.cls, []).append(t)
 
-        # 15 north-south IDS signatures, reproduced natively (curl / dns / tcp — no tmNIDS binary).
+        # North-south IDS: the 15 tmNIDS signatures + the modern-exploit pack,
+        # all reproduced natively (curl / dns / tcp — no tmNIDS binary).
         ns_ids = by_class["ns-ids"]
-        self.assertEqual(len(ns_ids), 15)
+        self.assertEqual(len(ns_ids), 19)
         self.assertTrue(all(t.runner in ("curl", "dns", "tcp") for t in ns_ids))
         self.assertEqual({t.runner for t in ns_ids}, {"curl", "dns", "tcp"})
 
-        # 10 WebCC (curl) + 1 IP-rep (iprep)
-        self.assertEqual(len(by_class.get("ns-webcc", [])), 10)
+        # WebCC (curl) + DLP (curl) + 1 IP-rep (iprep)
+        self.assertEqual(len(by_class.get("ns-webcc", [])), 18)
+        self.assertEqual(len(by_class.get("ns-dlp", [])), 3)
         self.assertEqual(len(by_class.get("ns-iprep", [])), 1)
-        for t in by_class["ns-webcc"]:
+        for t in by_class["ns-webcc"] + by_class["ns-dlp"]:
             self.assertEqual(t.runner, "curl")
             self.assertEqual(t.commands[0][0], "curl")
         self.assertEqual(by_class["ns-iprep"][0].runner, "iprep")
+        self.assertEqual(len(triggers), 41)
 
         # multi-request triggers reproduce every request the tmNIDS test sends
         malua = next(t for t in triggers if t.id == "ns-malua")
@@ -48,7 +51,44 @@ class TestLoad(unittest.TestCase):
 
         # live-suspect triggers gated off by default
         gated = {t.id for t in triggers if t.gated_disabled(settings)}
-        self.assertEqual(gated, {"ns-badcert", "ns-tor", "web-cat-p2p", "ip-rep-tor"})
+        self.assertEqual(gated, {"ns-badcert", "ns-tor", "web-cat-p2p",
+                                 "web-cat-hacking", "web-cat-adult", "ip-rep-tor"})
+
+    def test_exploit_payloads_are_inert_literals(self):
+        """The modern-exploit pack must carry FIXED literal payloads aimed at the benign
+        origin, and must never point a JNDI/LDAP reference at a resolvable name."""
+        settings = sv.load_settings(os.path.join(HERE, "config"))
+        triggers = sv.load_catalog(os.path.join(HERE, "config"), settings)
+        by_id = {t.id: t for t in triggers}
+        for tid in ("ns-log4shell", "ns-shellshock", "ns-spring4shell", "ns-scanner-ua"):
+            t = by_id[tid]
+            self.assertEqual(t.cls, "ns-ids")
+            self.assertEqual(t.runner, "curl")
+            self.assertFalse(t.params, f"{tid} must take no runtime params")
+            for cmd in t.commands:
+                url = [tok for tok in cmd if tok.startswith("http")]
+                self.assertTrue(url, f"{tid} has a command with no URL")
+                self.assertTrue(all("testmynids.org" in u for u in url),
+                                f"{tid} must only target the benign test origin")
+        # every JNDI reference points at the RFC 2606 reserved .invalid TLD
+        jndi = [tok for cmd in by_id["ns-log4shell"].commands for tok in cmd if "jndi" in tok]
+        self.assertTrue(jndi)
+        self.assertTrue(all(".invalid/" in tok for tok in jndi), jndi)
+
+    def test_dlp_payloads_are_synthetic(self):
+        """DLP bodies must use the publicly documented test values, never real data."""
+        settings = sv.load_settings(os.path.join(HERE, "config"))
+        triggers = sv.load_catalog(os.path.join(HERE, "config"), settings)
+        dlp = {t.id: t for t in triggers if t.cls == "ns-dlp"}
+        bodies = " ".join(tok for t in dlp.values() for cmd in t.commands for tok in cmd)
+        self.assertIn("4111111111111111", bodies)      # universal Visa test PAN
+        self.assertIn("666-12-3456", bodies)           # SSA never issues area 666
+        self.assertIn("AKIAIOSFODNN7EXAMPLE", bodies)  # AWS documentation example key
+        for t in dlp.values():
+            for cmd in t.commands:
+                self.assertIn("-X", cmd)
+                self.assertEqual(cmd[cmd.index("-X") + 1], "POST")
+                self.assertTrue(any("testmynids.org" in tok for tok in cmd))
 
     def test_devnull_token_is_allowed(self):
         settings = sv.load_settings(os.path.join(HERE, "config"))

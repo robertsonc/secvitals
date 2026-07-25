@@ -40,13 +40,13 @@ result**. It **polls no management API** — verification happens on the inline
 stack's console. Security Vitals' only job is to fire clean, attributable
 traffic and *honestly* report what it observed on this host. This build covers
 **north–south** functions (IDS/IPS, web categorization/reputation, IP
-reputation); east–west is deferred (see §1.9).
+reputation, and DLP / content inspection); east–west is deferred (see §1.9).
 
 ### 1.2 Architecture at a glance
 
 | Property | Choice | Why it matters for a demo |
 |---|---|---|
-| **Form factor** | Single‑file, stdlib‑only **Tkinter window** (`secvitals.py`, ~2,100 lines). No browser, no server. | Nothing to stand up on the SE laptop; opens in its own window with its own taskbar icon. |
+| **Form factor** | Single‑file, stdlib‑only **Tkinter window** (`secvitals.py`, ~2,500 lines). No browser, no server. | Nothing to stand up on the SE laptop; opens in its own window with its own taskbar icon. |
 | **Execution** | **Native** — `curl.exe` (Windows 10 1803+) for HTTP; built‑in stdlib probes for DNS and TCP; a built‑in IP‑reputation probe. **No WSL, no shell, no download‑and‑execute.** | Windows‑origin traffic (representative); the same IDS signatures trip without shipping a third‑party binary. |
 | **What fires** | A **fixed catalog** (`config/catalog.yaml`). Commands are argv lists, never built from free text; optional params are allowlist/pattern‑validated. | The signal set is auditable and repeatable — a *known quantity*, not ad‑hoc traffic. |
 | **What it reports** | A **three‑state classifier** where `blocked` and `error` never collapse. | A broken environment is reported as `error`, never a false `blocked` that would misrepresent the customer's product. |
@@ -56,36 +56,42 @@ reputation); east–west is deferred (see §1.9).
 ### 1.3 The test cases it supports today — the trigger catalog
 
 In Security Vitals' vocabulary, a **"test case" is a demo trigger**: a fixed unit
-of traffic designed to trip a specific control. There are **26 triggers** across
-three active classes (plus one reserved class):
+of traffic designed to trip a specific control. There are **41 triggers** across
+four active classes (plus one reserved class):
 
 | Class | UI label | Triggers | Catalog commands | On‑wire requests |
 |---|---|---:|---:|---:|
-| `ns-ids` | NORTH‑SOUTH · IDS / IPS | 15 | 37 | 37 |
-| `ns-webcc` | NORTH‑SOUTH · WEB CATEGORIES & REPUTATION (SWG) | 10 | 10 | 10 |
+| `ns-ids` | NORTH‑SOUTH · IDS / IPS | 19 | 43 | 43 |
+| `ns-webcc` | NORTH‑SOUTH · WEB CATEGORIES & REPUTATION (SWG) | 18 | 18 | 18 |
+| `ns-dlp` | NORTH‑SOUTH · DATA LOSS PREVENTION (content inspection) | 3 | 4 | 4 |
 | `ns-iprep` | NORTH‑SOUTH · IP REPUTATION | 1 | 1 | 6 (node sample) |
 | `ew` | EAST‑WEST | **0** (reserved / deferred) | 0 | 0 |
-| **Total** | | **26** | **48** | **53** |
+| **Total** | | **41** | **66** | **71** |
 
 > #### The "known quantity" — exactly how many signals hit the wire
 >
 > Several triggers fire more than one request (e.g. `ns-malua` = 5 malware
 > user‑agents, `ns-badcert` = 6 hosts, `ns-iplookup` = 6 lookup services). The
 > single `ip-rep-tor` trigger expands to **6 live node probes** (`ip_rep_sample`
-> in `settings.yaml`). So a full run is a *fixed, countable* set of signals — and
-> the count depends on one toggle:
+> in `settings.yaml`) — which is why the console counts *on‑wire requests*, not
+> catalog commands. So a full run is a *fixed, countable* set of signals, and the
+> count depends on one toggle:
 >
-> | Profile | Active triggers | IDS | SWG | IP‑rep | **Signals on the wire** |
-> |---|---:|---:|---:|---:|---:|
-> | **Default** (live‑suspect gate **off** — customer‑adjacent) | 22 | 30 | 9 | 0 | **39** |
-> | **Lab** (gate **on**, `enable_live_suspect_hosts: true`) | 26 | 37 | 10 | 6 | **53** |
+> | Profile | Active triggers | IDS | SWG | DLP | IP‑rep | **Signals on the wire** |
+> |---|---:|---:|---:|---:|---:|---:|
+> | **Default** (live‑suspect gate **off** — customer‑adjacent) | 35 | 36 | 15 | 4 | 0 | **55** |
+> | **Lab** (gate **on**, `enable_live_suspect_hosts: true`) | 41 | 43 | 18 | 4 | 6 | **71** |
 >
-> Out of the box, four triggers are gated off (§1.7), so the default run omits
-> the two live bad‑cert signals, the `.onion` lookup, the Pirate Bay category
-> hit, and **all** IP‑reputation coverage. Enable the gate in a lab you control
-> to fire the full 53.
+> Out of the box, six triggers are gated off (§1.7), so the default run omits the
+> live bad‑cert signals, the `.onion` lookup, the Pirate Bay / exploit‑tooling /
+> adult category hits, and **all** IP‑reputation coverage. Enable the gate in a
+> lab you control to fire the full 71.
+>
+> You never have to trust this table: `--list`, `--dry-run`, or the window's
+> **Signal manifest** button compute it from the live catalog and send nothing
+> (§2.1a).
 
-**The full catalog (all 26 triggers):**
+**The full catalog (all 41 triggers):**
 
 | # | id | Test case | Class | Runner | Req | Threat | Sev | Expected to fire (SID / rule) | Gated |
 |--:|---|---|---|---|--:|---|---|---|:--:|
@@ -104,6 +110,10 @@ three active classes (plus one reserved class):
 | 13 | `ns-gaming` | Policy violation — gaming | ns-ids | curl | **2** | policy | warn | ET POLICY — gaming UA/client (2014718, 2013910) | — |
 | 14 | `ns-adware` | Adware / PUP | ns-ids | curl | **3** | malware | warn | ET ADWARE_PUP (2003060, 2002001, 2002092) | — |
 | 15 | `ns-c2` | Malware C2 beacon | ns-ids | curl | **2** | c2 | crit | ET MALWARE — C2 beacon (2027793, 2016568) | — |
+| 15a | `ns-log4shell` | Log4Shell JNDI probe (CVE‑2021‑44228) | ns-ids | curl | 1 | exploit | crit | ET EXPLOIT — Log4j JNDI injection in an HTTP header | — |
+| 15b | `ns-shellshock` | Shellshock CGI probe (CVE‑2014‑6271) | ns-ids | curl | 1 | exploit | crit | ET EXPLOIT — Bash function definition in a header | — |
+| 15c | `ns-spring4shell` | Spring4Shell class‑loader probe (CVE‑2022‑22965) | ns-ids | curl | 1 | exploit | warn | ET EXPLOIT — Spring class‑loader manipulation | — |
+| 15d | `ns-scanner-ua` | Scanner user agents (Nikto/sqlmap/Nmap) | ns-ids | curl | **3** | recon | warn | ET SCAN — scanner user agent observed outbound | — |
 | 16 | `web-cat-gambling` | Gambling — bet365.com | ns-webcc | curl | 1 | policy | info | SWG category Gambling · Deny → timeout | — |
 | 17 | `web-cat-social` | Social Networking — facebook.com | ns-webcc | curl | 1 | policy | info | SWG Social Networking · Deny → timeout | — |
 | 18 | `web-cat-streaming` | Streaming Media — youtube.com | ns-webcc | curl | 1 | policy | info | SWG Streaming Media · Deny → timeout | — |
@@ -114,9 +124,30 @@ three active classes (plus one reserved class):
 | 23 | `web-rep-malware-gsb` | Malware page (Google Safe Browsing test) | ns-webcc | curl | 1 | malware | crit | Web threat (malware) · Deny → timeout | — |
 | 24 | `web-rep-phishing-gsb` | Phishing page (GSB test) | ns-webcc | curl | 1 | malware | crit | Web threat (phishing) · Deny → timeout | — |
 | 25 | `web-rep-unwanted-gsb` | Unwanted software (GSB test) | ns-webcc | curl | 1 | policy | warn | Web threat (unwanted) · Deny → timeout | — |
+| 25a | `web-cat-genai` | Generative AI / Shadow AI — chatgpt.com | ns-webcc | curl | 1 | policy | warn | SWG category Generative AI · Deny → timeout | — |
+| 25b | `web-cat-webmail` | Personal webmail — mail.yahoo.com | ns-webcc | curl | 1 | policy | info | SWG category Personal Webmail · Deny → timeout | — |
+| 25c | `web-cat-dating` | Dating — match.com | ns-webcc | curl | 1 | policy | info | SWG category Dating · Deny → timeout | — |
+| 25d | `web-cat-jobsearch` | Job Search — indeed.com | ns-webcc | curl | 1 | policy | info | SWG category Job Search · Deny → timeout | — |
+| 25e | `web-cat-weapons` | Weapons — guns.com | ns-webcc | curl | 1 | policy | info | SWG category Weapons · Deny → timeout | — |
+| 25f | `web-cat-drugs` | Marijuana / Drugs — leafly.com | ns-webcc | curl | 1 | policy | info | SWG category Marijuana / Drugs · Deny → timeout | — |
+| 25g | `web-cat-hacking` | Hacking / exploit tooling — exploit‑db.com | ns-webcc | curl | 1 | policy | warn | SWG category Hacking · Deny → timeout | **●** |
+| 25h | `web-cat-adult` | Adult content — category test | ns-webcc | curl | 1 | policy | warn | SWG category Adult · Deny → timeout | **●** |
 | 26 | `ip-rep-tor` | IP Reputation — Tor Proxy nodes (:443) | ns-iprep | iprep | 1* | policy | warn | IP reputation "Tor Proxy" · Deny → timeouts (ratio) | **●** |
+| 27 | `dlp-pan` | Credit‑card data (synthetic test PAN) | ns-dlp | curl | 1 | dlp | crit | DLP — credit‑card number in an outbound POST body | — |
+| 28 | `dlp-ssn` | Personal data (never‑issued SSN) | ns-dlp | curl | 1 | dlp | crit | DLP — US SSN pattern in an outbound POST body | — |
+| 29 | `dlp-secrets` | Credentials & keys (documentation examples) | ns-dlp | curl | **2** | dlp | crit | DLP — cloud access key / private‑key material | — |
 
-<sub>`Req` = number of catalog commands. `*` `ip-rep-tor` has one command but probes `ip_rep_sample` (6) live relays on the wire. `●` = gated by `hits_live_suspect_hosts`, off by default.</sub>
+<sub>`Req` = number of catalog commands. `*` `ip-rep-tor` has one command but probes `ip_rep_sample` (6) live relays on the wire. `●` = gated by `hits_live_suspect_hosts`, off by default. Lettered rows were added in roadmap wave 1.</sub>
+
+**On the exploit and DLP payloads.** Both packs are built to be *inert by
+construction*, because a demo tool must never actually attack anything or leak
+real data. The exploit payloads are fixed literal strings sent as headers or
+query strings to the same benign tmNIDS origin the rest of the IDS catalog uses;
+the JNDI references point at the RFC 2606 reserved `.invalid` TLD and are never
+resolved or fetched. The DLP bodies use publicly documented test values — the
+universal Visa test PAN, an SSN in the never‑issued 666 area, and AWS's own
+documentation example key. The sensor matches the pattern on the wire, which is
+the entire point; nothing is exploited and no real data exists to lose.
 
 Each trigger also carries a **talking point** and an **expected‑fire** string
 (the SID or rule a presenter can name), both surfaced in the UI.
@@ -143,6 +174,13 @@ How each runner decides:
   handshake, cert) → **error**; `rc 0` with HTTP `403/451` → **blocked**, else
   **allowed**; `rc 0` with no parseable code → **error**; any unknown code →
   **error** (fail toward honest).
+- **Optional per‑trigger refinement**: a gateway that serves a block page at HTTP
+  200 (or redirects to one) would look like `allowed` to the exit‑code mapping
+  alone. A catalog entry may declare `expected_on_block` / `expected_on_allow`
+  (matching on `rc`, `rc_nonzero`, `http_code`, `http_code_in`, `body_contains`)
+  to catch that. The refinement is applied **only to a request that actually
+  completed** (`rc 0`), so it can never promote an environment failure to
+  `blocked` or demote a real inline drop to `allowed`.
 - **dns / tcp** probes: a probe that doesn't complete is *ambiguous* — it could
   be an inline drop or a broken network. A **control egress probe** to a
   known‑good host (`1.1.1.1:443` by default) disambiguates: control OK + probe
@@ -191,14 +229,15 @@ verification; atomic swap with `.bak`; on‑disk re‑verify to close a TOCTOU
 window; Windows SChannel fallback for TLS‑inspecting proxies). Full detail lives
 in [`UPDATE_SECURITY.md`](UPDATE_SECURITY.md).
 
-Distinct from the *demo* test cases, the **software has 89 automated unit
-tests** (`tests/`, green on CI) covering the runner, the three‑state classifier,
-catalog/YAML loading and validation, the IP‑reputation probe, the signed
-updater (round‑tripped against `openssl`), and a headless Tkinter build smoke
-test. They stub the network deliberately (curl via a Python stub, TEST‑NET‑1 for
-guaranteed DNS timeouts, `file://` release URLs, a fake Tor list), so the one
-thing they *cannot* assert is signal **fidelity to a real IDS SID** — that is
-only verifiable on the inline stack, by design.
+Distinct from the *demo* test cases, the **software has 138 automated unit
+tests** (`tests/`, green on CI) covering the runner, the three‑state classifier
+and its `expected_on_*` refinement, catalog/YAML loading and validation, the
+IP‑reputation probe, the signed updater (round‑tripped against `openssl`), the
+signal manifest, headless mode, and a headless Tkinter build smoke test. They
+stub the network deliberately (curl via a Python stub, TEST‑NET‑1 for guaranteed
+DNS timeouts, `file://` release URLs, a fake Tor list), so the one thing they
+*cannot* assert is signal **fidelity to a real IDS SID** — that is only
+verifiable on the inline stack, by design.
 
 ### 1.9 What's deferred
 
@@ -231,6 +270,45 @@ python3 secvitals.py     # Linux (development)
 Useful flags: `--verbose`, `--config-dir DIR`, `--check-update`, `--update`,
 `--version`. No dependencies beyond Python 3.8+ (stdlib only); HTTP triggers need
 `curl.exe`.
+
+### 2.1a Know the number before you fire — the signal manifest
+
+Three ways to get the exact, live‑computed signal count, **none of which send
+anything**:
+
+```bash
+py secvitals.py --list                 # the catalog + the count
+py secvitals.py --dry-run              # every command that WOULD be sent
+py secvitals.py --list --format json   # the same, machine-readable
+```
+
+…or click **☰ Signal manifest** in the window. The window's header also shows the
+running total (`55 signals · 35 triggers`), and each trigger card carries its own
+signal chip — so `ip-rep-tor` reads *6 signals*, not *1 command*.
+
+Use this to open the demo with a concrete promise: *"I'm about to generate 55
+attributable signals across 35 triggers — here's the list."*
+
+### 2.1b Pre‑brief with headless mode
+
+```bash
+py secvitals.py --run all                    # everything (gated triggers skipped)
+py secvitals.py --run ns-dlp                 # one whole class
+py secvitals.py --run ns-uid,web-cat-genai   # named triggers
+py secvitals.py --run all --format json      # one JSON document for scripting
+```
+
+Run this **from the customer's network before the meeting**. It uses the same
+`App.run` and classifier the window does, so what you see is what the demo will
+do. Exit codes are policy‑neutral:
+
+| Exit | Meaning |
+|---:|---|
+| **0** | Every trigger produced a policy result — **including `blocked`**, which is the product working. |
+| **1** | At least one `error`/`invalid` — a broken environment or a gated trigger you named explicitly. |
+| **2** | Usage or config problem (unknown trigger id/class, bad config). |
+
+A red build here means *fix your environment*, never *the customer's stack failed*.
 
 ### 2.2 The window
 
@@ -278,10 +356,24 @@ Same signal, two outcomes — the strongest story the tool tells.
 
 ### 2.6 Correlating with the customer console
 
-Open a trigger's **5‑tuple details** and match the destination IP/port and
-source port (plus the run time) against the flow/event log on the customer's
-console. Because Security Vitals polls no API, this manual correlation *is* the
-verification step — the 5‑tuple is the bridge.
+Because Security Vitals polls no API, this correlation *is* the verification
+step. Three things make it fast:
+
+1. **The console hint.** Each expanded card names *where to look* on the inline
+   stack (alert log, URL‑filtering log, reputation hits, DLP log). Catalog
+   entries can override the per‑class default with their own `console_hint`.
+2. **The verification key.** After a run, click **Copy verification key** — you
+   get one greppable line to paste straight into the console's filter box:
+
+   ```
+   2026-07-25T09:14:07Z | ns-uid | expect SID 2100498 — GPL ATTACK_RESPONSE id check returned root | 10.13.1.100:51844 -> 3.33.130.190:80 (testmynids.org) | local:allowed
+   ```
+
+   An endpoint the run never learned prints `—` rather than a plausible‑looking
+   guess. The same key appears in the card's **verification key** pane and in
+   headless output (`verify_key`).
+3. **The 5‑tuple pane**, for the full per‑request breakdown when one line isn't
+   enough.
 
 ### 2.7 Enabling the live‑suspect triggers
 
@@ -291,8 +383,9 @@ Only in a lab you control, set in `config/settings.yaml`:
 enable_live_suspect_hosts: true
 ```
 
-This turns on `ns-badcert`, `ns-tor`, `web-cat-p2p`, and `ip-rep-tor` — and is
-the difference between a 39‑signal and a 53‑signal run.
+This turns on `ns-badcert`, `ns-tor`, `web-cat-p2p`, `web-cat-hacking`,
+`web-cat-adult`, and `ip-rep-tor` — the difference between a 55‑signal and a
+71‑signal run.
 
 ### 2.8 Configuration knobs (`settings.yaml`)
 
@@ -318,13 +411,16 @@ the new version.
 
 ### 2.10 Pre‑demo checklist
 
-1. Confirm `curl.exe` is present (`curl --version`) and general egress works.
-2. Decide the profile: **default (39 signals)** on a customer‑adjacent network,
-   or **lab (53 signals)** with the gate on.
+1. Run `py secvitals.py --run all` **from the customer's network** — the
+   pre‑brief. Exit 0 means every trigger produced a policy result; exit 1 tells
+   you which origin or control probe to fix *before* you're on stage.
+2. Decide the profile: **default (55 signals)** on a customer‑adjacent network,
+   or **lab (71 signals)** with the gate on. Confirm with `--list`.
 3. Fire one cheap trigger (`ns-uid`) and confirm you see it on the customer
-   console — this proves the correlation path before the real run.
+   console — this proves the correlation path before the real run. Use **Copy
+   verification key** to jump straight to the right filter.
 4. Agree with the customer which policy you'll flip for the before/after.
-5. Keep the 5‑tuple pane handy for correlation.
+5. Open with the **Signal manifest** so the room knows the number up front.
 
 ---
 
@@ -334,7 +430,33 @@ The roadmap below was generated by fanning out feature ideas across five lenses
 (known‑quantity signal accounting, coverage breadth, SE usability, closing the
 verification loop, and trust/robustness) and then **adversarially vetting each
 idea** against the product's non‑negotiables. Thirty‑two ideas survived; one was
-deliberately rejected (§3.5).
+deliberately rejected (§3.6).
+
+> ### ✅ Wave 1 — shipped
+>
+> The recommended first wave (§3.7) is **delivered**. Items marked ✅ below are in
+> the product today:
+>
+> - **True on‑wire counts** — `on_wire_count()` / `wire_request_count`; the IP‑rep
+>   6× under‑report is fixed, and the count is surfaced in the header, on every
+>   card, and in headless output.
+> - **Dry‑run signal manifest** — `--list` / `--dry-run` / `--format json` and the
+>   window's **☰ Signal manifest**; computes from the live catalog and sends
+>   nothing (enforced by a test that fails if any I/O is attempted).
+> - **Headless pre‑brief mode** — `--run all|<ids>|<classes>` with policy‑neutral
+>   exit codes (a `blocked` trigger still exits 0).
+> - **Catalog packs** — modern‑exploit (Log4Shell / Shellshock / Spring4Shell /
+>   scanner UAs), SWG categories (Generative AI, webmail, dating, job search,
+>   weapons, drugs, + gated hacking and adult), and DLP (PAN / SSN / secrets).
+>   Signals went from **39 → 55** by default and **53 → 71** in a lab.
+> - **Verification key + console hints** — a pasteable correlation line, a
+>   per‑class "where to look" hint with an optional per‑trigger `console_hint`,
+>   and a **Copy verification key** button.
+> - **`expected_on_*` refinement** — the validated‑but‑unused predicates now
+>   refine classification for completed requests only, so a block page served at
+>   200 is caught without ever promoting an error to `blocked`.
+>
+> The suite grew from **89 to 138 tests** alongside these changes.
 
 ### 3.1 The guardrails every feature must respect
 
@@ -359,8 +481,8 @@ Make the signal count exact, reproducible, and provable to the customer.
 
 | Feature | What it adds | Value | Effort | Horizon |
 |---|---|:--:|:--:|:--:|
-| **True on‑wire count** (`wire_request_count`) | Fix the console under‑reporting IP‑rep 6× (`to_public` reports `len(commands)=1`); show a per‑profile "N signals across M triggers" tally. | ★★★ | S | Near |
-| **Dry‑run "Signal Manifest"** | A zero‑egress preview (GUI toggle + `--dry-run`) listing every enabled trigger's redacted argv, destination, expected SID, and **true** on‑wire count — the pre‑brief artifact and the 6× fix in one. | ★★★★ | S | Near |
+| ✅ **True on‑wire count** (`wire_request_count`) | Fix the console under‑reporting IP‑rep 6× (`to_public` reports `len(commands)=1`); show a per‑profile "N signals across M triggers" tally. | ★★★ | S | Near |
+| ✅ **Dry‑run "Signal Manifest"** | A zero‑egress preview (GUI toggle + `--dry-run`) listing every enabled trigger's redacted argv, destination, expected SID, and **true** on‑wire count — the pre‑brief artifact and the 6× fix in one. | ★★★★ | S | Near |
 | **Per‑run Signal Ledger + export** | Accumulate every fired request (5‑tuple, 3‑state verdict, rc/http, control_ok) and export **JSON / CSV / printable HTML** as a leave‑behind. Local disk only. | ★★★★ | M | Mid |
 | **Expected‑vs‑Observed scorecard** | Pair each trigger's `expected_fire` with its local result, with an SE‑tickable "confirmed on console" column — the demo's reconciliation sheet. | ★★★★ | M | Mid |
 | **Policy‑coverage matrix** | From catalog metadata + run states, show which dimensions (class, threat, severity) were exercised — and name the empty cells (IP‑rep = Tor‑only, E/W = 0) honestly. | ★★★ | S | Near |
@@ -373,9 +495,9 @@ are **catalog‑only** additions reusing the existing runners and classifier.
 
 | Feature | What it adds | Value | Effort | Horizon |
 |---|---|:--:|:--:|:--:|
-| **SWG category pack** | ~8–10 new `ns-webcc` category triggers (Generative‑AI / Shadow‑AI, Weapons, Hacking, Adult, Dating, Drugs, Job‑search), awkward hosts gated. Category breadth is how a modern SWG is graded. | ★★★★ | S | Near |
-| **Modern‑exploit IDS pack** | `ns-ids` triggers carrying **inert** Log4Shell/Spring4Shell/ShellShock/exploit‑kit‑UA strings as fixed argv literals to the benign origin — the marquee‑CVE SIDs every IPS markets, never actually exploiting anything. | ★★★★ | S | Near |
-| **DLP / data‑exfil pack** | POST obviously‑synthetic test PII (the reserved 4111‑test PAN, a reserved SSN, a fake `AKIA…`/`BEGIN RSA PRIVATE KEY` marker) over HTTP and HTTPS to a benign sink to exercise inline content inspection. | ★★★★ | S | Near |
+| ✅ **SWG category pack** | ~8–10 new `ns-webcc` category triggers (Generative‑AI / Shadow‑AI, Weapons, Hacking, Adult, Dating, Drugs, Job‑search), awkward hosts gated. Category breadth is how a modern SWG is graded. | ★★★★ | S | Near |
+| ✅ **Modern‑exploit IDS pack** | `ns-ids` triggers carrying **inert** Log4Shell/Spring4Shell/ShellShock/exploit‑kit‑UA strings as fixed argv literals to the benign origin — the marquee‑CVE SIDs every IPS markets, never actually exploiting anything. | ★★★★ | S | Near |
+| ✅ **DLP / data‑exfil pack** | POST obviously‑synthetic test PII (the reserved 4111‑test PAN, a reserved SSN, a fake `AKIA…`/`BEGIN RSA PRIVATE KEY` marker) over HTTP and HTTPS to a benign sink to exercise inline content inspection. | ★★★★ | S | Near |
 | **DNS‑security pack** | Fixed‑string DGA + long‑name tunneling triggers, plus DoH via curl and an optional stdlib TXT query type. | ★★★ | S | Near |
 | **IP‑reputation expansion** | Curated botnet‑C2 / spammer / scanner reputation feeds as gated `ns-iprep` triggers — today IP‑rep is Tor‑only. | ★★★ | M | Mid |
 | **East‑West tier‑1 port probe** | An outbound‑only TCP probe filling the empty `ew` class: SYN‑ACK/RST = reachable, timeout + same‑zone control reachable = blocked, control unreachable = error. First lateral‑movement / segmentation signals. | ★★★★ | L | Mid |
@@ -387,12 +509,12 @@ Make a live demo smoother and give the customer something to keep.
 
 | Feature | What it adds | Value | Effort | Horizon |
 |---|---|:--:|:--:|:--:|
-| **Headless batch / pre‑brief mode** (`--run`, `--list`, `--format json`) | Validate egress + which signals fire **from the customer network before the meeting**, and prove the known‑quantity set in CI — reusing `App.run`/`classify()` verbatim. A block exits 0 (a win, not a failure); only error/invalid/config problems exit non‑zero. | ★★★★ | M | Near |
+| ✅ **Headless batch / pre‑brief mode** (`--run`, `--list`, `--format json`) | Validate egress + which signals fire **from the customer network before the meeting**, and prove the known‑quantity set in CI — reusing `App.run`/`classify()` verbatim. A block exits 0 (a win, not a failure); only error/invalid/config problems exit non‑zero. | ★★★★ | M | Near |
 | **Demo profiles / playlists** | Named, ordered run‑sets (e.g. "5‑minute exec demo", "SWG deep‑dive") so a presenter runs a tight, repeatable, *countable* subset instead of all 26. | ★★★★ | M | Mid |
 | **Presenter mode** | A paced talk‑track over Run‑all surfacing each trigger's talking point / expected SID in large type, plus a persistent big‑font scoreboard by class. | ★★★★ | M | Mid |
 | **Self‑contained HTML demo report** | One `html.escape`'d file combining expected SID + honest local state + 5‑tuple + provenance, opened in the browser — the shareable evidence artifact. | ★★★★ | M | Mid |
-| **`console_hint` + live correlation key** | An optional, load‑validated per‑trigger "where to look" hint plus a composed correlation key (live 5‑tuple + UTC window + expected SID) — turns the 5‑tuple table into a pointer at the right console filter. | ★★★★ | S | Near |
-| **Copy‑verification‑key button** | One click copies a greppable `UTC | trigger | expect SID | src→dst | local:state` line straight into the customer console's filter box — no alt‑tab retyping at the money moment. | ★★★★ | S | Near |
+| ✅ **`console_hint` + live correlation key** | An optional, load‑validated per‑trigger "where to look" hint plus a composed correlation key (live 5‑tuple + UTC window + expected SID) — turns the 5‑tuple table into a pointer at the right console filter. | ★★★★ | S | Near |
+| ✅ **Copy‑verification‑key button** | One click copies a greppable `UTC \| trigger \| expect SID \| src→dst \| local:state` line straight into the customer console's filter box — no alt‑tab retyping at the money moment. | ★★★★ | S | Near |
 | **Session recap / evidence log** | A local "Save recap" proof‑of‑fire file, and an append‑only JSONL log with "reload last session" (re‑render cards without re‑firing). No upload, no listener. | ★★★ | M | Near–Mid |
 | **Graceful curl‑absent / offline state** | Detect curl‑missing and full‑offline at startup and mark curl triggers **INVALID** with a one‑line remediation banner instead of a wall of ambiguous ERRORs. | ★★★ | S | Near |
 
@@ -403,7 +525,7 @@ the current code.
 
 | Feature | What it adds | Value | Effort | Horizon |
 |---|---|:--:|:--:|:--:|
-| **Activate `expected_on_*` predicates** | The `expected_on_allow`/`expected_on_block` fields are validated at load but **never consulted** by `classify()`. Wiring them in (reachable‑only) lets an SWG block page served at HTTP 200 or via redirect stop reading as `allowed` — without ever turning an error into a block. | ★★★★ | M | Mid |
+| ✅ **Activate `expected_on_*` predicates** | The `expected_on_allow`/`expected_on_block` fields are validated at load but **never consulted** by `classify()`. Wiring them in (reachable‑only) lets an SWG block page served at HTTP 200 or via redirect stop reading as `allowed` — without ever turning an error into a block. | ★★★★ | M | Mid |
 | **Sign & verify the catalog** | Today only `secvitals.py` is authenticated; the catalog is not. Sign `catalog.yaml` and show a verified/modified provenance badge, so the fired traffic provably matches the reviewed catalog. | ★★★ | M | Mid |
 | **Multi‑endpoint control probe** | The blocked‑vs‑error decision hinges on **one** host (`1.1.1.1:443`); if the customer filters it, real blocks degrade to errors. Make it an ordered, transport‑matched list (blocked only if all fail). | ★★★ | M | Mid |
 | **ERROR‑only failover origin** | Auto‑failover to a fixed alternate origin **only when a request honestly ERRORs** (never past blocked/allowed), so a down `testmynids.org` doesn't silently shrink the IDS signal count. | ★★★ | M | Mid |

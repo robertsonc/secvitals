@@ -111,6 +111,23 @@ class TestGuiBuildSmoke(unittest.TestCase):
         # exactly how the real window failed to open before the fix.
         sv.run_gui(settings, triggers, app, "config")
 
+    def test_presenter_windows_build(self):
+        """The presenter picker and the presenter window are built from live catalog and
+        profile data; both must pass the same widget-option validation as the main
+        window (this is the bug class that broke 0.1.1)."""
+        import secvitals as sv
+        settings = sv.load_settings("config")
+        triggers = sv.load_catalog("config", settings)
+        profiles = sv.load_profiles(settings, triggers)
+        app = sv.App(settings, triggers, "config")
+        sv.run_gui(settings, triggers, app, "config", profiles)   # sets module-level `tk`
+        sv.open_presenter_picker(FakeWidget(), app, triggers, settings, profiles)
+        session = sv.PresenterSession(triggers, settings, label="All")
+        sv.open_presenter_window(FakeWidget(), app, session, settings)
+        # the finished state renders too (no current trigger)
+        done = sv.PresenterSession([], settings, label="Empty")
+        sv.open_presenter_window(FakeWidget(), app, done, settings)
+
     def test_manifest_dialog_builds(self):
         """The signal-manifest preview is a second window built from live catalog data;
         it must survive the same widget-option validation as the main window."""

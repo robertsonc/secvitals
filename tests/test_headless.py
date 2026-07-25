@@ -27,7 +27,8 @@ def mk_trigger(tid, cls="ns-ids", runner="curl", commands=None, flags=None):
 
 def mk_app(triggers, live=False):
     settings = sv.Settings(raw={"enable_live_suspect_hosts": live,
-                                "run": {"min_interval_s": 0, "control_host": ""}})
+                                "run": {"min_interval_s": 0, "control_host": ""},
+                                "evidence": {"log": False}})
     return sv.App(settings, triggers, "."), settings
 
 

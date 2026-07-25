@@ -71,6 +71,23 @@ find out that an origin is unreachable or the control probe is down while you ca
 fix it. Its exit code is policy-neutral — **0 even when triggers are blocked** (a block is
 the inline stack doing its job); non-zero only for `error`/`invalid` or a usage problem.
 
+### Leave something behind
+
+```bash
+py secvitals.py --run all --export demo.html   # HTML leave-behind (.json / .csv too)
+py secvitals.py --last-session                 # re-read the last run, fire nothing
+```
+
+Or click **⬇ Save report** in the window. Every run is recorded in a **hash-chained
+ledger** stamped with digests of the code and catalog that produced it, so a report can
+be shown not to have been quietly edited. The report keeps three columns strictly
+separate — what the catalog **expected** to fire, what this host **observed**, and what
+the presenter **confirmed** on the customer's console — and names the policy dimensions
+the session did *not* exercise.
+
+**Local disk only.** Nothing is uploaded, nothing phones home, and there is still no
+listening socket. See [docs/milestones/M1-evidence-and-reporting.md](docs/milestones/M1-evidence-and-reporting.md).
+
 ## What the result states mean
 
 | State | What happened locally | Reading it |

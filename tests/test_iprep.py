@@ -17,7 +17,8 @@ class FakeTor:
 
 def mk_app(control_host="1.1.1.1", sample=3):
     settings = sv.Settings(raw={"run": {"control_host": control_host, "control_port": 443},
-                                "webcc": {"ip_rep_sample": sample, "node_probe_timeout_s": 1}})
+                                "webcc": {"ip_rep_sample": sample, "node_probe_timeout_s": 1},
+                                "evidence": {"log": False}})
     trig = sv.Trigger.from_dict({"id": "ip-rep-tor", "label": "tor", "class": "ns-iprep",
                                  "runner": "iprep", "argv": ["iprep"],
                                  "flags": ["needs_internet"]}, 30.0)
@@ -88,7 +89,8 @@ class TestIprep(unittest.TestCase):
     def test_iprep_gated_by_default_via_app_run(self):
         # ip-rep-tor carries hits_live_suspect_hosts; with the gate off it must not run.
         settings = sv.Settings(raw={"enable_live_suspect_hosts": False,
-                                    "run": {"control_host": "1.1.1.1"}})
+                                    "run": {"control_host": "1.1.1.1"},
+                                    "evidence": {"log": False}})
         trig = sv.Trigger.from_dict({"id": "ip-rep-tor", "label": "tor", "class": "ns-iprep",
                                      "runner": "iprep", "argv": ["iprep"],
                                      "flags": ["needs_internet", "hits_live_suspect_hosts"]}, 30.0)

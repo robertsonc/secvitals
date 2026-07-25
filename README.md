@@ -12,8 +12,14 @@ fires the traffic and honestly reports what it observed locally.
   This host  →  IDS/IPS + Secure Web Gateway  →  Internet
 ```
 
-This build covers **north–south** functions: IDS/IPS and web categorization / reputation
-and IP reputation. East–west is deferred.
+This build covers **north–south** functions: IDS/IPS, web categorization / reputation,
+IP reputation, and DLP / content inspection. East–west is deferred.
+
+**The known quantity.** The catalog is fixed, so the number of signals a run puts on the
+wire is exact and repeatable: **55 signals across 35 triggers** by default, or **71
+across 41** once the live-suspect gate is on. Ask for it before you fire — `--list` for
+the summary, `--dry-run` for every command that would be sent (both send nothing), or the
+**Signal manifest** button in the window.
 
 ## How it runs
 
@@ -50,6 +56,21 @@ No dependencies beyond Python 3.8+ (standard library only); the Windows Python n
 tcl/tk (Tkinter), and HTTP triggers need `curl.exe`. Useful flags: `--verbose`,
 `--config-dir DIR`, `--check-update`, `--update`.
 
+### Preview and headless modes (no window)
+
+```bash
+py secvitals.py --list                 # the catalog + the signal count — sends nothing
+py secvitals.py --dry-run              # every command that WOULD be sent — sends nothing
+py secvitals.py --run all              # fire everything headless and report honestly
+py secvitals.py --run ns-dlp,ns-uid    # fire selected classes and/or trigger ids
+py secvitals.py --run all --format json
+```
+
+`--run` is the **pre-brief**: fire from the customer's network *before* the meeting and
+find out that an origin is unreachable or the control probe is down while you can still
+fix it. Its exit code is policy-neutral — **0 even when triggers are blocked** (a block is
+the inline stack doing its job); non-zero only for `error`/`invalid` or a usage problem.
+
 ## What the result states mean
 
 | State | What happened locally | Reading it |
@@ -78,11 +99,11 @@ stack's console. Flip the security policy to inline/IPS and run the same trigger
 
 ### Live suspect-infrastructure gate
 
-Some triggers reach **real** suspect hosts or live Tor nodes (bad-cert hosts,
-`thepiratebay.org`, `.onion` / Tor relays). They are flagged
-`hits_live_suspect_hosts` and **disabled by default**, so the console can run on a
-customer-adjacent network without originating awkward traffic. Enable them only in a lab
-you control:
+Some triggers reach **real** suspect hosts, live Tor nodes, or destinations that simply
+look odd in a customer's SIEM (bad-cert hosts, `thepiratebay.org`, `.onion` / Tor relays,
+live exploit-tooling and adult sites). They are flagged `hits_live_suspect_hosts` and
+**disabled by default**, so the console can run on a customer-adjacent network without
+originating awkward traffic. Enable them only in a lab you control:
 
 ```yaml
 # config/settings.yaml
@@ -114,8 +135,9 @@ python3 -m unittest discover -s tests
 ```
 
 The runner (curl via a stub interpreter, the dns/tcp probes, multi-request aggregation),
-the three-state classifier, the catalog/YAML loader, the IP-reputation probe, and the
-signed updater each have their own suite — all run natively, no Windows required.
+the three-state classifier, the catalog/YAML loader, the IP-reputation probe, the signed
+updater, the signal manifest, and headless mode each have their own suite — all run
+natively, no Windows required.
 
 ## Provenance
 
@@ -137,4 +159,8 @@ full decision record.
 - [x] Phase 3 — Secure Web Gateway (category + web-reputation) + IP reputation (control probe + ratio)
 - [x] Tkinter window (replaces the loopback web UI)
 - [x] Native Windows execution (curl.exe + stdlib dns/tcp probes) — WSL removed
+- [x] Roadmap wave 1 — true on-wire signal counts + dry-run manifest, headless pre-brief
+      mode, modern-exploit / SWG-category / DLP catalog packs, verification key +
+      console hints, and `expected_on_*` classifier refinement
+      (see [docs/SOLUTION-AND-ROADMAP.md](docs/SOLUTION-AND-ROADMAP.md))
 - [ ] E/W — deferred (schema reserves `ew`; not implemented)

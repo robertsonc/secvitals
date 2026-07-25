@@ -64,6 +64,11 @@ class FakeWidget:
     grid = place = pack
 
     def __getattr__(self, name):          # every other widget/root method is a no-op
+        # Private attributes must behave like a real widget's: absent until assigned,
+        # so `getattr(root, "_secv_update_dialog", None)` returns None rather than a
+        # truthy stub (which would make the dialogs' reuse guard skip the build).
+        if name.startswith("_"):
+            raise AttributeError(name)
         return lambda *a, **k: None
 
 
@@ -105,6 +110,16 @@ class TestGuiBuildSmoke(unittest.TestCase):
         # Raises FakeTclError if any widget is built with an illegal option — which is
         # exactly how the real window failed to open before the fix.
         sv.run_gui(settings, triggers, app, "config")
+
+    def test_manifest_dialog_builds(self):
+        """The signal-manifest preview is a second window built from live catalog data;
+        it must survive the same widget-option validation as the main window."""
+        import secvitals as sv
+        settings = sv.load_settings("config")
+        triggers = sv.load_catalog("config", settings)
+        app = sv.App(settings, triggers, "config")
+        sv.run_gui(settings, triggers, app, "config")   # sets the module-level `tk`
+        sv.open_manifest_dialog(FakeWidget(), triggers, settings)
 
 
 if __name__ == "__main__":

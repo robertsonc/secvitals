@@ -96,6 +96,89 @@ class TestProbeClassify(unittest.TestCase):
         self.assertEqual(sv.classify(t, r)[0], sv.ERROR)
 
 
+class TestPredicateRefinement(unittest.TestCase):
+    """expected_on_allow / expected_on_block refine a COMPLETED request only.
+
+    The gap they close: a gateway that serves a block page at HTTP 200 (or redirects to
+    one) looks like `allowed` to the exit-code mapping alone. The rule that must never
+    break: refinement can only reclassify a request that actually completed, so an
+    environment failure can never be promoted to `blocked`."""
+
+    def sub(self, rc, http=None, stdout=""):
+        return sv.SubResult(argv=["curl", "http://x"], rc=rc, http_code=http, stdout=stdout)
+
+    def test_block_page_served_at_200_is_caught(self):
+        t = mk_trigger("curl", expected_on_block={"body_contains": "Access Denied"})
+        r = sv.RunResult(subs=[self.sub(0, 200, "200|\nAccess Denied by policy")])
+        state, reason = sv.classify(t, r)
+        self.assertEqual(state, sv.BLOCKED)
+        self.assertIn("expected_on_block", reason)
+
+    def test_redirect_to_a_block_page_is_caught(self):
+        t = mk_trigger("curl", expected_on_block={"http_code_in": [302, 307]})
+        self.assertEqual(sv.classify(t, sv.RunResult(subs=[self.sub(0, 302)]))[0], sv.BLOCKED)
+        # a 200 with the same predicate stays allowed
+        self.assertEqual(sv.classify(t, sv.RunResult(subs=[self.sub(0, 200)]))[0], sv.ALLOWED)
+
+    def test_expected_on_allow_confirms_a_pass(self):
+        t = mk_trigger("curl", expected_on_allow={"http_code": 200})
+        state, reason = sv.classify(t, sv.RunResult(subs=[self.sub(0, 200)]))
+        self.assertEqual(state, sv.ALLOWED)
+        self.assertIn("expected_on_allow", reason)
+
+    def test_block_predicate_wins_over_allow_predicate(self):
+        t = mk_trigger("curl", expected_on_allow={"rc": 0},
+                       expected_on_block={"body_contains": "denied"})
+        r = sv.RunResult(subs=[self.sub(0, 200, "200|\ndenied")])
+        self.assertEqual(sv.classify(t, r)[0], sv.BLOCKED)
+
+    def test_never_promotes_an_environment_error_to_blocked(self):
+        """The load-bearing safety property."""
+        t = mk_trigger("curl", expected_on_block={"rc_nonzero": True})
+        for rc in (6, 35, 60, 77, 99):
+            r = sv.RunResult(subs=[self.sub(rc)])
+            self.assertEqual(sv.classify(t, r)[0], sv.ERROR, rc)
+
+    def test_never_demotes_a_real_drop_to_allowed(self):
+        t = mk_trigger("curl", expected_on_allow={"rc_nonzero": True})
+        for rc in (28, 7, 56):
+            r = sv.RunResult(subs=[self.sub(rc)])
+            self.assertEqual(sv.classify(t, r)[0], sv.BLOCKED, rc)
+
+    def test_predicates_are_inert_when_undeclared(self):
+        t = mk_trigger("curl")
+        self.assertEqual(sv.classify(t, sv.RunResult(subs=[self.sub(0, 200)]))[0], sv.ALLOWED)
+        self.assertEqual(sv.classify(t, sv.RunResult(subs=[self.sub(0, 403)]))[0], sv.BLOCKED)
+
+    def test_a_non_matching_predicate_falls_back_to_the_default(self):
+        t = mk_trigger("curl", expected_on_block={"body_contains": "never appears"})
+        self.assertEqual(sv.classify(t, sv.RunResult(subs=[self.sub(0, 200)]))[0], sv.ALLOWED)
+        self.assertEqual(sv.classify(t, sv.RunResult(subs=[self.sub(0, 451)]))[0], sv.BLOCKED)
+
+    def test_error_reason_and_timeout_still_short_circuit(self):
+        t = mk_trigger("curl", expected_on_block={"rc": 0})
+        s = sv.SubResult(argv=["curl"], rc=0, http_code=200, error_reason="curl not found")
+        self.assertEqual(sv.classify(t, sv.RunResult(subs=[s]))[0], sv.ERROR)
+        s2 = sv.SubResult(argv=["curl"], timed_out=True)
+        self.assertEqual(sv.classify(t, sv.RunResult(subs=[s2]))[0], sv.ERROR)
+
+    def test_pred_matches_requires_every_key(self):
+        s = self.sub(0, 200, "hello")
+        self.assertTrue(sv._pred_matches({"rc": 0, "http_code": 200}, s))
+        self.assertFalse(sv._pred_matches({"rc": 0, "http_code": 404}, s))
+        self.assertFalse(sv._pred_matches({}, s))                 # empty is inert
+        self.assertFalse(sv._pred_matches({"unknown_key": 1}, s))  # fails closed
+        self.assertTrue(sv._pred_matches({"rc_nonzero": False}, s))
+        self.assertTrue(sv._pred_matches({"body_contains": "ell"}, s))
+        self.assertFalse(sv._pred_matches({"http_code_in": []}, s))
+
+    def test_probe_runners_are_not_refined(self):
+        # dns/tcp have no http code or body; predicates must not disturb them
+        t = mk_trigger("dns", expected_on_block={"rc_nonzero": True})
+        r = sv.RunResult(subs=[probe_sub(True)])
+        self.assertEqual(sv.classify(t, r)[0], sv.ALLOWED)
+
+
 class TestMultiRequestAggregate(unittest.TestCase):
     def test_all_allowed(self):
         t = mk_trigger("curl")

@@ -74,7 +74,7 @@ DEFAULT_CONFIG_DIR = os.path.join(HERE, "config")
 DEFAULT_ASSETS_DIR = os.path.join(HERE, "assets")
 
 # Known catalog vocabularies (fixed allowlists).
-CLASSES = {"ns-ids", "ns-webcc", "ns-iprep", "ew"}   # `ew` reserved / deferred
+CLASSES = {"ns-ids", "ns-webcc", "ns-iprep", "ns-dlp", "ew"}   # `ew` reserved / deferred
 # All runners execute NATIVELY (Windows or Linux) — no WSL, no download-and-execute:
 #   curl = curl.exe / curl (ships with Windows 10 1803+); dns / tcp = built-in stdlib
 #   probes; iprep = built-in IP-reputation probe. A trigger reproduces the exact requests
@@ -83,6 +83,17 @@ CLASSES = {"ns-ids", "ns-webcc", "ns-iprep", "ew"}   # `ew` reserved / deferred
 RUNNERS = {"curl", "dns", "tcp", "iprep"}
 FLAGS = {"needs_internet", "needs_et_ruleset", "hits_live_suspect_hosts"}
 SEVERITIES = {"info", "warn", "crit"}
+
+# Where a presenter looks for THIS class of signal on the inline stack's own console.
+# A catalog entry may override with its own `console_hint`; these are the fallbacks.
+# Deliberately vendor-neutral — every stack names these views differently.
+CLASS_CONSOLE_HINT = {
+    "ns-ids": "IDS/IPS alert or threat log — filter by the 5-tuple below and the run time; expect the SID above.",
+    "ns-webcc": "Web/URL filtering log — filter by destination host or URL; expect the category above with action Deny.",
+    "ns-iprep": "IP reputation / threat-intel hits — filter by the destination IPs below.",
+    "ns-dlp": "DLP / content-inspection log — filter by the 5-tuple below; expect the data pattern above.",
+    "ew": "East-west / segmentation policy log — filter by the source and destination zones.",
+}
 
 # Windows has no /dev/null; catalog commands use the {devnull} token, substituted to
 # os.devnull at run time (see build_command). It is a fixed safe value, never client input.
@@ -417,6 +428,7 @@ class Trigger:
     expected_on_block: dict
     params: list
     timeout: float
+    console_hint: str = ""      # optional "where to look on the inline console"
 
     @staticmethod
     def from_dict(d, default_timeout):
@@ -457,6 +469,11 @@ class Trigger:
         _validate_predicate(tid, "expected_on_block", block)
         params = d.get("params") or []
         _validate_params(tid, params, commands)
+        hint = d.get("console_hint", "")
+        if not isinstance(hint, str):
+            raise ConfigError(f"{tid}: console_hint must be a string")
+        if len(hint) > 300:
+            raise ConfigError(f"{tid}: console_hint is too long (max 300 characters)")
         return Trigger(
             id=tid,
             label=str(d.get("label", tid)),
@@ -472,11 +489,28 @@ class Trigger:
             expected_on_block=block,
             params=params,
             timeout=float(d.get("timeout_s", default_timeout)),
+            console_hint=hint,
         )
 
     def gated_disabled(self, settings):
         return ("hits_live_suspect_hosts" in self.flags
                 and not settings.enable_live_suspect_hosts)
+
+    def on_wire_count(self, settings):
+        """How many requests this trigger actually puts ON THE WIRE.
+
+        For most runners that is one per catalog command. The `iprep` runner is the
+        exception: its single `["iprep"]` command fans out to `webcc.ip_rep_sample`
+        node probes, so counting commands under-reports it (6x at the default sample).
+        This is the number to quote when promising a known quantity of signals."""
+        if self.runner == "iprep":
+            return max(1, int(settings.ip_rep_sample))
+        return len(self.commands)
+
+    def console_hint_text(self):
+        """Where to look for this trigger on the inline stack's console: the catalog's
+        own `console_hint` when it declares one, else the per-class default."""
+        return self.console_hint or CLASS_CONSOLE_HINT.get(self.cls, "")
 
     def to_public(self, settings):
         return {
@@ -489,7 +523,9 @@ class Trigger:
             "threat_class": self.threat_class,
             "expected_fire": self.expected_fire,
             "talking_point": self.talking_point,
+            "console_hint": self.console_hint_text(),
             "request_count": len(self.commands),
+            "wire_request_count": self.on_wire_count(settings),
             "params": [{"name": p["name"],
                         "allow": p.get("allow"),
                         "required": p.get("required", True)} for p in self.params],
@@ -1018,12 +1054,54 @@ def classify_curl(rc, http_code):
     return ERROR   # unknown rc is an error, not a block — fail toward honest
 
 
+def _pred_matches(pred, s):
+    """True iff EVERY key declared in `pred` matches this request's observation.
+
+    An empty/absent predicate never matches, so a catalog entry that declares nothing
+    keeps the default classification. An unknown key fails closed (load-time
+    validation already rejects those, so this is belt-and-braces)."""
+    if not pred:
+        return False
+    for key, want in pred.items():
+        if key == "rc":
+            if s.rc != want:
+                return False
+        elif key == "rc_nonzero":
+            if bool(s.rc not in (0, None)) is not bool(want):
+                return False
+        elif key == "body_contains":
+            # NB: a command that sends its body to {devnull} leaves only curl's own
+            # --write-out line here, so body_contains only bites when the catalog
+            # entry deliberately keeps the response body.
+            if want not in (s.stdout or ""):
+                return False
+        elif key == "http_code":
+            if s.http_code != want:
+                return False
+        elif key == "http_code_in":
+            if s.http_code not in (want or []):
+                return False
+        else:
+            return False
+    return True
+
+
 def _classify_sub(trigger, s, control_ok):
     if s.error_reason:
         return ERROR, s.error_reason
     if s.timed_out:
         return ERROR, f"timed out after {trigger.timeout:g}s"
     if trigger.runner == "curl":
+        # Reachable-only refinement. A COMPLETED request (rc 0) can still have been
+        # denied by a gateway that serves a block page at 200 or redirects to one —
+        # which the exit-code mapping alone reads as `allowed`. Refining only rc 0
+        # means an environment failure can never be promoted to `blocked`, and a real
+        # inline drop (rc 28/7/56) is never demoted to `allowed`.
+        if s.rc == 0:
+            if _pred_matches(trigger.expected_on_block, s):
+                return BLOCKED, f"curl rc=0, http={s.http_code} — matched expected_on_block"
+            if _pred_matches(trigger.expected_on_allow, s):
+                return ALLOWED, f"curl rc=0, http={s.http_code} — matched expected_on_allow"
         return classify_curl(s.rc, s.http_code), f"curl rc={s.rc}, http={s.http_code}"
     # dns / tcp native probe
     if s.ok:
@@ -1099,6 +1177,7 @@ class App:
             log.info("run done id=%s state=%s reqs=%d dur=%.2fs",
                      trigger_id, state, len(result.subs), result.duration_s)
             first = result.subs[0] if result.subs else None
+            flows = [s.flow for s in result.subs]
             return trigger, {
                 "state": state,
                 "reason": reason,
@@ -1106,9 +1185,12 @@ class App:
                 "http_code": (first.http_code if first else None),
                 "duration_s": round(result.duration_s, 3),
                 "expected_fire": trigger.expected_fire,
+                "console_hint": trigger.console_hint_text(),
+                "verify_key": verification_key(trigger, state, flows),
                 "requests": len(result.subs),
+                "wire_requests": trigger.on_wire_count(self.settings),
                 "stdout": _clip(_format_subs(result.subs), 6000),
-                "flow": _clip(_format_flows([s.flow for s in result.subs]), 4000),
+                "flow": _clip(_format_flows(flows), 4000),
                 "stderr": "",
             }
         finally:
@@ -1154,6 +1236,10 @@ class App:
                        "(control OK). A ratio, not a single verdict — a lone reach may be a "
                        "live relay; the inline IP-reputation stats are authoritative."),
             "expected_fire": trigger.expected_fire,
+            "console_hint": trigger.console_hint_text(),
+            "verify_key": verification_key(trigger, f"{blocked}/{len(sample)} blocked", flows),
+            "requests": len(sample),
+            "wire_requests": trigger.on_wire_count(s),
             "stdout": "\n".join(details),
             "flow": _clip(_format_flows(flows), 4000),
         }
@@ -1230,6 +1316,148 @@ def _format_flows(flows):
 
 
 # ===========================================================================
+# Verification key  —  one pasteable line that ties a click to the console
+# ===========================================================================
+def verification_key(trigger, state, flows, when=None):
+    """A single greppable line the presenter pastes straight into the inline stack's
+    console filter: when · what · which flow · what we saw locally. Built only from
+    what the run actually observed — an endpoint the run never learned prints '—'
+    rather than a plausible-looking guess."""
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                       time.gmtime(time.time() if when is None else when))
+    flow = next((f for f in (flows or []) if f), None) or {}
+
+    def v(key):
+        return str(flow.get(key) or "") or "—"
+
+    endpoint = f"{v('src_ip')}:{v('src_port')} -> {v('dst_ip')}:{v('dst_port')}"
+    host = str(flow.get("host") or "")
+    if host and host != flow.get("dst_ip"):
+        endpoint += f" ({host})"
+    expect = _first_line(trigger.expected_fire) or trigger.label
+    return f"{ts} | {trigger.id} | expect {expect} | {endpoint} | local:{state}"
+
+
+# ===========================================================================
+# Signal manifest  —  the KNOWN QUANTITY, computed without sending anything
+# ===========================================================================
+def _command_destination(runner, argv):
+    """Where one command is aimed, for the manifest. Never sends anything."""
+    if runner == "curl":
+        host, port = _url_endpoint(argv)
+        return f"{host}:{port}" if host else ""
+    if runner == "dns":
+        qname, server = None, "8.8.8.8"
+        for a in argv[1:]:
+            if a.startswith("@"):
+                server = a[1:] or server
+            elif qname is None:
+                qname = a
+        return f"{qname} @{server}:53" if qname else ""
+    if runner == "tcp":
+        return f"{argv[1]}:{argv[2]}" if len(argv) >= 3 else ""
+    if runner == "iprep":
+        return "live Tor relays :443"
+    return ""
+
+
+def _preview_commands(trigger):
+    """The concrete argv list each command WOULD run — the real resolve/build path,
+    stopped before any subprocess or socket. Triggers with unsupplied required params
+    fall back to the raw template rather than failing the whole preview."""
+    try:
+        resolved = _resolve_params(trigger, {})
+    except ParamError:
+        return [list(c) for c in trigger.commands]
+    out = []
+    for template in trigger.commands:
+        try:
+            out.append(build_command(template, resolved))
+        except ParamError:
+            out.append(list(template))
+    return out
+
+
+def signal_manifest(triggers, settings):
+    """Everything a full run would put on the wire, WITHOUT sending a byte.
+
+    This is the answer to 'how many signals am I about to generate?' — and it counts
+    the `iprep` fan-out honestly (see Trigger.on_wire_count), which a naive count of
+    catalog commands under-reports."""
+    rows, classes = [], {}
+    enabled = gated = signals = signals_if_gate_on = 0
+    for t in triggers:
+        is_gated = t.gated_disabled(settings)
+        count = t.on_wire_count(settings)
+        signals_if_gate_on += count
+        cmds = _preview_commands(t)
+        dests = [d for d in (_command_destination(t.runner, c) for c in cmds) if d]
+        rows.append({
+            "id": t.id, "label": t.label, "class": t.cls, "runner": t.runner,
+            "severity": t.severity, "threat_class": t.threat_class,
+            "wire_request_count": count, "gated_disabled": is_gated,
+            "flags": list(t.flags), "destinations": dests,
+            "expected_fire": t.expected_fire, "console_hint": t.console_hint_text(),
+            "commands": [_redact(c) for c in cmds],
+        })
+        if is_gated:
+            gated += 1
+            continue
+        enabled += 1
+        signals += count
+        slot = classes.setdefault(t.cls, {"class": t.cls,
+                                          "label": CLASS_LABEL.get(t.cls, t.cls),
+                                          "triggers": 0, "signals": 0})
+        slot["triggers"] += 1
+        slot["signals"] += count
+    return {
+        "profile": "lab" if settings.enable_live_suspect_hosts else "default",
+        "enable_live_suspect_hosts": settings.enable_live_suspect_hosts,
+        "totals": {"triggers_enabled": enabled, "triggers_gated": gated,
+                   "triggers_total": len(triggers), "signals": signals,
+                   "signals_if_gate_enabled": signals_if_gate_on},
+        "classes": [classes[k] for k in classes],
+        "triggers": rows,
+    }
+
+
+def format_signal_manifest(manifest, verbose=False):
+    """Render a signal manifest as presenter-readable text."""
+    t = manifest["totals"]
+    profile = ("LAB — live-suspect gate ON" if manifest["enable_live_suspect_hosts"]
+               else "DEFAULT — live-suspect gate OFF")
+    out = ["SIGNAL MANIFEST — what a full run would put on the wire (nothing is sent)",
+           f"Profile: {profile}", ""]
+    for c in manifest["classes"]:
+        out.append(f"{c['label']}   —   {c['triggers']} triggers, {c['signals']} signals")
+        for r in manifest["triggers"]:
+            if r["class"] != c["class"] or r["gated_disabled"]:
+                continue
+            dest = ", ".join(r["destinations"][:3])
+            if len(r["destinations"]) > 3:
+                dest += f", +{len(r['destinations']) - 3} more"
+            out.append(f"  {r['id']:<22} {r['wire_request_count']:>2} signal(s)  "
+                       f"{r['severity']:<4}  {dest}")
+            if verbose and r["expected_fire"]:
+                out.append(f"  {'':<22}    expect: {r['expected_fire']}")
+            if verbose:
+                for argv in r["commands"]:
+                    out.append(f"  {'':<22}    $ " + " ".join(argv))
+        out.append("")
+    gated = [r for r in manifest["triggers"] if r["gated_disabled"]]
+    if gated:
+        out.append(f"DISABLED — reaches live suspect infrastructure ({len(gated)}): "
+                   + ", ".join(r["id"] for r in gated))
+        out.append("  Enable with enable_live_suspect_hosts in settings.yaml — a lab you control only.")
+        out.append("")
+    out.append(f"TOTAL: {t['signals']} signals across {t['triggers_enabled']} enabled triggers")
+    if t["triggers_gated"]:
+        out.append(f"       {t['signals_if_gate_enabled']} signals if the live-suspect gate is enabled "
+                   f"({t['triggers_total']} triggers)")
+    return "\n".join(out)
+
+
+# ===========================================================================
 # Tkinter console  —  self-contained window (no browser, no local server)
 # ===========================================================================
 # Visual identity mirrored from netvitals: same palette, EKG heartbeat, dark
@@ -1266,6 +1494,7 @@ CLASS_LABEL = {
     "ns-ids":   "NORTH-SOUTH · IDS / IPS",
     "ns-webcc": "NORTH-SOUTH · WEB CATEGORIES & REPUTATION  (SWG)",
     "ns-iprep": "NORTH-SOUTH · IP REPUTATION",
+    "ns-dlp":   "NORTH-SOUTH · DATA LOSS PREVENTION  (content inspection)",
     "ew":       "EAST-WEST",
 }
 
@@ -1353,6 +1582,18 @@ def run_gui(settings, triggers, app, config_dir=None):
         if c:
             c["status"].configure(text=text, fg=fg)
 
+    def copy_text(text, tid=None):
+        """Put text on the system clipboard (Tk-local; no network surface)."""
+        if not text:
+            return
+        try:
+            root.clipboard_clear()
+            root.clipboard_append(text)
+        except tk.TclError:
+            return
+        if tid:
+            _set_status(tid, "verification key copied", GUI_ACCENT)
+
     def set_result(tid, out):
         c = cards.get(tid)
         if not c:
@@ -1371,11 +1612,16 @@ def run_gui(settings, triggers, app, config_dir=None):
             kv.append(f"http={out['http_code']}")
         if out.get("duration_s") is not None:
             kv.append(f"{out['duration_s']}s")
-        if out.get("requests", 1) > 1:
-            kv.append(f"{out['requests']} requests")
+        if out.get("wire_requests", 1) > 1:
+            kv.append(f"{out['wire_requests']} signals")
         c["kv"].configure(text="    ".join(kv))
         c["set_pane"]("cmd", (out.get("stdout") or "").strip())
         c["set_pane"]("flow", (out.get("flow") or "").strip())
+        # The pasteable one-liner that ties this click to a row on the inline console.
+        c["verify_key"] = out.get("verify_key", "")
+        if c["verify_key"]:
+            c["set_pane"]("verify", c["verify_key"] + "\n\n" + (out.get("console_hint") or ""))
+            c["copy"].pack(side="left", padx=6)
         c["fire"].configure(state="normal")
 
     def fire(tid):
@@ -1453,6 +1699,11 @@ def run_gui(settings, triggers, app, config_dir=None):
     meta.pack(side="right", anchor="e")
     tk.Label(meta, text=f"v{__version__}", fg=GUI_DIM, bg=GUI_BG,
              font=(GUI_MONO, 9)).pack(anchor="e")
+    # The known quantity, stated up front: how many signals a full run puts on the wire.
+    enabled_triggers = [t for t in triggers if not t.gated_disabled(settings)]
+    planned_signals = sum(t.on_wire_count(settings) for t in enabled_triggers)
+    tk.Label(meta, text=f"{planned_signals} signals · {len(enabled_triggers)} triggers",
+             fg=GUI_ACCENT, bg=GUI_BG, font=(GUI_MONO, 9, "bold")).pack(anchor="e")
 
     # ---- toolbar ----------------------------------------------------------
     bar = tk.Frame(root, bg=GUI_BG, padx=16)
@@ -1460,6 +1711,9 @@ def run_gui(settings, triggers, app, config_dir=None):
     run_all_btn = _gui_button(bar, "▶  Run all enabled", start_run_all, primary=True)
     run_all_btn.pack(side="left", pady=2)
     stop_btn = _gui_button(bar, "■  Stop", stop_run_all)          # packed only while running
+    preview_btn = _gui_button(bar, "☰  Signal manifest",
+                              lambda: open_manifest_dialog(root, triggers, settings))
+    preview_btn.pack(side="left", padx=6, pady=2)
     upd_btn = _gui_button(bar, "⟳  Check for updates", lambda: open_update_dialog(root))
     upd_btn.pack(side="right", pady=2)
     status_var = tk.StringVar(value="")
@@ -1575,12 +1829,19 @@ def run_gui(settings, triggers, app, config_dir=None):
         if t.threat_class:
             chip(t.threat_class, GUI_DIM, GUI_GRID)
         chip(t.severity, SEV_COLOR.get(t.severity, GUI_DIM), SEV_COLOR.get(t.severity, GUI_GRID))
+        # How many signals THIS trigger puts on the wire (iprep fans out; see on_wire_count).
+        wire_n = t.on_wire_count(settings)
+        chip(f"{wire_n} signal" + ("" if wire_n == 1 else "s"), GUI_DIM, GUI_GRID)
 
         if t.expected_fire:
             tk.Label(body_l2, text=t.expected_fire, fg=GUI_DIM, bg=GUI_SURFACE, font=(GUI_MONO, 9),
                      anchor="w", justify="left", wraplength=820).pack(fill="x", pady=(8, 0))
         if t.talking_point:
             tk.Label(body_l2, text=t.talking_point, fg=GUI_FAINT, bg=GUI_SURFACE, font=(GUI_FONT, 9),
+                     anchor="w", justify="left", wraplength=820).pack(fill="x", pady=(4, 0))
+        hint = t.console_hint_text()
+        if hint:
+            tk.Label(body_l2, text="↳ " + hint, fg=GUI_INFO, bg=GUI_SURFACE, font=(GUI_FONT, 9),
                      anchor="w", justify="left", wraplength=820).pack(fill="x", pady=(4, 0))
 
         actions = tk.Frame(body_l2, bg=GUI_SURFACE)
@@ -1589,6 +1850,8 @@ def run_gui(settings, triggers, app, config_dir=None):
         if disabled:
             fire_btn.configure(state="disabled", text="Disabled (live)")
         fire_btn.pack(side="left")
+        copy_btn = _gui_button(actions, "Copy verification key",
+                               lambda tid=t.id: copy_text(cards[tid].get("verify_key"), tid))
         kv = tk.Label(actions, text="", fg=GUI_DIM, bg=GUI_SURFACE, font=(GUI_MONO, 9))
         kv.pack(side="left", padx=12)
 
@@ -1598,9 +1861,13 @@ def run_gui(settings, triggers, app, config_dir=None):
         # ---- L3: detail panes, each disclosed on demand -------------------
         set_cmd, reset_cmd = _make_pane(body_l2, "command/payload details")
         set_flow, reset_flow = _make_pane(body_l2, "5-tuple details")
+        set_verify, reset_verify = _make_pane(body_l2, "verification key (paste into the console)")
+        panes = {"cmd": set_cmd, "flow": set_flow, "verify": set_verify}
 
         def set_pane(which, text):
-            (set_cmd if which == "cmd" else set_flow)(text)
+            fn = panes.get(which)
+            if fn:
+                fn(text)
 
         if disabled:
             reason.configure(text=("Reaches live suspect infrastructure — enable "
@@ -1622,7 +1889,7 @@ def run_gui(settings, triggers, app, config_dir=None):
             child.bind("<Button-1>", toggle_expand)
 
         cards[t.id] = {"status": status, "reason": reason, "kv": kv, "fire": fire_btn,
-                       "set_pane": set_pane, "runs": 0}
+                       "copy": copy_btn, "set_pane": set_pane, "runs": 0, "verify_key": ""}
 
     order, seen = [], set()
     for t in triggers:
@@ -1665,6 +1932,57 @@ def run_gui(settings, triggers, app, config_dir=None):
         root.update()
         root.after(int(os.environ.get("SECV_RENDER_MS", "300")), _finish)
     root.mainloop()
+
+
+def open_manifest_dialog(root, triggers, settings):
+    """Show the signal manifest — every command a full run WOULD send and the exact
+    signal count — without sending anything. This is the number to put on screen
+    before you fire, so the room knows the quantity up front."""
+    existing = getattr(root, "_secv_manifest_dialog", None)
+    if existing is not None:
+        try:
+            if existing.winfo_exists():
+                existing.lift()
+                existing.focus_set()
+                return
+        except tk.TclError:
+            pass
+
+    manifest = signal_manifest(triggers, settings)
+    body = format_signal_manifest(manifest, verbose=True)
+    totals = manifest["totals"]
+
+    dlg = tk.Toplevel(root)
+    root._secv_manifest_dialog = dlg
+    dlg.title(f"{APP_NAME} — signal manifest")
+    dlg.configure(bg=GUI_BG, padx=16, pady=12)
+    dlg.transient(root)
+
+    tk.Label(dlg, text=f"{totals['signals']} signals across "
+                       f"{totals['triggers_enabled']} enabled triggers",
+             fg=GUI_ACCENT, bg=GUI_BG, font=(GUI_FONT, 14, "bold")).pack(anchor="w")
+    tk.Label(dlg, text="Nothing has been sent — this is the plan.",
+             fg=GUI_DIM, bg=GUI_BG, font=(GUI_FONT, 9)).pack(anchor="w", pady=(2, 8))
+
+    box = tk.Text(dlg, width=104, height=26, bg=GUI_BG, fg=GUI_INK, font=(GUI_MONO, 9),
+                  relief="flat", highlightthickness=1, highlightbackground=GUI_GRID,
+                  wrap="none", padx=8, pady=6)
+    box.insert("1.0", body)
+    box.configure(state="disabled")
+    box.pack(fill="both", expand=True)
+
+    btns = tk.Frame(dlg, bg=GUI_BG)
+    btns.pack(anchor="e", fill="x", pady=(10, 0))
+
+    def copy_all():
+        try:
+            root.clipboard_clear()
+            root.clipboard_append(body)
+        except tk.TclError:
+            pass
+
+    _gui_button(btns, "Close", dlg.destroy).pack(side="right")
+    _gui_button(btns, "Copy", copy_all).pack(side="right", padx=6)
 
 
 def open_update_dialog(root):
@@ -2045,6 +2363,108 @@ def perform_update(manifest_url=UPDATE_MANIFEST_URL, apply=True, pubkey=UPDATE_P
 
 
 # ===========================================================================
+# Headless mode  —  pre-brief validation, and a scriptable proof of the signal set
+# ===========================================================================
+# Runs the SAME App.run + classify() the window does, with no display. Intended for
+# the pre-brief: fire from the customer's network before the meeting and find out that
+# an origin is unreachable or the control probe is down BEFORE you are on stage.
+#
+# Exit codes are deliberately policy-neutral: a `blocked` result is the product
+# working, never a failure. Only a broken environment or a usage/config problem is
+# non-zero.
+HEADLESS_OK, HEADLESS_PROBLEM, HEADLESS_USAGE = 0, 1, 2
+
+
+def select_triggers(triggers, selector, settings):
+    """Resolve a `--run` selector into an ordered trigger list (catalog order).
+
+    `all` (or empty) selects everything, skipping live-suspect-gated triggers exactly
+    as the window's "Run all enabled" does. Otherwise the selector is a comma-separated
+    list of trigger ids and/or class names; an explicitly named trigger is NOT skipped,
+    so asking for a gated one reports its disabled state instead of silently doing
+    nothing. Raises ValueError on an unknown name."""
+    if selector in (None, "", "all"):
+        return [t for t in triggers if not t.gated_disabled(settings)]
+    wanted = [w.strip() for w in str(selector).split(",") if w.strip()]
+    by_id = {t.id: t for t in triggers}
+    classes = {t.cls for t in triggers}
+    unknown = [w for w in wanted if w not in by_id and w not in classes]
+    if unknown:
+        raise ValueError("unknown trigger id or class: " + ", ".join(sorted(set(unknown))))
+    keep = set()
+    for w in wanted:
+        if w in by_id:
+            keep.add(w)
+        else:
+            keep.update(t.id for t in triggers if t.cls == w)
+    return [t for t in triggers if t.id in keep]
+
+
+def run_headless(app, triggers, settings, selector="all", fmt="text", out=None):
+    """Fire the selected triggers with no window and report honestly. Returns the
+    process exit code (see HEADLESS_* above)."""
+    out = sys.stdout if out is None else out
+    try:
+        chosen = select_triggers(triggers, selector, settings)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return HEADLESS_USAGE
+    if not chosen:
+        print("error: that selection matched no runnable triggers", file=sys.stderr)
+        return HEADLESS_USAGE
+
+    planned = sum(t.on_wire_count(settings) for t in chosen)
+    if fmt != "json":
+        print(f"Firing {len(chosen)} triggers — {planned} signals planned.\n", file=out)
+
+    results, counts = [], {}
+    for i, t in enumerate(chosen, 1):
+        _t, res = app.run(t.id, {})
+        state = res.get("state", ERROR)
+        counts[state] = counts.get(state, 0) + 1
+        record = {
+            "id": t.id, "label": t.label, "class": t.cls, "runner": t.runner,
+            "severity": t.severity, "state": state, "reason": res.get("reason", ""),
+            "rc": res.get("rc"), "http_code": res.get("http_code"),
+            "duration_s": res.get("duration_s"),
+            "wire_requests": res.get("wire_requests", t.on_wire_count(settings)),
+            "expected_fire": res.get("expected_fire", ""),
+            "console_hint": res.get("console_hint", ""),
+            "verify_key": res.get("verify_key", ""),
+            "ratio": res.get("ratio"),
+        }
+        results.append(record)
+        if fmt != "json":
+            print(f"[{i:>2}/{len(chosen)}] {t.id:<22} {state:<8} "
+                  f"{record['wire_requests']:>2} signal(s)", file=out)
+            if record["reason"]:
+                print(f"           {record['reason']}", file=out)
+            if record["verify_key"]:
+                print(f"           verify: {record['verify_key']}", file=out)
+
+    problems = counts.get(ERROR, 0) + counts.get(INVALID, 0)
+    fired = sum(r["wire_requests"] for r in results)
+    summary = {
+        "triggers": len(results), "signals": fired,
+        "states": counts, "problems": problems,
+        "profile": "lab" if settings.enable_live_suspect_hosts else "default",
+    }
+    if fmt == "json":
+        json.dump({"summary": summary, "results": results}, out, indent=2)
+        out.write("\n")
+    else:
+        breakdown = " / ".join(f"{n} {s}" for s, n in sorted(counts.items()))
+        print(f"\nSUMMARY: {len(results)} triggers · {fired} signals · {breakdown}", file=out)
+        if problems:
+            print(f"{problems} trigger(s) could not be evaluated (error/invalid) — "
+                  "that is an environment or gating problem, not a policy result.", file=out)
+        else:
+            print("Every trigger produced a policy result. A `blocked` result is the "
+                  "inline stack doing its job.", file=out)
+    return HEADLESS_OK if problems == 0 else HEADLESS_PROBLEM
+
+
+# ===========================================================================
 # Entry point
 # ===========================================================================
 def setup_logging(verbose):
@@ -2063,6 +2483,17 @@ def parse_args(argv):
                    help="check the pinned, signed release source for a newer version and exit")
     p.add_argument("--update", action="store_true",
                    help="verify and install a newer signed release, then exit (fails closed)")
+    p.add_argument("--list", dest="list_triggers", action="store_true",
+                   help="list the trigger catalog and the signal count, then exit (sends nothing)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print the full signal manifest — every command that WOULD be sent "
+                        "and the exact signal count — then exit (sends nothing)")
+    p.add_argument("--run", metavar="SELECTOR",
+                   help="run headless (no window) and exit: 'all', or a comma-separated list "
+                        "of trigger ids and/or classes. Exit 0 even when triggers are blocked; "
+                        "non-zero only for error/invalid or a usage problem")
+    p.add_argument("--format", choices=("text", "json"), default="text",
+                   help="output format for --list / --dry-run / --run (default: text)")
     p.add_argument("--version", action="version", version=f"{APP_NAME} {__version__}")
     return p.parse_args(argv)
 
@@ -2082,9 +2513,24 @@ def main(argv=None):
         log.error("configuration error: %s", e)
         return 2
 
+    # Preview / headless paths: no window, and --list/--dry-run send nothing at all.
+    if args.list_triggers or args.dry_run:
+        manifest = signal_manifest(triggers, settings)
+        if args.format == "json":
+            print(json.dumps(manifest, indent=2))
+        else:
+            print(format_signal_manifest(manifest, verbose=bool(args.dry_run)))
+        return 0
+
     app = App(settings, triggers, args.config_dir)
-    log.info("%s %s — %d triggers, native execution on %s",
-             APP_NAME, __version__, len(triggers), sys.platform)
+    planned = sum(t.on_wire_count(settings) for t in triggers if not t.gated_disabled(settings))
+    log.info("%s %s — %d triggers (%d enabled, %d signals), native execution on %s",
+             APP_NAME, __version__, len(triggers),
+             sum(1 for t in triggers if not t.gated_disabled(settings)), planned, sys.platform)
+
+    if args.run:
+        return run_headless(app, triggers, settings, args.run, args.format)
+
     try:
         run_gui(settings, triggers, app, args.config_dir)
     except RuntimeError as e:

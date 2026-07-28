@@ -719,6 +719,83 @@ def load_ew_targets(settings):
     return out
 
 
+# ===========================================================================
+# Demo profiles  —  curated, ORDERED subsets of the catalog
+# ===========================================================================
+# A profile SELECTS existing triggers; it never defines new ones. That distinction is
+# what keeps the fixed-catalog guarantee intact: a profile is a list of catalog ids and
+# an order to run them in, nothing more. Unknown ids fail loudly at startup rather than
+# half-way through a demo.
+#
+# Order is the point. "Run all" is catalog order; a profile is the order the story wants
+# — which is what turns 55 signals into a five-minute narrative.
+PROFILE_NAME_RE = r"[a-z0-9][a-z0-9\-]{0,31}"
+
+
+@dataclasses.dataclass
+class Profile:
+    name: str
+    label: str
+    description: str
+    trigger_ids: list
+
+    def triggers(self, by_id):
+        """The profile's triggers, in PROFILE order (not catalog order)."""
+        return [by_id[tid] for tid in self.trigger_ids if tid in by_id]
+
+    def on_wire_count(self, by_id, settings):
+        return sum(t.on_wire_count(settings) for t in self.triggers(by_id)
+                   if not t.gated_disabled(settings))
+
+    def to_public(self, by_id, settings):
+        chosen = self.triggers(by_id)
+        gated = [t.id for t in chosen if t.gated_disabled(settings)]
+        return {
+            "name": self.name, "label": self.label, "description": self.description,
+            "triggers": list(self.trigger_ids), "trigger_count": len(chosen),
+            "gated": gated, "signals": self.on_wire_count(by_id, settings),
+        }
+
+
+def load_profiles(settings, triggers):
+    """Read `profiles:` from settings.yaml and validate it against the catalog.
+
+    Every referenced id must exist — a profile that names a trigger the catalog does not
+    have is a configuration error, caught at startup, not a silent no-op on stage."""
+    raw = _dget(settings.raw, "profiles", None)
+    if raw in (None, "", {}):
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError("profiles: must be a mapping of name -> profile")
+    known = {t.id for t in triggers}
+    out = {}
+    for name, body in raw.items():
+        if not isinstance(name, str) or not re.fullmatch(PROFILE_NAME_RE, name):
+            raise ConfigError(f"profiles: invalid profile name {name!r}")
+        if not isinstance(body, dict):
+            raise ConfigError(f"profiles.{name}: must be a mapping")
+        ids = body.get("triggers")
+        if not isinstance(ids, list) or not ids:
+            raise ConfigError(f"profiles.{name}: needs a non-empty 'triggers' list")
+        if not all(isinstance(i, str) for i in ids):
+            raise ConfigError(f"profiles.{name}: every trigger must be a string id")
+        missing = [i for i in ids if i not in known]
+        if missing:
+            raise ConfigError(f"profiles.{name}: unknown trigger id(s) {sorted(set(missing))}")
+        seen, ordered = set(), []
+        for tid in ids:                      # keep first occurrence, drop repeats
+            if tid not in seen:
+                seen.add(tid)
+                ordered.append(tid)
+        out[name] = Profile(
+            name=name,
+            label=str(body.get("label", name)),
+            description=str(body.get("description", "")),
+            trigger_ids=ordered,
+        )
+    return out
+
+
 def load_settings(config_dir):
     path = os.path.join(config_dir, "settings.yaml")
     try:
@@ -2199,6 +2276,26 @@ def signal_manifest(triggers, settings):
     }
 
 
+def format_profiles(profiles, by_id, settings):
+    """The demo profiles on offer, with the exact signal count each one commits to."""
+    if not profiles:
+        return ("No demo profiles are defined. Add a `profiles:` section to "
+                "config/settings.yaml to curate ordered run-sets.")
+    out = ["DEMO PROFILES — curated, ordered run-sets (nothing is sent)", ""]
+    for profile in profiles.values():
+        pub = profile.to_public(by_id, settings)
+        out.append(f"  {profile.name:<18} {pub['signals']:>3} signals across "
+                   f"{pub['trigger_count']} triggers   {profile.label}")
+        if profile.description:
+            out.append(f"  {'':<18} {profile.description}")
+        out.append(f"  {'':<18} order: " + " → ".join(profile.trigger_ids))
+        if pub["gated"]:
+            out.append(f"  {'':<18} gated off right now: " + ", ".join(pub["gated"]))
+        out.append("")
+    out.append("Run one with:  --profile <name> --run all")
+    return "\n".join(out)
+
+
 def format_signal_manifest(manifest, verbose=False):
     """Render a signal manifest as presenter-readable text."""
     t = manifest["totals"]
@@ -2243,6 +2340,100 @@ def format_signal_manifest(manifest, verbose=False):
         out.append(f"       {t['signals_if_gate_enabled']} signals if the live-suspect gate is enabled "
                    f"({t['triggers_total']} triggers)")
     return "\n".join(out)
+
+
+# ===========================================================================
+# Presenter session  —  an ordered walk with a live scoreboard
+# ===========================================================================
+# Deliberately pure: the presenter WINDOW is a thin renderer over this object, so the
+# pacing, the progress arithmetic and the scoreboard are unit-testable without a display.
+#
+# The scoreboard counts what was OBSERVED LOCALLY and says so. It is a running tally of
+# this host's own reads, never a claim about what the customer's stack did.
+class PresenterSession:
+    def __init__(self, triggers, settings, label="", description=""):
+        self.triggers = list(triggers)
+        self.settings = settings
+        self.label = label or "All enabled triggers"
+        self.description = description
+        self.index = 0
+        self.results = {}          # trigger id -> observed state
+
+    # -- position ---------------------------------------------------------
+    @property
+    def total(self):
+        return len(self.triggers)
+
+    @property
+    def current(self):
+        if 0 <= self.index < self.total:
+            return self.triggers[self.index]
+        return None
+
+    @property
+    def done(self):
+        return self.index >= self.total
+
+    def advance(self):
+        if self.index < self.total:
+            self.index += 1
+        return self.current
+
+    def back(self):
+        if self.index > 0:
+            self.index -= 1
+        return self.current
+
+    def goto(self, index):
+        self.index = max(0, min(int(index), self.total))
+        return self.current
+
+    def progress(self):
+        """(position, total) — 1-based for display, clamped at the end."""
+        return (min(self.index + 1, self.total) if self.total else 0, self.total)
+
+    # -- signal accounting ------------------------------------------------
+    def planned_signals(self):
+        return sum(t.on_wire_count(self.settings) for t in self.triggers)
+
+    def fired_signals(self):
+        return sum(t.on_wire_count(self.settings) for t in self.triggers
+                   if t.id in self.results)
+
+    # -- scoreboard -------------------------------------------------------
+    def record(self, trigger_id, state):
+        self.results[trigger_id] = state
+        return state
+
+    def scoreboard(self):
+        """Totals overall and per class, plus the count still to run."""
+        by_state, by_class = {}, {}
+        for t in self.triggers:
+            slot = by_class.setdefault(t.cls, {"label": CLASS_LABEL.get(t.cls, t.cls),
+                                               "total": 0, "fired": 0, "states": {}})
+            slot["total"] += 1
+            state = self.results.get(t.id)
+            if state is None:
+                continue
+            slot["fired"] += 1
+            slot["states"][state] = slot["states"].get(state, 0) + 1
+            by_state[state] = by_state.get(state, 0) + 1
+        return {
+            "label": self.label,
+            "states": by_state,
+            "classes": by_class,
+            "fired": len(self.results),
+            "remaining": self.total - len(self.results),
+            "signals_fired": self.fired_signals(),
+            "signals_planned": self.planned_signals(),
+        }
+
+    def summary_line(self):
+        board = self.scoreboard()
+        parts = " · ".join(f"{n} {s}" for s, n in sorted(board["states"].items()))
+        return (f"{board['fired']}/{self.total} triggers · "
+                f"{board['signals_fired']}/{board['signals_planned']} signals"
+                + (f" · {parts}" if parts else ""))
 
 
 # ===========================================================================
@@ -2337,7 +2528,7 @@ def _gui_button(parent, text, cmd, primary=False):
                      font=(GUI_FONT, 9, "bold"), cursor="hand2")
 
 
-def run_gui(settings, triggers, app, config_dir=None):
+def run_gui(settings, triggers, app, config_dir=None, profiles=None):
     """Build and run the console window. Raises RuntimeError when no display is
     available (headless without Xvfb / no X server)."""
     global tk
@@ -2531,6 +2722,10 @@ def run_gui(settings, triggers, app, config_dir=None):
     preview_btn = _gui_button(bar, "☰  Signal manifest",
                               lambda: open_manifest_dialog(root, triggers, settings))
     preview_btn.pack(side="left", padx=6, pady=2)
+    presenter_btn = _gui_button(
+        bar, "🎤  Presenter mode",
+        lambda: open_presenter_picker(root, app, triggers, settings, profiles))
+    presenter_btn.pack(side="left", padx=6, pady=2)
     report_btn = _gui_button(bar, "⬇  Save report",
                              lambda: open_report_dialog(root, app, triggers, settings))
     report_btn.pack(side="left", padx=6, pady=2)
@@ -2764,6 +2959,235 @@ def run_gui(settings, triggers, app, config_dir=None):
         root.update()
         root.after(int(os.environ.get("SECV_RENDER_MS", "300")), _finish)
     root.mainloop()
+
+
+def open_presenter_picker(root, app, triggers, settings, profiles):
+    """Choose what to present: a curated profile, or everything enabled.
+
+    Each option states its exact signal count up front, so the presenter commits to a
+    number before the room sees any traffic."""
+    existing = getattr(root, "_secv_presenter_picker", None)
+    if existing is not None:
+        try:
+            if existing.winfo_exists():
+                existing.lift()
+                existing.focus_set()
+                return
+        except tk.TclError:
+            pass
+
+    by_id = {t.id: t for t in triggers}
+    dlg = tk.Toplevel(root)
+    root._secv_presenter_picker = dlg
+    dlg.title(f"{APP_NAME} — presenter mode")
+    dlg.configure(bg=GUI_BG, padx=18, pady=14)
+    dlg.transient(root)
+
+    tk.Label(dlg, text="What are we presenting?", fg=GUI_INK, bg=GUI_BG,
+             font=(GUI_FONT, 14, "bold")).pack(anchor="w")
+    tk.Label(dlg, text="Each option runs in its own order and commits to a signal count.",
+             fg=GUI_DIM, bg=GUI_BG, font=(GUI_FONT, 9)).pack(anchor="w", pady=(2, 12))
+
+    def start(session):
+        try:
+            dlg.destroy()
+        except tk.TclError:
+            pass
+        open_presenter_window(root, app, session, settings)
+
+    def add_option(label, description, chosen, name=""):
+        signals = sum(t.on_wire_count(settings) for t in chosen)
+        row = tk.Frame(dlg, bg=GUI_SURFACE, padx=12, pady=10,
+                       highlightbackground=GUI_GRID, highlightthickness=1)
+        row.pack(fill="x", pady=3)
+        head = tk.Frame(row, bg=GUI_SURFACE)
+        head.pack(fill="x")
+        tk.Label(head, text=label, fg=GUI_INK, bg=GUI_SURFACE,
+                 font=(GUI_FONT, 11, "bold")).pack(side="left")
+        tk.Label(head, text=f"{len(chosen)} triggers · {signals} signals", fg=GUI_ACCENT,
+                 bg=GUI_SURFACE, font=(GUI_MONO, 9)).pack(side="right")
+        if description:
+            tk.Label(row, text=description, fg=GUI_FAINT, bg=GUI_SURFACE,
+                     font=(GUI_FONT, 9), anchor="w", justify="left",
+                     wraplength=520).pack(fill="x", pady=(2, 0))
+        session = PresenterSession(chosen, settings, label=label, description=description)
+        btn = _gui_button(row, "Present", lambda s=session: start(s), primary=True)
+        btn.pack(anchor="e", pady=(8, 0))
+        if not chosen:
+            btn.configure(state="disabled", text="Nothing enabled")
+
+    for profile in (profiles or {}).values():
+        chosen = [t for t in profile.triggers(by_id) if not t.gated_disabled(settings)]
+        add_option(profile.label, profile.description, chosen, profile.name)
+    add_option("All enabled triggers", "The full catalog, in catalog order.",
+               [t for t in triggers if not t.gated_disabled(settings)])
+
+    _gui_button(dlg, "Cancel", dlg.destroy).pack(anchor="e", pady=(12, 0))
+
+
+def open_presenter_window(root, app, session, settings):
+    """Big-type, one-trigger-at-a-time presentation with a live scoreboard.
+
+    The scoreboard tallies what THIS HOST observed and says so — it is never a claim
+    about what the customer's stack did. The presenter still reads the verdict on the
+    customer's console; this just keeps the story moving and the count honest."""
+    existing = getattr(root, "_secv_presenter", None)
+    if existing is not None:
+        try:
+            if existing.winfo_exists():
+                existing.lift()
+                existing.focus_set()
+                return
+        except tk.TclError:
+            pass
+
+    win = tk.Toplevel(root)
+    root._secv_presenter = win
+    win.title(f"{APP_NAME} — presenter")
+    win.configure(bg=GUI_BG, padx=28, pady=22)
+    win.transient(root)
+    state = {"busy": False, "outcome": None}
+
+    head = tk.Frame(win, bg=GUI_BG)
+    head.pack(fill="x")
+    tk.Label(head, text=session.label, fg=GUI_ACCENT, bg=GUI_BG,
+             font=(GUI_FONT, 12, "bold")).pack(side="left")
+    progress_var = tk.StringVar(value="")
+    tk.Label(head, textvariable=progress_var, fg=GUI_DIM, bg=GUI_BG,
+             font=(GUI_MONO, 11)).pack(side="right")
+
+    card = tk.Frame(win, bg=GUI_SURFACE, padx=24, pady=20,
+                    highlightbackground=GUI_GRID, highlightthickness=1)
+    card.pack(fill="both", expand=True, pady=(14, 0))
+
+    title_var = tk.StringVar(value="")
+    tk.Label(card, textvariable=title_var, fg=GUI_INK, bg=GUI_SURFACE,
+             font=(GUI_FONT, 22, "bold"), anchor="w", justify="left",
+             wraplength=780).pack(fill="x")
+    expect_var = tk.StringVar(value="")
+    tk.Label(card, textvariable=expect_var, fg=GUI_GOLD, bg=GUI_SURFACE,
+             font=(GUI_MONO, 12), anchor="w", justify="left",
+             wraplength=780).pack(fill="x", pady=(10, 0))
+    talk_var = tk.StringVar(value="")
+    tk.Label(card, textvariable=talk_var, fg=GUI_DIM, bg=GUI_SURFACE,
+             font=(GUI_FONT, 13), anchor="w", justify="left",
+             wraplength=780).pack(fill="x", pady=(12, 0))
+    hint_var = tk.StringVar(value="")
+    tk.Label(card, textvariable=hint_var, fg=GUI_INFO, bg=GUI_SURFACE,
+             font=(GUI_FONT, 10), anchor="w", justify="left",
+             wraplength=780).pack(fill="x", pady=(10, 0))
+
+    result_var = tk.StringVar(value="")
+    result_lbl = tk.Label(card, textvariable=result_var, fg=GUI_INK, bg=GUI_SURFACE,
+                          font=(GUI_FONT, 26, "bold"), anchor="w")
+    result_lbl.pack(fill="x", pady=(18, 0))
+    reason_var = tk.StringVar(value="")
+    tk.Label(card, textvariable=reason_var, fg=GUI_DIM, bg=GUI_SURFACE,
+             font=(GUI_FONT, 10), anchor="w", justify="left",
+             wraplength=780).pack(fill="x", pady=(4, 0))
+
+    board_var = tk.StringVar(value="")
+    tk.Label(win, textvariable=board_var, fg=GUI_INK, bg=GUI_BG, font=(GUI_MONO, 13),
+             anchor="w", justify="left").pack(fill="x", pady=(16, 0))
+    tk.Label(win, text="Observed locally by this host — the inline stack's console is "
+                       "authoritative.", fg=GUI_FAINT, bg=GUI_BG,
+             font=(GUI_FONT, 9)).pack(anchor="w")
+
+    bar = tk.Frame(win, bg=GUI_BG)
+    bar.pack(fill="x", pady=(16, 0))
+
+    def render():
+        pos, total = session.progress()
+        progress_var.set(f"{pos} / {total}   ·   {session.summary_line()}")
+        board_var.set(_presenter_board(session))
+        trigger = session.current
+        if trigger is None:
+            title_var.set("Done.")
+            expect_var.set("")
+            talk_var.set("")
+            hint_var.set("")
+            result_var.set("")
+            reason_var.set("")
+            fire_btn.configure(state="disabled", text="Finished")
+            return
+        title_var.set(trigger.label)
+        expect_var.set(f"Expect: {trigger.expected_fire}" if trigger.expected_fire else "")
+        talk_var.set(trigger.talking_point)
+        hint_var.set("↳ " + trigger.console_hint_text() if trigger.console_hint_text() else "")
+        seen = session.results.get(trigger.id)
+        result_var.set(seen.upper() if seen else "")
+        result_lbl.configure(fg=PRESENTER_STATE_FG.get(seen, GUI_INK))
+        reason_var.set(state.get("reason", "") if seen else "")
+        wire = trigger.on_wire_count(settings)
+        fire_btn.configure(state=("disabled" if state["busy"] else "normal"),
+                           text=("Firing…" if state["busy"]
+                                 else f"Fire  ({wire} signal" + ("" if wire == 1 else "s") + ")"))
+
+    def poll():
+        outcome = state.get("outcome")
+        if outcome is not None:
+            state["outcome"] = None
+            state["busy"] = False
+            tid, out = outcome
+            session.record(tid, out.get("state", ERROR))
+            state["reason"] = out.get("reason", "")
+            render()
+        try:
+            win.after(150, poll)
+        except tk.TclError:
+            pass
+
+    def fire():
+        trigger = session.current
+        if trigger is None or state["busy"]:
+            return
+        state["busy"] = True
+        state["reason"] = ""
+        result_var.set("")
+        render()
+
+        def work():
+            try:
+                _t, out = app.run(trigger.id, {})
+            except Exception as e:                  # a run thread must never die silently
+                out = {"state": ERROR, "reason": f"{e.__class__.__name__}: {e}"}
+            state["outcome"] = (trigger.id, out)
+        threading.Thread(target=work, daemon=True).start()
+
+    def step(delta):
+        if state["busy"]:
+            return
+        session.goto(session.index + delta)
+        state["reason"] = ""
+        render()
+
+    back_btn = _gui_button(bar, "◀  Back", lambda: step(-1))
+    back_btn.pack(side="left")
+    fire_btn = _gui_button(bar, "Fire", fire, primary=True)
+    fire_btn.pack(side="left", padx=8)
+    next_btn = _gui_button(bar, "Next  ▶", lambda: step(1))
+    next_btn.pack(side="left")
+    _gui_button(bar, "Close", win.destroy).pack(side="right")
+
+    render()
+    poll()
+
+
+PRESENTER_STATE_FG = {ALLOWED: GUI_INFO, BLOCKED: GUI_ACCENT, ERROR: GUI_CRIT,
+                      INVALID: GUI_GOLD, RATIO: GUI_WARN}
+
+
+def _presenter_board(session):
+    """The scoreboard line: overall tally, then per class."""
+    board = session.scoreboard()
+    parts = [f"{n} {s}" for s, n in sorted(board["states"].items())] or ["nothing fired yet"]
+    lines = ["   ".join(parts)]
+    for cls, slot in board["classes"].items():
+        if not slot["fired"]:
+            continue
+        detail = " ".join(f"{n} {s}" for s, n in sorted(slot["states"].items()))
+        lines.append(f"   {cls:<10} {slot['fired']}/{slot['total']}   {detail}")
+    return "\n".join(lines)
 
 
 def open_report_dialog(root, app, triggers, settings):
@@ -3311,14 +3735,20 @@ def format_scorecard(rows):
     return "\n".join(out)
 
 
-def select_triggers(triggers, selector, settings):
-    """Resolve a `--run` selector into an ordered trigger list (catalog order).
+def select_triggers(triggers, selector, settings, profile=None):
+    """Resolve a `--run` selector into an ordered trigger list.
 
-    `all` (or empty) selects everything, skipping live-suspect-gated triggers exactly
-    as the window's "Run all enabled" does. Otherwise the selector is a comma-separated
-    list of trigger ids and/or class names; an explicitly named trigger is NOT skipped,
-    so asking for a gated one reports its disabled state instead of silently doing
-    nothing. Raises ValueError on an unknown name."""
+    With a `profile`, the profile's OWN order is used — that ordering is the demo
+    narrative, and catalog order would destroy it. Gated triggers are still skipped.
+
+    Otherwise: `all` (or empty) selects everything in catalog order, skipping
+    live-suspect-gated triggers exactly as the window's "Run all enabled" does. A
+    comma-separated list of trigger ids and/or class names selects those; an explicitly
+    named trigger is NOT skipped, so asking for a gated one reports its disabled state
+    instead of silently doing nothing. Raises ValueError on an unknown name."""
+    if profile is not None:
+        by_id = {t.id: t for t in triggers}
+        return [t for t in profile.triggers(by_id) if not t.gated_disabled(settings)]
     if selector in (None, "", "all"):
         return [t for t in triggers if not t.unavailable_reason(settings)]
     wanted = [w.strip() for w in str(selector).split(",") if w.strip()]
@@ -3337,13 +3767,13 @@ def select_triggers(triggers, selector, settings):
 
 
 def run_headless(app, triggers, settings, selector="all", fmt="text", out=None,
-                 export=None):
+                 export=None, profile=None):
     """Fire the selected triggers with no window and report honestly. Returns the
     process exit code (see HEADLESS_* above). With `export`, the run's evidence ledger
     is also written to that path (format chosen by its extension)."""
     out = sys.stdout if out is None else out
     try:
-        chosen = select_triggers(triggers, selector, settings)
+        chosen = select_triggers(triggers, selector, settings, profile)
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return HEADLESS_USAGE
@@ -3353,6 +3783,8 @@ def run_headless(app, triggers, settings, selector="all", fmt="text", out=None,
 
     planned = sum(t.on_wire_count(settings) for t in chosen)
     if fmt != "json":
+        if profile is not None:
+            print(f"Profile: {profile.label}", file=out)
         print(f"Firing {len(chosen)} triggers — {planned} signals planned.\n", file=out)
 
     results, counts = [], {}
@@ -3386,6 +3818,7 @@ def run_headless(app, triggers, settings, selector="all", fmt="text", out=None,
         "triggers": len(results), "signals": fired,
         "states": counts, "problems": problems,
         "profile": "lab" if settings.enable_live_suspect_hosts else "default",
+        "demo_profile": (profile.name if profile is not None else None),
     }
     exported = None
     if export:
@@ -3444,6 +3877,11 @@ def parse_args(argv):
                         "non-zero only for error/invalid or a usage problem")
     p.add_argument("--format", choices=("text", "json"), default="text",
                    help="output format for --list / --dry-run / --run (default: text)")
+    p.add_argument("--profile", metavar="NAME",
+                   help="scope --list / --dry-run / --run to a named demo profile from "
+                        "settings.yaml, run in the profile's own order")
+    p.add_argument("--profiles", action="store_true",
+                   help="list the demo profiles defined in settings.yaml, then exit")
     p.add_argument("--export", metavar="FILE",
                    help="after --run, write the run evidence to FILE — the extension picks "
                         "the format (.json, .csv, .html). Written to local disk only")
@@ -3465,16 +3903,41 @@ def main(argv=None):
     try:
         settings = load_settings(args.config_dir)
         triggers = load_catalog(args.config_dir, settings)
+        profiles = load_profiles(settings, triggers)
     except ConfigError as e:
         log.error("configuration error: %s", e)
         return 2
 
+    by_id = {t.id: t for t in triggers}
+    if args.profiles:
+        if args.format == "json":
+            print(json.dumps([p.to_public(by_id, settings) for p in profiles.values()],
+                             indent=2))
+        else:
+            print(format_profiles(profiles, by_id, settings))
+        return 0
+
+    profile = None
+    if args.profile:
+        profile = profiles.get(args.profile)
+        if profile is None:
+            known = ", ".join(sorted(profiles)) or "(none defined)"
+            print(f"error: unknown profile {args.profile!r}. Available: {known}",
+                  file=sys.stderr)
+            return 2
+
     # Preview / headless paths: no window, and --list/--dry-run send nothing at all.
     if args.list_triggers or args.dry_run:
-        manifest = signal_manifest(triggers, settings)
+        scope = profile.triggers(by_id) if profile is not None else triggers
+        manifest = signal_manifest(scope, settings)
+        if profile is not None:
+            manifest["demo_profile"] = profile.to_public(by_id, settings)
         if args.format == "json":
             print(json.dumps(manifest, indent=2))
         else:
+            if profile is not None:
+                print(f"Profile: {profile.label}"
+                      + (f" — {profile.description}" if profile.description else ""))
             print(format_signal_manifest(manifest, verbose=bool(args.dry_run)))
         return 0
 
@@ -3501,10 +3964,10 @@ def main(argv=None):
 
     if args.run:
         return run_headless(app, triggers, settings, args.run, args.format,
-                            export=args.export)
+                            export=args.export, profile=profile)
 
     try:
-        run_gui(settings, triggers, app, args.config_dir)
+        run_gui(settings, triggers, app, args.config_dir, profiles)
     except RuntimeError as e:
         log.error("%s", e)
         print(f"{APP_NAME} is a desktop app and needs a display.\n"

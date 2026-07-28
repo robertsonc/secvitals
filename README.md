@@ -72,6 +72,27 @@ find out that an origin is unreachable or the control probe is down while you ca
 fix it. Its exit code is policy-neutral — **0 even when triggers are blocked** (a block is
 the inline stack doing its job); non-zero only for `error`/`invalid` or a usage problem.
 
+### Demo profiles and presenter mode
+
+"Run all" is catalog order — an inventory, not a story. A **profile** is a curated,
+ordered subset with a committed signal count:
+
+```bash
+py secvitals.py --profiles                     # what's available + each one's count
+py secvitals.py --profile exec-5min --list     # the plan for that profile
+py secvitals.py --profile exec-5min --run all  # fire it, in profile order
+```
+
+Five ship in `config/settings.yaml` (`exec-5min`, `ids-story`, `swg-story`,
+`data-protection`, `modern-cve`). A profile only ever **selects** existing catalog ids —
+it never defines a command — and every id is validated at startup, so a typo fails at
+launch rather than on stage.
+
+In the window, **🎤 Presenter mode** walks one trigger at a time in large type: expected
+SID, talking point, where to look on the customer's console, then the observed state and
+a running scoreboard by state and class. See
+[docs/milestones/M2-presenter-experience.md](docs/milestones/M2-presenter-experience.md).
+
 ### Leave something behind
 
 ```bash

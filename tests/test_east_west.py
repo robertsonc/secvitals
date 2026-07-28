@@ -346,3 +346,37 @@ class TestAvailabilityIsConsistent(unittest.TestCase):
         ledger = sv.RunLedger(CONFIG)
         gaps = ledger.coverage_matrix(self.triggers, self.settings)["gaps"]
         self.assertTrue(any(g.startswith("ew /") for g in gaps), gaps)
+
+
+class TestLoadersReturnMappings(unittest.TestCase):
+    """Every config loader must return a mapping, never None.
+
+    Regression guard for a merge hazard that actually bit: load_ew_targets and
+    load_profiles both end with `return out`, and git matched that identical trailing
+    line as shared context between two conflicting hunks — deduplicating it, so
+    load_ew_targets fell off the end and returned None. The failure surfaced far from
+    the cause, as `argument of type 'NoneType' is not iterable` inside
+    Trigger.unconfigured()."""
+
+    def setUp(self):
+        self.settings = sv.load_settings(CONFIG)
+        self.triggers = sv.load_catalog(CONFIG, self.settings)
+
+    def test_loaders_return_dicts_on_the_shipped_config(self):
+        loaders = [("load_ew_targets", (self.settings,)),
+                   ("load_profiles", (self.settings, self.triggers)),
+                   ("load_reputation_feeds", (self.settings,))]
+        for name, args in loaders:
+            fn = getattr(sv, name, None)
+            if fn is None:
+                continue                     # not present on every milestone branch
+            self.assertIsInstance(fn(*args), dict, name)
+
+    def test_ew_targets_round_trip_a_real_definition(self):
+        """An empty result must mean "none configured", not "the loader fell through"."""
+        settings = ew_settings({"t": {"host": "10.0.0.1", "control_port": 443,
+                                      "ports": [445, 3389]}})
+        targets = sv.load_ew_targets(settings)
+        self.assertIsInstance(targets, dict)
+        self.assertIn("t", targets)
+        self.assertEqual(targets["t"].ports, [445, 3389])

@@ -304,3 +304,45 @@ class TestShippedEwCatalog(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAvailabilityIsConsistent(unittest.TestCase):
+    """Every place that asks "can this run?" must use the same broad check.
+
+    A trigger can be unavailable for two different reasons — gated off, or never
+    configured for this site. Anywhere that still asked only `gated_disabled` would
+    treat an unconfigured east-west trigger as runnable: the header would promise
+    signals it cannot fire, the coverage matrix would count it as exercised-able, and
+    its card would look clickable until you clicked it."""
+
+    def setUp(self):
+        self.settings = sv.load_settings(CONFIG)
+        self.triggers = sv.load_catalog(CONFIG, self.settings)
+        self.ew = [t for t in self.triggers if t.cls == "ew"]
+
+    def test_the_shipped_ew_triggers_are_unavailable_but_not_gated(self):
+        self.assertTrue(self.ew)
+        for t in self.ew:
+            self.assertTrue(t.unavailable_reason(self.settings), t.id)
+            self.assertFalse(t.gated_disabled(self.settings), t.id)
+
+    def test_header_signal_count_excludes_them(self):
+        available = [t for t in self.triggers if not t.unavailable_reason(self.settings)]
+        self.assertTrue(all(t.cls != "ew" for t in available))
+        planned = sum(t.on_wire_count(self.settings) for t in available)
+        self.assertEqual(planned, sv.signal_manifest(self.triggers, self.settings)["totals"]["signals"])
+
+    def test_coverage_matrix_does_not_count_them_as_enabled(self):
+        """M1's coverage matrix reports what COULD have been exercised; an unconfigured
+        trigger could not, and saying otherwise would overstate the session."""
+        ledger = sv.RunLedger(CONFIG)
+        cov = ledger.coverage_matrix(self.triggers, self.settings)
+        for cls, threat in ((t.cls, t.threat_class or "(unclassified)") for t in self.ew):
+            cell = cov["cells"][f"{cls}|{threat}"]
+            self.assertGreater(cell["catalog"], 0)
+            self.assertEqual(cell["enabled"], 0, f"{cls}|{threat}")
+
+    def test_coverage_gaps_name_the_unexercised_ew_class(self):
+        ledger = sv.RunLedger(CONFIG)
+        gaps = ledger.coverage_matrix(self.triggers, self.settings)["gaps"]
+        self.assertTrue(any(g.startswith("ew /") for g in gaps), gaps)

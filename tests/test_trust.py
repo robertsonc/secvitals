@@ -150,7 +150,8 @@ class TestCatalogSignature(unittest.TestCase):
                        check=True, capture_output=True)
         subprocess.run(["openssl", "rsa", "-in", priv, "-pubout", "-out", pub],
                        check=True, capture_output=True)
-        pubkey = open(pub, encoding="utf-8").read()
+        with open(pub, encoding="utf-8") as fh:
+            pubkey = fh.read()
         catalog = os.path.join(self.cfg, "catalog.yaml")
         subprocess.run(["openssl", "dgst", "-sha256", "-sign", priv,
                         "-out", catalog + ".sig", catalog], check=True, capture_output=True)
@@ -375,3 +376,42 @@ class TestOriginFailover(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCurlChecksCompose(unittest.TestCase):
+    """M3's transport-capability gate and M5's curl-presence check both shell out to
+    `curl --version`, and both can veto the same trigger. The ordering matters: when
+    curl is missing entirely, the user must be told THAT — not the narrower and
+    misleading "this curl has no HTTP/3 support"."""
+
+    def setUp(self):
+        sv.reset_environment_cache()
+        if hasattr(sv, "reset_capability_cache"):
+            sv.reset_capability_cache()
+
+    def tearDown(self):
+        sv.reset_environment_cache()
+        if hasattr(sv, "reset_capability_cache"):
+            sv.reset_capability_cache()
+
+    @unittest.skipUnless(hasattr(sv, "unmet_requirement"), "M3 capability gate not present")
+    def test_absent_curl_reports_absence_not_a_missing_feature(self):
+        sv.curl_present(_runner=lambda: FakeProc(rc=127))
+        sv.curl_features(_runner=lambda: FakeProc(rc=127))
+        trigger = mk_trigger("h3")
+        trigger.requires = ["http3"]
+        app = sv.App(sv.Settings(raw={"run": {"min_interval_s": 0}}), [trigger], CONFIG)
+        _t, out = app.run("h3", {})
+        self.assertEqual(out["state"], sv.INVALID)
+        self.assertIn("curl was not found", out["reason"])
+        self.assertNotIn("HTTP/3", out["reason"])
+
+    @unittest.skipUnless(hasattr(sv, "unmet_requirement"), "M3 capability gate not present")
+    def test_present_curl_without_http3_still_reports_the_feature_gap(self):
+        sv.curl_present(_runner=lambda: FakeProc(rc=0, stdout=b"curl 8.5.0\n"))
+        sv.curl_features(_runner=lambda: FakeProc(rc=0, stdout=b"Features: HTTP2 SSL\n"))
+        trigger = mk_trigger("h3")
+        trigger.requires = ["http3"]
+        reason = sv.unmet_requirement(trigger, sv.Settings(raw={}))
+        self.assertIn("HTTP/3", reason)
+        self.assertIn("not a policy result", reason)

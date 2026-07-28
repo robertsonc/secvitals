@@ -20,6 +20,11 @@ run:
   # Set control_host to "" to disable.
   control_host: "1.1.1.1"
   control_port: 443
+  # Stamp an X-SecVitals-Run: <run id> header on curl triggers so the customer's console
+  # can be filtered to exactly this run. OFF by default on purpose: it adds a header to
+  # traffic whose whole job is to match a signature faithfully, and it marks that traffic
+  # as synthetic. Turn it on when correlation matters more than fidelity.
+  correlation_header: false
 
   # A SINGLE control host is a single point of failure for the whole blocked-vs-error
   # decision: if the customer's policy happens to deny 1.1.1.1, every native probe drop
@@ -55,6 +60,80 @@ webcc:
   tor_list_ttl_s: 3600
   ip_rep_sample: 6                # probe the first N well-formed relay IPs
   node_probe_timeout_s: 5
+
+# Demo profiles — curated, ORDERED subsets of the catalog.
+#
+# A profile only ever SELECTS existing catalog ids; it never defines a command, so the
+# fixed-catalog guarantee is untouched. Order matters: it is the order the story wants,
+# which is what turns a 55-signal "run all" into a five-minute narrative. Every id is
+# validated against the catalog at startup — a typo fails loudly here, not on stage.
+profiles:
+  exec-5min:
+    label: "5-minute exec demo"
+    description: "One signal per control, worst-first. The short story."
+    # NB: the vendored YAML loader supports block sequences and SINGLE-LINE flow
+    # sequences, but not a [...] list wrapped across lines. Use the block form below.
+    triggers:
+      - ns-uid
+      - ns-c2
+      - web-rep-phishing-gsb
+      - web-cat-social
+      - dlp-pan
+
+  ids-story:
+    label: "IDS/IPS deep dive"
+    description: "Recon, then policy, then malware and C2 — the escalation narrative."
+    triggers:
+      - ns-uid
+      - ns-sshscan
+      - ns-iplookup
+      - ns-basicauth
+      - ns-shortener
+      - ns-peexe
+      - ns-malua
+      - ns-log4shell
+      - ns-c2
+
+  swg-story:
+    label: "Secure Web Gateway deep dive"
+    description: "Acceptable-use categories first, then the threat categories."
+    triggers:
+      - web-cat-social
+      - web-cat-streaming
+      - web-cat-gambling
+      - web-cat-genai
+      - web-cat-webmail
+      - web-cat-proxy
+      - web-rep-malware-gsb
+      - web-rep-phishing-gsb
+      - web-rep-eicar
+
+  data-protection:
+    label: "Data protection (DLP)"
+    description: "Synthetic PII, then credentials — cleartext so DLP can read it."
+    triggers:
+      - dlp-pan
+      - dlp-ssn
+      - dlp-secrets
+      - ns-anonfile
+
+  modern-cve:
+    label: "Modern exploit signatures"
+    description: "The marquee CVEs a customer expects their IPS to catch."
+    triggers:
+      - ns-log4shell
+      - ns-shellshock
+      - ns-spring4shell
+      - ns-scanner-ua
+
+evidence:
+  # Run evidence — the hash-chained ledger behind "Save report", --export, and
+  # --last-session. LOCAL DISK ONLY: nothing is uploaded, there is still no listening
+  # socket, and no telemetry of any kind is sent.
+  log: true
+  # Where evidence lands. Empty = the per-user default
+  # (%LOCALAPPDATA%\SecVitals\runs on Windows, ~/.local/share/secvitals/runs elsewhere).
+  dir: ""
 
 update:
   # Pinned, non-overridable release source. The updater fails CLOSED without a valid

@@ -303,7 +303,7 @@ class TestOriginFailover(unittest.TestCase):
         calls = []
         original = sv._run_curl
 
-        def fake(argv, timeout):
+        def fake(argv, timeout, run_id=None):
             calls.append(argv)
             host, _ = sv._url_endpoint(argv)
             if host == "origin.example":
@@ -324,8 +324,8 @@ class TestOriginFailover(unittest.TestCase):
         calls = []
         original = sv._run_curl
         try:
-            sv._run_curl = lambda argv, timeout: (calls.append(argv)
-                                                  or sv.SubResult(argv=argv, rc=28))
+            sv._run_curl = lambda argv, timeout, run_id=None: (
+                calls.append(argv) or sv.SubResult(argv=argv, rc=28))
             sub = sv._run_curl_with_failover(["curl", "http://origin.example/x"], 5, settings)
         finally:
             sv._run_curl = original
@@ -337,12 +337,33 @@ class TestOriginFailover(unittest.TestCase):
         settings = sv.Settings(raw={"run": {"origin_failover": {"origin.example": "alt.example"}}})
         original = sv._run_curl
         try:
-            sv._run_curl = lambda argv, timeout: sv.SubResult(argv=argv, rc=6)
+            sv._run_curl = lambda argv, timeout, run_id=None: sv.SubResult(argv=argv, rc=6)
             sub = sv._run_curl_with_failover(["curl", "http://origin.example/x"], 5, settings)
         finally:
             sv._run_curl = original
         self.assertEqual(sub.rc, 6)
         self.assertEqual(sub.failover_from, "")   # nothing to claim
+
+    def test_correlation_run_id_survives_the_failover(self):
+        """A console filtered on X-SecVitals-Run must still see the retried request —
+        otherwise correlation goes blind precisely when the alternate origin is used."""
+        settings = sv.Settings(raw={"run": {"origin_failover": {"origin.example": "alt.example"}}})
+        seen = []
+        original = sv._run_curl
+
+        def fake(argv, timeout, run_id=None):
+            seen.append(run_id)
+            host, _ = sv._url_endpoint(argv)
+            if host == "origin.example":
+                return sv.SubResult(argv=argv, rc=6)
+            return sv.SubResult(argv=argv, rc=0, http_code=200)
+        try:
+            sv._run_curl = fake
+            sv._run_curl_with_failover(["curl", "http://origin.example/x"], 5, settings,
+                                       "abc123")
+        finally:
+            sv._run_curl = original
+        self.assertEqual(seen, ["abc123", "abc123"])   # both attempts carry it
 
     def test_failover_is_visible_in_the_details(self):
         sub = sv.SubResult(argv=["curl", "http://alt.example/x"], rc=0, http_code=200,

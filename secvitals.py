@@ -42,7 +42,7 @@ import time
 import urllib.error
 import urllib.request
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 APP_NAME = "Security Vitals"
 
 log = logging.getLogger("secvitals")
@@ -396,6 +396,14 @@ class Settings:
         return float(_dget(self.raw, "run.min_interval_s", 0.75))
 
     @property
+    def ipv6_control_url(self):
+        """Known-good IPv6 endpoint used to tell "this host has no IPv6" apart from
+        "the customer's policy dropped it". An address literal, so the answer does not
+        depend on DNS returning AAAA. Empty disables IPv6 triggers (they report error)."""
+        return str(_dget(self.raw, "run.ipv6_control_url",
+                         "https://[2606:4700:4700::1111]/") or "").strip()
+
+    @property
     def evidence_log_enabled(self):
         # Append each run to a local JSONL evidence log. Local disk only — there is
         # still no network surface and nothing is uploaded.
@@ -445,6 +453,7 @@ class Trigger:
     params: list
     timeout: float
     console_hint: str = ""      # optional "where to look on the inline console"
+    requires: list = dataclasses.field(default_factory=list)   # transports this needs
 
     @staticmethod
     def from_dict(d, default_timeout):
@@ -485,6 +494,10 @@ class Trigger:
         _validate_predicate(tid, "expected_on_block", block)
         params = d.get("params") or []
         _validate_params(tid, params, commands)
+        requires = d.get("requires") or []
+        if not isinstance(requires, list) or any(r not in REQUIREMENTS for r in requires):
+            raise ConfigError(f"{tid}: requires must be a subset of {sorted(REQUIREMENTS)}, "
+                              f"got {requires!r}")
         hint = d.get("console_hint", "")
         if not isinstance(hint, str):
             raise ConfigError(f"{tid}: console_hint must be a string")
@@ -506,6 +519,7 @@ class Trigger:
             params=params,
             timeout=float(d.get("timeout_s", default_timeout)),
             console_hint=hint,
+            requires=list(requires),
         )
 
     def gated_disabled(self, settings):
@@ -540,6 +554,7 @@ class Trigger:
             "expected_fire": self.expected_fire,
             "talking_point": self.talking_point,
             "console_hint": self.console_hint_text(),
+            "requires": list(self.requires),
             "request_count": len(self.commands),
             "wire_request_count": self.on_wire_count(settings),
             "params": [{"name": p["name"],
@@ -709,6 +724,18 @@ def load_catalog(config_dir, settings):
             raise ConfigError(f"duplicate trigger id: {t.id}")
         seen.add(t.id)
         triggers.append(t)
+    # An iprep trigger names a reputation feed. Resolve it now so a typo fails at
+    # startup rather than at click time, in front of a customer.
+    feeds = load_reputation_feeds(settings)
+    for t in triggers:
+        if t.runner != "iprep":
+            continue
+        cmd = t.commands[0] if t.commands else ["iprep"]
+        name = cmd[1] if len(cmd) > 1 else "tor"
+        if name not in feeds:
+            known = ", ".join(sorted(feeds)) or "(none configured)"
+            raise ConfigError(f"{t.id}: unknown reputation feed {name!r} — "
+                              f"configured feeds: {known}")
     return triggers
 
 
@@ -721,8 +748,8 @@ def _quiet_remove(path):
         pass
 
 
-class TorNodeCache:
-    """Fetch + cache the Tor relay IP list with a TTL — not refetched on every click."""
+class IpFeedCache:
+    """Fetch + cache one IP-reputation feed with a TTL — not refetched on every click."""
 
     def __init__(self, url, ttl):
         self.url = url
@@ -732,7 +759,7 @@ class TorNodeCache:
         self._fetched_at = 0.0
 
     def get(self):
-        """Return a list of relay IPv4 strings. Raises urllib/OSError on fetch failure
+        """Return a list of IPv4 strings. Raises urllib/OSError on fetch failure
         (the caller maps that to `error`)."""
         with self._lock:
             now = time.monotonic()
@@ -744,21 +771,78 @@ class TorNodeCache:
 
     def _fetch(self):
         if not self.url.lower().startswith("https:"):
-            raise OSError(f"tor_list_url must be https, got {self.url!r}")
+            raise OSError(f"reputation feed url must be https, got {self.url!r}")
         req = urllib.request.Request(self.url, headers={"User-Agent": "secvitals/%s" % __version__})
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = resp.read(8 * 1024 * 1024).decode("utf-8", "replace")
-        return _parse_tor_ips(data)
+        return _parse_ip_list(data)
 
 
-def _parse_tor_ips(text):
-    """Extract well-formed IPv4 addresses from the node list, skipping comments/junk."""
+TorNodeCache = IpFeedCache          # the pre-M3 name, kept so nothing external breaks
+
+
+def _parse_ip_list(text):
+    """Extract well-formed IPv4 addresses from a feed, skipping comments and junk.
+
+    Deliberately strict: a line must be exactly an address. Feeds carry comment headers,
+    CIDR ranges and timestamps, and guessing at those would put traffic somewhere the
+    operator never authorised."""
     out = []
     for line in (text or "").splitlines():
         ip = line.strip()
         if re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", ip) and all(0 <= int(o) <= 255 for o in ip.split(".")):
             out.append(ip)
     return out
+
+
+_parse_tor_ips = _parse_ip_list     # the pre-M3 name
+
+
+# ---------------------------------------------------------------------------
+# IP-reputation feeds. Each is a named, pinned https list of addresses plus the port to
+# probe. A catalog trigger names a feed with a FIXED token (["iprep", "<feed>"]) — never
+# a URL — so a trigger can only ever reach a destination an operator put in settings.
+@dataclasses.dataclass
+class ReputationFeed:
+    name: str
+    label: str
+    url: str
+    port: int
+    ttl: float
+
+
+def load_reputation_feeds(settings):
+    """Feeds from settings, with the historical Tor feed always present as `tor` so
+    existing installs keep working unchanged."""
+    feeds = {}
+    if settings.tor_list_url:
+        feeds["tor"] = ReputationFeed(name="tor", label="Tor Proxy nodes",
+                                      url=settings.tor_list_url, port=443,
+                                      ttl=settings.tor_list_ttl)
+    raw = _dget(settings.raw, "webcc.reputation_feeds", None)
+    if raw in (None, "", {}):
+        return feeds
+    if not isinstance(raw, dict):
+        raise ConfigError("webcc.reputation_feeds must be a mapping of name -> feed")
+    for name, body in raw.items():
+        if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9\-]{0,31}", name):
+            raise ConfigError(f"webcc.reputation_feeds: invalid feed name {name!r}")
+        if not isinstance(body, dict):
+            raise ConfigError(f"webcc.reputation_feeds.{name}: must be a mapping")
+        url = str(body.get("url", "") or "").strip()
+        if not url.lower().startswith("https:"):
+            raise ConfigError(f"webcc.reputation_feeds.{name}: url must be https")
+        try:
+            port = int(body.get("port", 443))
+        except (TypeError, ValueError):
+            raise ConfigError(f"webcc.reputation_feeds.{name}: port must be an integer") from None
+        if not 1 <= port <= 65535:
+            raise ConfigError(f"webcc.reputation_feeds.{name}: port out of range")
+        feeds[name] = ReputationFeed(
+            name=name, label=str(body.get("label", name)), url=url, port=port,
+            ttl=float(body.get("ttl_s", settings.tor_list_ttl)),
+        )
+    return feeds
 
 
 # ===========================================================================
@@ -948,6 +1032,100 @@ def build_command(template, resolved):
     return argv
 
 
+# ===========================================================================
+# Transport capability  —  so an absent transport reads as `error`, never `blocked`
+# ===========================================================================
+# IPv6 and HTTP/3 twins are how you find a policy blind spot: a control that inspects
+# IPv4/TCP-443 and quietly ignores IPv6 or QUIC. But they introduce a specific way to
+# LIE. If this host has no IPv6 route, `curl -6` exits 7 — which the classifier maps to
+# `blocked`, and the demo would claim the customer's stack dropped traffic it never saw.
+# Same for `--http3` on a curl built without HTTP/3.
+#
+# So a trigger declares what it needs (`requires: [ipv6]`), and the requirement is
+# checked BEFORE the trigger runs. Unmet requirement => `error` with a plain reason.
+# Never `blocked`.
+REQUIREMENTS = {"ipv6", "http3"}
+
+_CAPS = {"features": None, "ipv6": None, "ipv6_at": 0.0}
+_CAPS_LOCK = threading.Lock()
+_IPV6_TTL = 300.0          # re-probe occasionally; a laptop changes networks
+
+
+def curl_features(_runner=None):
+    """The feature words from `curl --version`, lowercased. Cached for the process —
+    the curl binary does not change under us. Returns an empty set if curl is missing."""
+    with _CAPS_LOCK:
+        if _CAPS["features"] is not None:
+            return _CAPS["features"]
+    run = _runner or (lambda: subprocess.run(["curl", "--version"], capture_output=True,
+                                             timeout=10, check=False))
+    features = set()
+    try:
+        proc = run()
+        for line in _dec(proc.stdout).splitlines():
+            if line.lower().startswith("features:"):
+                features = {w.strip().lower() for w in line.split(":", 1)[1].split() if w.strip()}
+                break
+    except (OSError, subprocess.SubprocessError):
+        features = set()
+    with _CAPS_LOCK:
+        _CAPS["features"] = features
+    return features
+
+
+def ipv6_egress_ok(settings, _runner=None):
+    """True iff this host can actually reach the internet over IPv6.
+
+    Probes a literal IPv6 address so the answer does not depend on DNS returning AAAA.
+    `-k` because we only care whether packets get there, not who answered. Cached
+    briefly: an SE laptop moves between networks."""
+    now = time.monotonic()
+    with _CAPS_LOCK:
+        if _CAPS["ipv6"] is not None and (now - _CAPS["ipv6_at"]) < _IPV6_TTL:
+            return _CAPS["ipv6"]
+    url = settings.ipv6_control_url
+    if not url:
+        return None                     # not configured: caller decides (=> error)
+    argv = ["curl", "-6", "-s", "-S", "-k", "-o", os.devnull,
+            "--connect-timeout", "5", "--max-time", "8", url]
+    run = _runner or (lambda: subprocess.run(argv, capture_output=True, timeout=15,
+                                             check=False))
+    try:
+        ok = run().returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        ok = False
+    with _CAPS_LOCK:
+        _CAPS["ipv6"], _CAPS["ipv6_at"] = ok, now
+    return ok
+
+
+def reset_capability_cache():
+    """Forget cached capability answers (tests, and a deliberate re-probe)."""
+    with _CAPS_LOCK:
+        _CAPS["features"], _CAPS["ipv6"], _CAPS["ipv6_at"] = None, None, 0.0
+
+
+def unmet_requirement(trigger, settings):
+    """The reason this trigger CANNOT be evaluated here, or None if it can.
+
+    Returning a reason produces `error` — an honest "we could not test this" — rather
+    than a `blocked` that would credit the customer's stack with a drop it never made."""
+    for need in trigger.requires:
+        if need == "http3":
+            if "http3" not in curl_features():
+                return ("this curl has no HTTP/3 support, so QUIC cannot be tested here "
+                        "(not a policy result)")
+        elif need == "ipv6":
+            ok = ipv6_egress_ok(settings)
+            if ok is None:
+                return ("IPv6 cannot be tested: no run.ipv6_control_url is configured, so "
+                        "a failure could not be told apart from a policy block")
+            if not ok:
+                return ("this host has no working IPv6 egress, so an IPv6 trigger proves "
+                        "nothing about policy (not a policy result)")
+    return None
+
+
 def run_trigger(trigger, params, settings, run_id=None):
     """Run every command of one trigger natively and return a RunResult. Never raises for
     expected failure modes — those become per-request error_reason (→ `error`)."""
@@ -955,6 +1133,11 @@ def run_trigger(trigger, params, settings, run_id=None):
         resolved = _resolve_params(trigger, params)
     except ParamError as e:
         return RunResult(error_reason=f"invalid parameters: {e}")
+
+    # A transport this host cannot use is an ERROR, never a block (see unmet_requirement).
+    unmet = unmet_requirement(trigger, settings)
+    if unmet:
+        return RunResult(error_reason=unmet)
 
     start = time.monotonic()
     subs, need_control = [], False
@@ -1005,17 +1188,33 @@ def _run_curl(argv, timeout, run_id=None):
                      stdout=out, stderr=_dec(proc.stderr), flow=flow)
 
 
+# DNS query types the built-in probe can ask for. TXT and NULL matter because that is
+# what DNS tunnelling actually uses — an A-record probe would not reproduce the shape a
+# tunnelling signature looks for.
+DNS_QTYPES = {"A": 1, "NS": 2, "CNAME": 5, "MX": 15, "TXT": 16, "AAAA": 28, "NULL": 10,
+              "SRV": 33, "ANY": 255}
+
+
 def _run_dns(argv, timeout):
-    """`dns` command: ["dns", "<name>", "@<server>"] — a native A-record query."""
-    qname, server = None, "8.8.8.8"
+    """`dns` command: ["dns", "<name>", "@<server>", "type=TXT"] — a native DNS query.
+
+    The `type=` token is optional and defaults to A; it is matched against a fixed
+    allowlist, so it can never become an arbitrary value."""
+    qname, server, qtype = None, "8.8.8.8", "A"
     for a in argv[1:]:
         if a.startswith("@"):
             server = a[1:] or server
+        elif a.lower().startswith("type="):
+            qtype = a.split("=", 1)[1].strip().upper()
         elif qname is None:
             qname = a
     if not qname:
         return SubResult(argv=argv, error_reason="dns: no query name in command")
-    ok, detail, err, flow = _dns_query(qname, server, min(float(timeout), 8.0))
+    if qtype not in DNS_QTYPES:
+        return SubResult(argv=argv,
+                         error_reason=f"dns: unsupported query type {qtype!r} "
+                                      f"(allowed: {', '.join(sorted(DNS_QTYPES))})")
+    ok, detail, err, flow = _dns_query(qname, server, min(float(timeout), 8.0), qtype)
     if err:
         return SubResult(argv=argv, ok=False, error_reason=err, flow=flow)
     return SubResult(argv=argv, ok=ok, stdout=detail, flow=flow)
@@ -1054,15 +1253,22 @@ def _sock_flow(sock, proto, host, dst_ip="", dst_port=""):
     return _flow(proto, src_ip, src_port, dst_ip, dst_port, host)
 
 
-def _dns_query(qname, server="8.8.8.8", timeout=5.0):
-    """Send a minimal DNS A-query over UDP and wait for a response. Returns
+def _dns_query(qname, server="8.8.8.8", timeout=5.0, qtype="A"):
+    """Send a minimal DNS query over UDP and wait for a response. Returns
     (ok, detail, err, flow): ok True if ANY response came back (the query crossed the wire
     and the resolver was reachable), ok False on timeout (no response — possibly a policy
-    drop), err set only for a local/environment failure."""
+    drop), err set only for a local/environment failure.
+
+    NB an NXDOMAIN still counts as ok: the question crossed the wire, which is exactly
+    what a DNS signature inspects. Whether the name resolves is beside the point."""
+    qcode = DNS_QTYPES.get(str(qtype).upper(), 1)
     try:
         labels = qname.rstrip(".").split(".")
+        if any(len(p.encode("ascii")) > 63 for p in labels):
+            return (False, "", f"dns: label longer than 63 bytes in {qname!r}", None)
         q = b"".join(bytes([len(p)]) + p.encode("ascii") for p in labels) + b"\x00"
-        packet = struct.pack(">HHHHHH", 0x1337, 0x0100, 1, 0, 0, 0) + q + struct.pack(">HH", 1, 1)
+        packet = (struct.pack(">HHHHHH", 0x1337, 0x0100, 1, 0, 0, 0) + q
+                  + struct.pack(">HH", qcode, 1))
     except (UnicodeError, ValueError) as e:
         return (False, "", f"dns: bad query name {qname!r}: {e}", None)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1074,10 +1280,10 @@ def _dns_query(qname, server="8.8.8.8", timeout=5.0):
         data, _ = sock.recvfrom(4096)
         rcode = data[3] & 0x0F if len(data) >= 4 else -1
         answers = struct.unpack(">H", data[6:8])[0] if len(data) >= 8 else 0
-        return (True, f"DNS {qname} @{server}: response (rcode={rcode}, answers={answers})",
-                None, flow)
+        return (True, f"DNS {qname} {qtype} @{server}: response "
+                      f"(rcode={rcode}, answers={answers})", None, flow)
     except socket.timeout:
-        return (False, f"DNS {qname} @{server}: no response (timeout)", None, flow)
+        return (False, f"DNS {qname} {qtype} @{server}: no response (timeout)", None, flow)
     except OSError as e:
         return (False, "", f"dns: {e}", flow)
     finally:
@@ -1720,11 +1926,24 @@ class App:
         self.triggers = triggers
         self.by_id = {t.id: t for t in triggers}
         self.config_dir = config_dir
-        self.tor_cache = TorNodeCache(settings.tor_list_url, settings.tor_list_ttl)
+        self.feeds = load_reputation_feeds(settings)
+        self._feed_caches = {}
+        self._feed_lock = threading.Lock()
+        # the pre-M3 attribute, still the Tor feed's cache
+        self.tor_cache = self.feed_cache(self.feeds["tor"]) if "tor" in self.feeds else None
         self._run_lock = threading.Lock()   # serialize triggers — clean before/after on stage
         self._last_run_end = 0.0            # rate limiting between runs
         self.ledger = ledger if ledger is not None else RunLedger(config_dir)
         self.evidence_path = os.path.join(evidence_dir(settings), "evidence.jsonl")
+
+    def feed_cache(self, feed):
+        """One cache per feed URL, shared across runs so a click never refetches."""
+        with self._feed_lock:
+            cache = self._feed_caches.get(feed.url)
+            if cache is None:
+                cache = IpFeedCache(feed.url, feed.ttl)
+                self._feed_caches[feed.url] = cache
+            return cache
 
     def run(self, trigger_id, params):
         """Fire one trigger and record it. Every outcome — including `invalid` and
@@ -1790,6 +2009,14 @@ class App:
         then connect to the first N Tor nodes on :443 and report a RATIO (never a single
         verdict). Called while the run lock is held."""
         s = self.settings
+        # The catalog names a feed with a fixed token; it can never carry a URL.
+        cmd = trigger.commands[0] if trigger.commands else ["iprep"]
+        feed_name = cmd[1] if len(cmd) > 1 else "tor"
+        feed = self.feeds.get(feed_name)
+        if feed is None:
+            known = ", ".join(sorted(self.feeds)) or "(none configured)"
+            return {"state": ERROR, "expected_fire": trigger.expected_fire,
+                    "reason": f"unknown reputation feed {feed_name!r} — configured: {known}"}
         if not s.control_enabled:
             return {"state": ERROR, "expected_fire": trigger.expected_fire,
                     "reason": "IP reputation needs a control probe — set run.control_host"}
@@ -1798,31 +2025,32 @@ class App:
                     "reason": (f"control probe to {s.control_host}:{s.control_port} failed — "
                                "egress is broken, so the whole test is invalid (not blocked)")}
         try:
-            nodes = self.tor_cache.get()
+            nodes = self.feed_cache(feed).get()
         except (urllib.error.URLError, OSError, ValueError) as e:
             return {"state": ERROR, "expected_fire": trigger.expected_fire,
-                    "reason": f"could not fetch the Tor node list: {e}"}
+                    "reason": f"could not fetch the {feed.label} feed: {e}"}
         sample = nodes[:max(1, s.ip_rep_sample)]
         if not sample:
             return {"state": ERROR, "expected_fire": trigger.expected_fire,
-                    "reason": "the Tor node list was empty"}
+                    "reason": f"the {feed.label} feed was empty"}
         blocked = reached = 0
         details, flows = [], []
         for ip in sample:
-            ok, flow = _tcp_probe_flow(ip, 443, s.node_probe_timeout)
+            ok, flow = _tcp_probe_flow(ip, feed.port, s.node_probe_timeout)
             flows.append(flow)
             if ok:
                 reached += 1
-                details.append(f"{ip}:443  reached  (not blocked by IP reputation)")
+                details.append(f"{ip}:{feed.port}  reached  (not blocked by IP reputation)")
             else:
                 blocked += 1
-                details.append(f"{ip}:443  blocked  (timeout/reset)")
+                details.append(f"{ip}:{feed.port}  blocked  (timeout/reset)")
         return {
             "state": RATIO,
             "ratio": {"blocked": blocked, "reached": reached, "total": len(sample)},
-            "reason": (f"{blocked} of {len(sample)} Tor nodes blocked by IP reputation "
-                       "(control OK). A ratio, not a single verdict — a lone reach may be a "
-                       "live relay; the inline IP-reputation stats are authoritative."),
+            "reason": (f"{blocked} of {len(sample)} {feed.label} addresses blocked by IP "
+                       "reputation (control OK). A ratio, not a single verdict — a lone "
+                       "reach may be a live host and a lone block may be an offline one; "
+                       "the inline IP-reputation stats are authoritative."),
             "expected_fire": trigger.expected_fire,
             "console_hint": trigger.console_hint_text(),
             "verify_key": verification_key(trigger, f"{blocked}/{len(sample)} blocked", flows),

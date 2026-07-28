@@ -26,6 +26,31 @@ run:
   # as synthetic. Turn it on when correlation matters more than fidelity.
   correlation_header: false
 
+  # A SINGLE control host is a single point of failure for the whole blocked-vs-error
+  # decision: if the customer's policy happens to deny 1.1.1.1, every native probe drop
+  # degrades to `error` and real blocks are masked. List several and egress counts as up
+  # if ANY answers. `kind` is tcp (default) or dns, so a DNS trigger can be checked with
+  # a DNS control — a network that permits DNS while denying TCP/443 would otherwise
+  # produce a false `error`. Falls back to control_host/control_port above when unset.
+  control_endpoints:
+    - {host: "1.1.1.1", port: 443, kind: tcp}
+    - {host: "9.9.9.9", port: 443, kind: tcp}
+    - {host: "8.8.8.8", port: 53, kind: dns}
+
+  # Refuse to start unless config/catalog.yaml carries a valid signature. Default false
+  # so existing unsigned installs keep working; the status is always reported either way.
+  # Sign with tools/sign_catalog.sh. Also available as --strict-catalog.
+  strict_catalog: false
+
+  # ERROR-ONLY origin failover: origin host -> alternate host, applied ONLY when a
+  # request honestly ERRORS (DNS/TLS failure) and NEVER past a blocked or allowed result.
+  # EMPTY BY DEFAULT, deliberately. It preserves signal count when an origin is down, but
+  # it also changes what is on the wire: an alternate that does not serve the same
+  # content can turn a real signal into a benign request that trips nothing. Enable it
+  # only with an alternate you control and have checked. Any result reached this way is
+  # marked ORIGIN FAILOVER in the details.
+  origin_failover: {}
+
 webcc:
   # IP-reputation (ns-iprep) probes live Tor relays. The node list is cached with a TTL
   # (not refetched per click). Before probing, a control egress probe (run.control_host)

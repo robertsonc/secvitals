@@ -176,6 +176,23 @@ originating awkward traffic. Enable them only in a lab you control:
 enable_live_suspect_hosts: true
 ```
 
+### Pre-flight and catalog provenance
+
+```bash
+py secvitals.py --preflight        # can this console run its triggers from here?
+py secvitals.py --strict-catalog   # refuse to start unless the catalog is signed
+```
+
+`--preflight` checks curl, egress control, and the catalog signature. It is a **readiness
+gate only** — it says nothing about whether any trigger will be allowed or blocked.
+
+The update channel authenticates `secvitals.py` but not the catalog, and the catalog is
+what decides where traffic goes. Sign it with `tools/sign_catalog.sh`; the status
+(**verified** / **unsigned** / **modified**) is reported on every start. Unsigned is
+reported rather than refused so existing installs keep working — use `--strict-catalog`
+to require it. See
+[docs/milestones/M5-trust-and-robustness.md](docs/milestones/M5-trust-and-robustness.md).
+
 ## Security posture
 
 Because this console executes local commands, it is built defensively:

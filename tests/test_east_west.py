@@ -380,3 +380,24 @@ class TestLoadersReturnMappings(unittest.TestCase):
         self.assertIsInstance(targets, dict)
         self.assertIn("t", targets)
         self.assertEqual(targets["t"].ports, [445, 3389])
+
+
+class TestGateOnTotalIsNotOverstated(unittest.TestCase):
+    """The "if the gate were enabled" line must count only what the GATE can unlock.
+
+    Unconfigured east-west triggers are not gated — no setting of
+    enable_live_suspect_hosts makes them runnable — so including them in that figure
+    would promise signals that flipping the gate cannot deliver."""
+
+    def test_headline_matches_what_the_lab_profile_actually_runs(self):
+        settings = sv.load_settings(CONFIG)
+        triggers = sv.load_catalog(CONFIG, settings)
+        text = sv.format_signal_manifest(sv.signal_manifest(triggers, settings))
+        gate_line = [ln for ln in text.splitlines() if "gate is enabled" in ln][0]
+
+        lab = sv.Settings(raw=dict(settings.raw, enable_live_suspect_hosts=True))
+        lab_totals = sv.signal_manifest(triggers, lab)["totals"]
+        self.assertIn(f"{lab_totals['signals']} signals", gate_line)
+        self.assertIn(f"({lab_totals['triggers_enabled']} triggers)", gate_line)
+        # and the naive figure — every trigger in the catalog — is NOT what is shown
+        self.assertNotIn(f"({len(triggers)} triggers)", gate_line)

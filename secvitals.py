@@ -2565,8 +2565,12 @@ def format_signal_manifest(manifest, verbose=False):
         out.append("")
     out.append(f"TOTAL: {t['signals']} signals across {t['triggers_enabled']} enabled triggers")
     if t["triggers_gated"]:
+        # Count only what the GATE can unlock. triggers_total would include triggers
+        # that are unconfigured for this site, which no gate can make runnable —
+        # exactly the kind of quiet overstatement the manifest exists to prevent.
+        unlockable = t["triggers_total"] - t.get("triggers_unconfigured", 0)
         out.append(f"       {t['signals_if_gate_enabled']} signals if the live-suspect gate is enabled "
-                   f"({t['triggers_total']} triggers)")
+                   f"({unlockable} triggers)")
     return "\n".join(out)
 
 

@@ -396,6 +396,22 @@ class Settings:
         return float(_dget(self.raw, "run.min_interval_s", 0.75))
 
     @property
+    def evidence_log_enabled(self):
+        # Append each run to a local JSONL evidence log. Local disk only — there is
+        # still no network surface and nothing is uploaded.
+        return bool(_dget(self.raw, "evidence.log", True))
+
+    @property
+    def correlation_header(self):
+        """Stamp an X-SecVitals-Run header on curl triggers so the customer's console
+        can be filtered to exactly this run.
+
+        DEFAULT OFF, deliberately. It adds a header to traffic whose whole job is to
+        match a signature faithfully, and it marks the traffic as synthetic. Turn it on
+        when correlation matters more than fidelity."""
+        return bool(_dget(self.raw, "run.correlation_header", False))
+
+    @property
     def tor_list_url(self):
         return str(_dget(self.raw, "webcc.tor_list_url", "") or "")
 
@@ -838,10 +854,22 @@ def _url_endpoint(argv):
     return "", ""
 
 
-def _curl_flow_argv(argv):
+# Optional per-run correlation header (settings: run.correlation_header, default OFF).
+# It lets the customer filter their console to exactly this run — at the cost of adding
+# a header to traffic whose entire job is to match a signature faithfully, and of
+# marking that traffic as synthetic. That trade is the operator's to make, so it is
+# off unless asked for. Like the 5-tuple write-out, it is applied IN CODE: a self-update
+# ships secvitals.py alone, so an install keeps its existing catalog.
+CORRELATION_HEADER = "X-SecVitals-Run"
+
+
+def _curl_flow_argv(argv, run_id=None):
     """The argv actually executed: the catalog's command with the 5-tuple fields appended
-    to its --write-out format (or a --write-out added, if it has none)."""
+    to its --write-out format (or a --write-out added, if it has none), plus the optional
+    correlation header. The DISPLAYED command stays exactly what the catalog declares."""
     out = list(argv)
+    if run_id:
+        out += ["-H", f"{CORRELATION_HEADER}: {run_id}"]
     for i, tok in enumerate(out):
         if tok == "-w" and i + 1 < len(out):
             out[i + 1] = out[i + 1] + _FLOW_WRITEOUT
@@ -920,7 +948,7 @@ def build_command(template, resolved):
     return argv
 
 
-def run_trigger(trigger, params, settings):
+def run_trigger(trigger, params, settings, run_id=None):
     """Run every command of one trigger natively and return a RunResult. Never raises for
     expected failure modes — those become per-request error_reason (→ `error`)."""
     try:
@@ -937,7 +965,8 @@ def run_trigger(trigger, params, settings):
             subs.append(SubResult(argv=list(template), error_reason=f"invalid parameters: {e}"))
             continue
         if trigger.runner == "curl":
-            subs.append(_run_curl(argv, trigger.timeout))
+            stamp = run_id if (run_id and settings.correlation_header) else None
+            subs.append(_run_curl(argv, trigger.timeout, stamp))
         elif trigger.runner == "dns":
             s = _run_dns(argv, trigger.timeout)
             subs.append(s)
@@ -960,8 +989,8 @@ def run_trigger(trigger, params, settings):
     return res
 
 
-def _run_curl(argv, timeout):
-    exec_argv = _curl_flow_argv(argv)          # argv stays the catalog's, for display
+def _run_curl(argv, timeout, run_id=None):
+    exec_argv = _curl_flow_argv(argv, run_id)  # argv stays the catalog's, for display
     try:
         proc = subprocess.run(exec_argv, capture_output=True, timeout=timeout, check=False)
     except FileNotFoundError as e:
@@ -1215,10 +1244,478 @@ def classify(trigger, result):
 
 
 # ===========================================================================
-# Application state
+# Run evidence  —  a per-run ledger, on local disk only
 # ===========================================================================
+# What this is FOR: after a demo, the SE needs to prove what was fired, when, from
+# which endpoints, and what this host observed — so the customer can reconcile it
+# against their own console at their own pace.
+#
+# What it deliberately is NOT: telemetry. Nothing is uploaded, nothing phones home,
+# and there is still no listening socket. Every artifact is written to local disk and
+# handed over by the presenter.
+#
+# The ledger is HASH-CHAINED: each record commits to the previous one, so a report can
+# be shown to have not been quietly edited after the fact. The chain covers the
+# machine-observed facts only — the presenter's "confirmed on console" annotation is
+# added later by a human and is explicitly OUTSIDE the chain (see LEDGER_UNCHAINED).
+CONFIRMED_UNSET, CONFIRMED_YES, CONFIRMED_NO = "unset", "confirmed", "not-seen"
+CONFIRMED_STATES = (CONFIRMED_UNSET, CONFIRMED_YES, CONFIRMED_NO)
+
+# Fields excluded from the hash chain: they are human annotations or chain metadata,
+# not observations, and they change after the record is written.
+LEDGER_UNCHAINED = ("confirmed", "hash", "prev_hash")
+
+
+def _sha256_file(path):
+    """SHA-256 of a file, or "" when it can't be read (never raises — a missing file
+    must not stop a demo)."""
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return ""
+
+
+def provenance(config_dir=None):
+    """What produced this evidence: the app version plus digests of the code and the
+    config that actually decided what was sent. Lets a reader confirm the run used the
+    reviewed catalog, not a locally edited one."""
+    cfg = config_dir or DEFAULT_CONFIG_DIR
+    return {
+        "app": APP_NAME,
+        "version": __version__,
+        "code_sha256": _sha256_file(_THIS_FILE),
+        "catalog_sha256": _sha256_file(os.path.join(cfg, "catalog.yaml")),
+        "settings_sha256": _sha256_file(os.path.join(cfg, "settings.yaml")),
+    }
+
+
+def new_run_id():
+    """A short, unique id for one console session. os.urandom keeps this dependency-free
+    and unpredictable; it is not a secret, just a correlation handle."""
+    return os.urandom(8).hex()
+
+
+def _utc(when=None):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                         time.gmtime(time.time() if when is None else when))
+
+
+def _record_hash(record, prev_hash):
+    """Commit to this record and everything before it. Canonical JSON (sorted keys,
+    no whitespace) so the digest is reproducible by anyone re-reading the file."""
+    payload = {k: v for k, v in record.items() if k not in LEDGER_UNCHAINED}
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256((prev_hash + blob).encode("utf-8")).hexdigest()
+
+
+class RunLedger:
+    """Every trigger fired in this session, in order, hash-chained."""
+
+    def __init__(self, config_dir=None, run_id=None, started=None):
+        self.run_id = run_id or new_run_id()
+        self.started = _utc(started)
+        self.provenance = provenance(config_dir)
+        self.records = []
+        self._lock = threading.Lock()
+
+    def add(self, trigger, out, settings, when=None):
+        """Append one fired trigger's honest result. Returns the stored record."""
+        with self._lock:
+            prev = self.records[-1]["hash"] if self.records else ""
+            rec = {
+                "seq": len(self.records) + 1,
+                "ts": _utc(when),
+                "run_id": self.run_id,
+                "id": trigger.id,
+                "label": trigger.label,
+                "class": trigger.cls,
+                "runner": trigger.runner,
+                "severity": trigger.severity,
+                "threat_class": trigger.threat_class,
+                "state": out.get("state", ERROR),
+                "reason": out.get("reason", ""),
+                "rc": out.get("rc"),
+                "http_code": out.get("http_code"),
+                "duration_s": out.get("duration_s"),
+                "wire_requests": out.get("wire_requests", trigger.on_wire_count(settings)),
+                "expected_fire": out.get("expected_fire", trigger.expected_fire),
+                "console_hint": out.get("console_hint", trigger.console_hint_text()),
+                "verify_key": out.get("verify_key", ""),
+                "ratio": out.get("ratio"),
+                "flows": [f for f in (out.get("flows") or []) if f],
+                "confirmed": CONFIRMED_UNSET,
+                "prev_hash": prev,
+            }
+            rec["hash"] = _record_hash(rec, prev)
+            self.records.append(rec)
+            return rec
+
+    def set_confirmed(self, seq, value):
+        """Record the presenter's own read of the customer's console. Deliberately
+        separate from the machine observation, and outside the hash chain, so the two
+        can never be confused for one another."""
+        if value not in CONFIRMED_STATES:
+            raise ValueError(f"confirmed must be one of {CONFIRMED_STATES}")
+        with self._lock:
+            for rec in self.records:
+                if rec["seq"] == seq:
+                    rec["confirmed"] = value
+                    return rec
+        return None
+
+    def verify_chain(self):
+        """Re-derive every digest. Returns (ok, first_bad_seq)."""
+        prev = ""
+        for rec in self.records:
+            if rec.get("prev_hash") != prev or rec.get("hash") != _record_hash(rec, prev):
+                return False, rec.get("seq")
+            prev = rec["hash"]
+        return True, None
+
+    # -- summaries ---------------------------------------------------------
+    def state_counts(self):
+        counts = {}
+        for rec in self.records:
+            counts[rec["state"]] = counts.get(rec["state"], 0) + 1
+        return counts
+
+    def signals_fired(self):
+        return sum(int(r.get("wire_requests") or 0) for r in self.records)
+
+    def scorecard(self):
+        """The reconciliation sheet: what the catalog EXPECTED to fire, what this host
+        OBSERVED locally, and what the presenter CONFIRMED on the customer's console —
+        three separate columns that are never merged, because they are three different
+        kinds of evidence."""
+        return [{
+            "seq": r["seq"], "ts": r["ts"], "id": r["id"], "label": r["label"],
+            "class": r["class"], "severity": r["severity"],
+            "expected": r["expected_fire"], "observed": r["state"],
+            "reason": r["reason"], "signals": r["wire_requests"],
+            "confirmed": r["confirmed"], "verify_key": r["verify_key"],
+        } for r in self.records]
+
+    def coverage_matrix(self, triggers, settings):
+        """Which policy dimensions this session actually exercised — and, honestly, which
+        it did not. Empty cells are the point: they are the gaps to name out loud."""
+        fired = {r["id"] for r in self.records}
+        produced = {r["id"] for r in self.records
+                    if r["state"] in (ALLOWED, BLOCKED, RATIO)}
+        cells, classes, threats = {}, [], []
+        for t in triggers:
+            if t.cls not in classes:
+                classes.append(t.cls)
+            threat = t.threat_class or "(unclassified)"
+            if threat not in threats:
+                threats.append(threat)
+            cell = cells.setdefault((t.cls, threat),
+                                    {"catalog": 0, "enabled": 0, "fired": 0, "result": 0})
+            cell["catalog"] += 1
+            if not t.gated_disabled(settings):
+                cell["enabled"] += 1
+            if t.id in fired:
+                cell["fired"] += 1
+            if t.id in produced:
+                cell["result"] += 1
+        gaps = []
+        for cls in classes:
+            for threat in threats:
+                cell = cells.get((cls, threat))
+                if cell and cell["catalog"] and not cell["fired"]:
+                    gaps.append(f"{cls} / {threat}: {cell['catalog']} trigger(s) in the "
+                                "catalog, none fired this session")
+        for cls in sorted(CLASSES - set(classes)):
+            gaps.append(f"{cls}: no triggers exist in the catalog at all")
+        return {"classes": classes, "threats": threats,
+                "cells": {f"{c}|{th}": v for (c, th), v in cells.items()},
+                "gaps": gaps}
+
+    # -- serialisation -----------------------------------------------------
+    def to_dict(self, triggers=None, settings=None):
+        ok, bad = self.verify_chain()
+        doc = {
+            "run_id": self.run_id,
+            "started": self.started,
+            "generated": _utc(),
+            "provenance": self.provenance,
+            "summary": {
+                "triggers": len(self.records),
+                "signals": self.signals_fired(),
+                "states": self.state_counts(),
+                "chain_ok": ok,
+                "chain_first_bad_seq": bad,
+            },
+            "records": self.records,
+        }
+        if triggers is not None and settings is not None:
+            doc["coverage"] = self.coverage_matrix(triggers, settings)
+        return doc
+
+    def to_json(self, triggers=None, settings=None):
+        return json.dumps(self.to_dict(triggers, settings), indent=2, default=str)
+
+    CSV_COLUMNS = ("seq", "ts", "run_id", "id", "label", "class", "runner", "severity",
+                   "threat_class", "state", "reason", "rc", "http_code", "duration_s",
+                   "wire_requests", "expected_fire", "confirmed", "verify_key", "hash")
+
+    def to_csv(self):
+        import csv
+        import io
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=list(self.CSV_COLUMNS),
+                                extrasaction="ignore", lineterminator="\n")
+        writer.writeheader()
+        for rec in self.records:
+            writer.writerow({k: ("" if rec.get(k) is None else rec.get(k))
+                             for k in self.CSV_COLUMNS})
+        return buf.getvalue()
+
+    def to_html(self, triggers=None, settings=None):
+        return render_html_report(self, triggers, settings)
+
+
+# --- the leave-behind -------------------------------------------------------
+_STATE_CSS = {ALLOWED: "st-allowed", BLOCKED: "st-blocked", ERROR: "st-error",
+              INVALID: "st-invalid", RATIO: "st-ratio"}
+_CONFIRMED_LABEL = {CONFIRMED_UNSET: "—", CONFIRMED_YES: "confirmed on console",
+                    CONFIRMED_NO: "not seen"}
+
+_REPORT_CSS = """
+:root { color-scheme: dark; }
+body { background:#1a1d21; color:#f2f4f5; font-family:'Segoe UI',system-ui,sans-serif;
+       margin:0; padding:32px; line-height:1.5; }
+h1,h2 { margin:0 0 8px; } h1 { font-size:24px; } h2 { font-size:15px; margin-top:32px;
+       text-transform:uppercase; letter-spacing:.08em; color:#01A982; }
+.sub { color:#9aa3ad; font-size:13px; margin-bottom:24px; }
+table { border-collapse:collapse; width:100%; font-size:13px; margin-top:8px; }
+th,td { text-align:left; padding:7px 10px; border-bottom:1px solid #363b44;
+        vertical-align:top; }
+th { color:#9aa3ad; font-weight:600; font-size:11px; text-transform:uppercase;
+     letter-spacing:.06em; }
+code,.mono { font-family:Consolas,ui-monospace,monospace; font-size:12px; }
+.badge { display:inline-block; padding:1px 8px; border-radius:3px; font-size:11px;
+         font-family:Consolas,monospace; border:1px solid; }
+.st-allowed { color:#00B0E6; border-color:#00B0E6; }
+.st-blocked { color:#01A982; border-color:#01A982; }
+.st-error   { color:#E0574a; border-color:#E0574a; }
+.st-invalid { color:#FEC901; border-color:#FEC901; }
+.st-ratio   { color:#FF8300; border-color:#FF8300; }
+.card { background:#23272e; border:1px solid #363b44; border-radius:6px; padding:14px 18px;
+        margin-bottom:10px; }
+.kv { display:flex; flex-wrap:wrap; gap:24px; font-size:12px; color:#9aa3ad; }
+.gap { color:#FEC901; } .ok { color:#01A982; } .bad { color:#E0574a; }
+.note { color:#6f787c; font-size:12px; margin-top:6px; }
+.wrap { overflow-x:auto; }
+"""
+
+
+def _esc(value):
+    import html
+    return html.escape("" if value is None else str(value), quote=True)
+
+
+def render_html_report(ledger, triggers=None, settings=None):
+    """One self-contained HTML file: no scripts, no external resources, everything
+    escaped. This is the artifact the customer keeps — so it states plainly what was
+    machine-observed locally, what the presenter attested, and what was NOT covered."""
+    doc = ledger.to_dict(triggers, settings)
+    summary, prov = doc["summary"], doc["provenance"]
+    chain_ok = summary["chain_ok"]
+    out = ["<!doctype html><html lang='en'><head><meta charset='utf-8'>",
+           "<meta name='viewport' content='width=device-width,initial-scale=1'>",
+           f"<title>{_esc(APP_NAME)} run {_esc(doc['run_id'])}</title>",
+           f"<style>{_REPORT_CSS}</style></head><body>",
+           f"<h1>{_esc(APP_NAME)} — demo evidence</h1>",
+           f"<div class='sub'>Run <span class='mono'>{_esc(doc['run_id'])}</span> · "
+           f"started {_esc(doc['started'])} · report generated {_esc(doc['generated'])}</div>"]
+
+    # -- summary ----------------------------------------------------------
+    states = " · ".join(f"{n} {_esc(s)}" for s, n in sorted(summary["states"].items()))
+    out.append("<div class='card'><div class='kv'>"
+               f"<div><strong>{summary['triggers']}</strong> triggers fired</div>"
+               f"<div><strong>{summary['signals']}</strong> signals on the wire</div>"
+               f"<div>{states or '—'}</div></div>")
+    if chain_ok:
+        out.append("<div class='note ok'>Evidence chain verified — every record commits "
+                   "to the one before it.</div>")
+    else:
+        out.append("<div class='note bad'>Evidence chain BROKEN at record "
+                   f"{_esc(summary['chain_first_bad_seq'])} — this report has been "
+                   "altered after it was written.</div>")
+    out.append("</div>")
+
+    out.append("<div class='card'><div class='kv'>"
+               f"<div>version <span class='mono'>{_esc(prov['version'])}</span></div>"
+               f"<div>code <span class='mono'>{_esc(prov['code_sha256'][:16])}…</span></div>"
+               f"<div>catalog <span class='mono'>{_esc(prov['catalog_sha256'][:16])}…</span></div>"
+               f"<div>settings <span class='mono'>{_esc(prov['settings_sha256'][:16])}…</span></div>"
+               "</div><div class='note'>Digests of the code and configuration that decided "
+               "what was sent.</div></div>")
+
+    # -- how to read it ---------------------------------------------------
+    out.append("<h2>How to read this</h2><div class='card'><table>"
+               "<tr><th>State</th><th>What it means</th></tr>"
+               "<tr><td><span class='badge st-allowed'>allowed</span></td><td>The traffic "
+               "completed. The control is in detect-only mode, or the category is not set "
+               "to Deny.</td></tr>"
+               "<tr><td><span class='badge st-blocked'>blocked</span></td><td>The flow was "
+               "dropped inline — enforcement working.</td></tr>"
+               "<tr><td><span class='badge st-error'>error</span></td><td><strong>Not a "
+               "policy result.</strong> The trigger could not run (DNS, TLS, no route). "
+               "Never read this as a block.</td></tr>"
+               "<tr><td><span class='badge st-invalid'>invalid</span></td><td>Gated off, or "
+               "the egress control probe failed.</td></tr>"
+               "<tr><td><span class='badge st-ratio'>ratio</span></td><td>IP reputation "
+               "reached N of M nodes — a ratio, never a single verdict.</td></tr>"
+               "</table><div class='note'>Observed locally by the host that fired the "
+               "traffic. The inline stack's own console remains authoritative.</div></div>")
+
+    # -- scorecard --------------------------------------------------------
+    out.append("<h2>Expected vs observed vs confirmed</h2><div class='wrap'><table>"
+               "<tr><th>#</th><th>Time (UTC)</th><th>Trigger</th><th>Expected to fire</th>"
+               "<th>Observed locally</th><th>Confirmed on console</th><th>Signals</th></tr>")
+    for row in ledger.scorecard():
+        css = _STATE_CSS.get(row["observed"], "")
+        out.append(
+            f"<tr><td class='mono'>{row['seq']}</td><td class='mono'>{_esc(row['ts'])}</td>"
+            f"<td><strong>{_esc(row['label'])}</strong><br><span class='mono' "
+            f"style='color:#6f787c'>{_esc(row['id'])}</span></td>"
+            f"<td>{_esc(row['expected'])}</td>"
+            f"<td><span class='badge {css}'>{_esc(row['observed'])}</span><div class='note'>"
+            f"{_esc(row['reason'])}</div></td>"
+            f"<td>{_esc(_CONFIRMED_LABEL.get(row['confirmed'], row['confirmed']))}</td>"
+            f"<td class='mono'>{_esc(row['signals'])}</td></tr>")
+    out.append("</table></div><div class='note'>“Expected” is what the catalog says the "
+               "signal should trip. “Observed locally” is this host's honest read. "
+               "“Confirmed on console” is the presenter's own attestation — a human "
+               "annotation, deliberately kept separate and outside the evidence chain.</div>")
+
+    # -- coverage ---------------------------------------------------------
+    coverage = doc.get("coverage")
+    if coverage:
+        out.append("<h2>Policy coverage</h2><div class='wrap'><table><tr><th>Class</th>")
+        for threat in coverage["threats"]:
+            out.append(f"<th>{_esc(threat)}</th>")
+        out.append("</tr>")
+        for cls in coverage["classes"]:
+            out.append(f"<tr><td class='mono'>{_esc(cls)}</td>")
+            for threat in coverage["threats"]:
+                cell = coverage["cells"].get(f"{cls}|{threat}")
+                if not cell or not cell["catalog"]:
+                    out.append("<td class='note'>—</td>")
+                else:
+                    style = "ok" if cell["result"] else ("gap" if cell["enabled"] else "note")
+                    out.append(f"<td class='{style} mono'>{cell['result']}/{cell['catalog']}</td>")
+            out.append("</tr>")
+        out.append("</table></div><div class='note'>Triggers that produced a policy result "
+                   "/ triggers in the catalog.</div>")
+        if coverage["gaps"]:
+            out.append("<div class='card'><strong>Not exercised in this session</strong><ul>")
+            for gap in coverage["gaps"]:
+                out.append(f"<li class='gap'>{_esc(gap)}</li>")
+            out.append("</ul><div class='note'>Named explicitly: a gap the customer cannot "
+                       "see is a gap they cannot judge.</div></div>")
+
+    # -- per-trigger detail ----------------------------------------------
+    out.append("<h2>Flow detail</h2>")
+    for rec in doc["records"]:
+        out.append(f"<div class='card'><strong>{_esc(rec['label'])}</strong> "
+                   f"<span class='mono' style='color:#6f787c'>{_esc(rec['id'])}</span>")
+        if rec.get("verify_key"):
+            out.append(f"<div class='mono note'>{_esc(rec['verify_key'])}</div>")
+        if rec.get("flows"):
+            out.append("<div class='wrap'><table><tr><th>Proto</th><th>Source</th>"
+                       "<th>Destination</th><th>Host</th></tr>")
+            for flow in rec["flows"]:
+                src = f"{flow.get('src_ip') or '—'}:{flow.get('src_port') or '—'}"
+                dst = f"{flow.get('dst_ip') or '—'}:{flow.get('dst_port') or '—'}"
+                out.append(f"<tr><td class='mono'>{_esc(flow.get('proto'))}</td>"
+                           f"<td class='mono'>{_esc(src)}</td><td class='mono'>{_esc(dst)}</td>"
+                           f"<td class='mono'>{_esc(flow.get('host') or '—')}</td></tr>")
+            out.append("</table></div>")
+        out.append("</div>")
+
+    out.append("<div class='note'>Generated locally by Security Vitals. Nothing in this "
+               "report was uploaded or transmitted anywhere.</div></body></html>")
+    return "\n".join(out)
+
+
+# --- where evidence lands ---------------------------------------------------
+def evidence_dir(settings=None):
+    """Local, per-user directory for run evidence. Never inside the install folder,
+    which may not be writable — and never anywhere off this machine."""
+    configured = _dget(getattr(settings, "raw", {}) or {}, "evidence.dir", "") or ""
+    if configured:
+        return os.path.expanduser(str(configured))
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        return os.path.join(base, "SecVitals", "runs")
+    return os.path.join(os.path.expanduser("~"), ".local", "share", "secvitals", "runs")
+
+
+def write_evidence(path, text):
+    """Write one artifact, creating the directory. Returns the path; raises OSError."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    return path
+
+
+def append_jsonl(path, record, max_bytes=8 * 1024 * 1024):
+    """Append one record to the rolling evidence log, rotating once it gets large so a
+    long-lived install can't fill a disk. Best-effort: evidence logging must never take
+    the console down mid-demo."""
+    try:
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        try:
+            if os.path.getsize(path) >= max_bytes:
+                os.replace(path, path + ".1")
+        except OSError:
+            pass
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, sort_keys=True, default=str) + "\n")
+        return True
+    except OSError as e:
+        log.warning("could not append to the evidence log: %s", e)
+        return False
+
+
+def read_jsonl(path, limit=5000):
+    """Read back evidence records (oldest first). Malformed lines are skipped, not fatal."""
+    out = []
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict):
+                    out.append(rec)
+    except OSError:
+        return []
+    return out[-limit:]
+
+
+def last_session_records(path):
+    """The most recent run's records, for re-rendering a session without re-firing."""
+    records = read_jsonl(path)
+    if not records:
+        return []
+    last_run = records[-1].get("run_id")
+    return [r for r in records if r.get("run_id") == last_run]
+
+
 class App:
-    def __init__(self, settings, triggers, config_dir=None):
+    def __init__(self, settings, triggers, config_dir=None, ledger=None):
         self.settings = settings
         self.triggers = triggers
         self.by_id = {t.id: t for t in triggers}
@@ -1226,8 +1723,21 @@ class App:
         self.tor_cache = TorNodeCache(settings.tor_list_url, settings.tor_list_ttl)
         self._run_lock = threading.Lock()   # serialize triggers — clean before/after on stage
         self._last_run_end = 0.0            # rate limiting between runs
+        self.ledger = ledger if ledger is not None else RunLedger(config_dir)
+        self.evidence_path = os.path.join(evidence_dir(settings), "evidence.jsonl")
 
     def run(self, trigger_id, params):
+        """Fire one trigger and record it. Every outcome — including `invalid` and
+        `error` — lands in the ledger, because a demo's gaps are evidence too."""
+        trigger, out = self._run_one(trigger_id, params)
+        if trigger is not None:
+            record = self.ledger.add(trigger, out, self.settings)
+            out["seq"] = record["seq"]
+            if self.settings.evidence_log_enabled:
+                append_jsonl(self.evidence_path, record)
+        return trigger, out
+
+    def _run_one(self, trigger_id, params):
         trigger = self.by_id.get(trigger_id)
         if trigger is None:
             return None, {"error": "unknown trigger id"}
@@ -1249,7 +1759,7 @@ class App:
                 out = self._run_iprep(trigger)
                 log.info("run done id=%s state=%s", trigger_id, out.get("state"))
                 return trigger, out
-            result = run_trigger(trigger, params, self.settings)
+            result = run_trigger(trigger, params, self.settings, self.ledger.run_id)
             state, reason = classify(trigger, result)
             log.info("run done id=%s state=%s reqs=%d dur=%.2fs",
                      trigger_id, state, len(result.subs), result.duration_s)
@@ -1268,6 +1778,7 @@ class App:
                 "wire_requests": trigger.on_wire_count(self.settings),
                 "stdout": _clip(_format_subs(result.subs), 6000),
                 "flow": _clip(_format_flows(flows), 4000),
+                "flows": [f for f in flows if f],
                 "stderr": "",
             }
         finally:
@@ -1319,6 +1830,7 @@ class App:
             "wire_requests": trigger.on_wire_count(s),
             "stdout": "\n".join(details),
             "flow": _clip(_format_flows(flows), 4000),
+            "flows": [f for f in flows if f],
         }
 
 
@@ -1675,6 +2187,15 @@ GUI_MONO = "Consolas"
 
 SEV_COLOR = {"info": GUI_INFO, "warn": GUI_WARN, "crit": GUI_CRIT}
 
+# The presenter's attestation cycles unset -> confirmed -> not-seen. It records what a
+# human saw on the customer's console; it never changes this host's own observation.
+CONFIRM_CYCLE = {CONFIRMED_UNSET: CONFIRMED_YES, CONFIRMED_YES: CONFIRMED_NO,
+                 CONFIRMED_NO: CONFIRMED_UNSET}
+CONFIRM_CYCLE_LABEL = {CONFIRMED_UNSET: "Console: not marked",
+                       CONFIRMED_YES: "Console: confirmed \u2713",
+                       CONFIRMED_NO: "Console: not seen"}
+CONFIRM_CYCLE_FG = {CONFIRMED_UNSET: GUI_INK, CONFIRMED_YES: GUI_ACCENT, CONFIRMED_NO: GUI_WARN}
+
 # The row status line reports WHEN a trigger last ran and HOW MANY times — not a local
 # verdict. The inline security stack's own console is authoritative for
 # allowed-vs-blocked; the console's own read of the run still shows up in the expanded
@@ -1785,6 +2306,20 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
         if tid:
             _set_status(tid, "verification key copied", GUI_ACCENT)
 
+    def cycle_confirmed(tid):
+        """Advance this trigger's console attestation and store it on the ledger record."""
+        card = cards.get(tid)
+        if not card or not card.get("seq"):
+            return
+        card["confirmed"] = CONFIRM_CYCLE.get(card.get("confirmed", CONFIRMED_UNSET),
+                                              CONFIRMED_UNSET)
+        try:
+            app.ledger.set_confirmed(card["seq"], card["confirmed"])
+        except ValueError:
+            return
+        card["confirm"].configure(text=CONFIRM_CYCLE_LABEL[card["confirmed"]],
+                                  fg=CONFIRM_CYCLE_FG[card["confirmed"]])
+
     def set_result(tid, out):
         c = cards.get(tid)
         if not c:
@@ -1813,6 +2348,12 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
         if c["verify_key"]:
             c["set_pane"]("verify", c["verify_key"] + "\n\n" + (out.get("console_hint") or ""))
             c["copy"].pack(side="left", padx=6)
+        c["seq"] = out.get("seq")
+        if c["seq"]:
+            c["confirmed"] = CONFIRMED_UNSET
+            c["confirm"].configure(text=CONFIRM_CYCLE_LABEL[CONFIRMED_UNSET],
+                                   fg=CONFIRM_CYCLE_FG[CONFIRMED_UNSET])
+            c["confirm"].pack(side="left", padx=6)
         c["fire"].configure(state="normal")
 
     def fire(tid):
@@ -1909,6 +2450,9 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
         bar, "🎤  Presenter mode",
         lambda: open_presenter_picker(root, app, triggers, settings, profiles))
     presenter_btn.pack(side="left", padx=6, pady=2)
+    report_btn = _gui_button(bar, "⬇  Save report",
+                             lambda: open_report_dialog(root, app, triggers, settings))
+    report_btn.pack(side="left", padx=6, pady=2)
     upd_btn = _gui_button(bar, "⟳  Check for updates", lambda: open_update_dialog(root))
     upd_btn.pack(side="right", pady=2)
     status_var = tk.StringVar(value="")
@@ -2047,6 +2591,11 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
         fire_btn.pack(side="left")
         copy_btn = _gui_button(actions, "Copy verification key",
                                lambda tid=t.id: copy_text(cards[tid].get("verify_key"), tid))
+        # The presenter's own read of the customer's console. Deliberately a SEPARATE
+        # record from what this host observed — the two are different kinds of evidence
+        # and the report keeps them in different columns.
+        confirm_btn = _gui_button(actions, CONFIRM_CYCLE_LABEL[CONFIRMED_UNSET],
+                                  lambda tid=t.id: cycle_confirmed(tid))
         kv = tk.Label(actions, text="", fg=GUI_DIM, bg=GUI_SURFACE, font=(GUI_MONO, 9))
         kv.pack(side="left", padx=12)
 
@@ -2084,7 +2633,9 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
             child.bind("<Button-1>", toggle_expand)
 
         cards[t.id] = {"status": status, "reason": reason, "kv": kv, "fire": fire_btn,
-                       "copy": copy_btn, "set_pane": set_pane, "runs": 0, "verify_key": ""}
+                       "copy": copy_btn, "confirm": confirm_btn, "set_pane": set_pane,
+                       "runs": 0, "verify_key": "", "seq": None,
+                       "confirmed": CONFIRMED_UNSET}
 
     order, seen = [], set()
     for t in triggers:
@@ -2356,6 +2907,79 @@ def _presenter_board(session):
         detail = " ".join(f"{n} {s}" for s, n in sorted(slot["states"].items()))
         lines.append(f"   {cls:<10} {slot['fired']}/{slot['total']}   {detail}")
     return "\n".join(lines)
+
+
+def open_report_dialog(root, app, triggers, settings):
+    """Write this session's evidence to local disk and say exactly where it went.
+
+    Nothing is uploaded and no browser is launched on the user's behalf — the presenter
+    decides what to do with the file. Writes an HTML leave-behind plus the raw JSON."""
+    existing = getattr(root, "_secv_report_dialog", None)
+    if existing is not None:
+        try:
+            if existing.winfo_exists():
+                existing.lift()
+                existing.focus_set()
+                return
+        except tk.TclError:
+            pass
+
+    ledger = app.ledger
+    dlg = tk.Toplevel(root)
+    root._secv_report_dialog = dlg
+    dlg.title(f"{APP_NAME} — save report")
+    dlg.configure(bg=GUI_BG, padx=18, pady=14)
+    dlg.transient(root)
+
+    if not ledger.records:
+        tk.Label(dlg, text="Nothing to report yet", fg=GUI_INK, bg=GUI_BG,
+                 font=(GUI_FONT, 13, "bold")).pack(anchor="w")
+        tk.Label(dlg, text="Fire at least one trigger first.", fg=GUI_DIM, bg=GUI_BG,
+                 font=(GUI_FONT, 10)).pack(anchor="w", pady=(4, 12))
+        _gui_button(dlg, "Close", dlg.destroy).pack(anchor="e")
+        return
+
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    base = os.path.join(evidence_dir(settings), f"secvitals-{stamp}-{ledger.run_id}")
+    written, failed = [], None
+    try:
+        written.append(export_ledger(ledger, base + ".html", triggers, settings))
+        written.append(export_ledger(ledger, base + ".json", triggers, settings))
+        written.append(export_ledger(ledger, base + ".csv", triggers, settings))
+    except OSError as e:
+        failed = str(e)
+
+    chain_ok, bad_seq = ledger.verify_chain()
+    tk.Label(dlg, text=f"{len(ledger.records)} triggers · {ledger.signals_fired()} signals",
+             fg=GUI_ACCENT, bg=GUI_BG, font=(GUI_FONT, 14, "bold")).pack(anchor="w")
+    if failed:
+        tk.Label(dlg, text=f"Could not write the report: {failed}", fg=GUI_CRIT, bg=GUI_BG,
+                 font=(GUI_FONT, 10), wraplength=520, justify="left").pack(anchor="w", pady=(6, 0))
+    else:
+        tk.Label(dlg, text="Written to local disk (nothing was uploaded):",
+                 fg=GUI_DIM, bg=GUI_BG, font=(GUI_FONT, 10)).pack(anchor="w", pady=(6, 2))
+        for path in written:
+            tk.Label(dlg, text=path, fg=GUI_INK, bg=GUI_BG, font=(GUI_MONO, 9),
+                     wraplength=560, justify="left").pack(anchor="w")
+    tk.Label(dlg,
+             text=("Evidence chain verified." if chain_ok
+                   else f"Evidence chain BROKEN at record {bad_seq}."),
+             fg=(GUI_ACCENT if chain_ok else GUI_CRIT), bg=GUI_BG,
+             font=(GUI_MONO, 9)).pack(anchor="w", pady=(8, 0))
+
+    btns = tk.Frame(dlg, bg=GUI_BG)
+    btns.pack(anchor="e", fill="x", pady=(14, 0))
+
+    def copy_path():
+        try:
+            root.clipboard_clear()
+            root.clipboard_append(written[0] if written else "")
+        except tk.TclError:
+            pass
+
+    _gui_button(btns, "Close", dlg.destroy).pack(side="right")
+    if written:
+        _gui_button(btns, "Copy path", copy_path).pack(side="right", padx=6)
 
 
 def open_manifest_dialog(root, triggers, settings):
@@ -2799,6 +3423,37 @@ def perform_update(manifest_url=UPDATE_MANIFEST_URL, apply=True, pubkey=UPDATE_P
 HEADLESS_OK, HEADLESS_PROBLEM, HEADLESS_USAGE = 0, 1, 2
 
 
+def export_ledger(ledger, path, triggers=None, settings=None):
+    """Write run evidence to `path`; the file extension picks the format
+    (.csv, .html/.htm, anything else = JSON). Local disk only."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".csv":
+        text = ledger.to_csv()
+    elif ext in (".html", ".htm"):
+        text = ledger.to_html(triggers, settings)
+    else:
+        text = ledger.to_json(triggers, settings)
+    return write_evidence(path, text)
+
+
+def format_scorecard(rows):
+    """The reconciliation sheet as text: expected, observed, and the presenter's own
+    attestation kept in three separate columns."""
+    if not rows:
+        return "No triggers have been fired yet."
+    out = ["  #  TIME (UTC)            TRIGGER                 OBSERVED  CONFIRMED",
+           "  " + "-" * 74]
+    for r in rows:
+        out.append("  {:<3}{:<22}{:<24}{:<10}{}".format(
+            r.get("seq", ""), r.get("ts", ""), (r.get("id") or "")[:23],
+            r.get("observed") or r.get("state") or "",
+            _CONFIRMED_LABEL.get(r.get("confirmed"), r.get("confirmed") or "—")))
+        expected = r.get("expected") or r.get("expected_fire") or ""
+        if expected:
+            out.append("     expected: " + expected[:96])
+    return "\n".join(out)
+
+
 def select_triggers(triggers, selector, settings, profile=None):
     """Resolve a `--run` selector into an ordered trigger list.
 
@@ -2831,9 +3486,10 @@ def select_triggers(triggers, selector, settings, profile=None):
 
 
 def run_headless(app, triggers, settings, selector="all", fmt="text", out=None,
-                 profile=None):
+                 export=None, profile=None):
     """Fire the selected triggers with no window and report honestly. Returns the
-    process exit code (see HEADLESS_* above)."""
+    process exit code (see HEADLESS_* above). With `export`, the run's evidence ledger
+    is also written to that path (format chosen by its extension)."""
     out = sys.stdout if out is None else out
     try:
         chosen = select_triggers(triggers, selector, settings, profile)
@@ -2883,8 +3539,18 @@ def run_headless(app, triggers, settings, selector="all", fmt="text", out=None,
         "profile": "lab" if settings.enable_live_suspect_hosts else "default",
         "demo_profile": (profile.name if profile is not None else None),
     }
+    exported = None
+    if export:
+        try:
+            exported = export_ledger(app.ledger, export, triggers, settings)
+        except OSError as e:
+            print(f"error: could not write {export}: {e}", file=sys.stderr)
+            return HEADLESS_USAGE
     if fmt == "json":
-        json.dump({"summary": summary, "results": results}, out, indent=2)
+        doc = {"summary": summary, "results": results}
+        if exported:
+            doc["export"] = exported
+        json.dump(doc, out, indent=2)
         out.write("\n")
     else:
         breakdown = " / ".join(f"{n} {s}" for s, n in sorted(counts.items()))
@@ -2895,6 +3561,8 @@ def run_headless(app, triggers, settings, selector="all", fmt="text", out=None,
         else:
             print("Every trigger produced a policy result. A `blocked` result is the "
                   "inline stack doing its job.", file=out)
+        if exported:
+            print(f"Evidence written to {exported}", file=out)
     return HEADLESS_OK if problems == 0 else HEADLESS_PROBLEM
 
 
@@ -2933,6 +3601,12 @@ def parse_args(argv):
                         "settings.yaml, run in the profile's own order")
     p.add_argument("--profiles", action="store_true",
                    help="list the demo profiles defined in settings.yaml, then exit")
+    p.add_argument("--export", metavar="FILE",
+                   help="after --run, write the run evidence to FILE — the extension picks "
+                        "the format (.json, .csv, .html). Written to local disk only")
+    p.add_argument("--last-session", action="store_true",
+                   help="print the reconciliation scorecard for the most recent run from "
+                        "the local evidence log, without firing anything")
     p.add_argument("--version", action="version", version=f"{APP_NAME} {__version__}")
     return p.parse_args(argv)
 
@@ -2986,6 +3660,20 @@ def main(argv=None):
             print(format_signal_manifest(manifest, verbose=bool(args.dry_run)))
         return 0
 
+    if args.last_session:
+        path = os.path.join(evidence_dir(settings), "evidence.jsonl")
+        records = last_session_records(path)
+        if args.format == "json":
+            print(json.dumps(records, indent=2, default=str))
+        elif not records:
+            print(f"No runs recorded yet in {path}.")
+        else:
+            print(f"Last session {records[0].get('run_id', '?')} — "
+                  f"{len(records)} triggers, "
+                  f"{sum(int(r.get('wire_requests') or 0) for r in records)} signals\n")
+            print(format_scorecard(records))
+        return 0
+
     app = App(settings, triggers, args.config_dir)
     planned = sum(t.on_wire_count(settings) for t in triggers if not t.gated_disabled(settings))
     log.info("%s %s — %d triggers (%d enabled, %d signals), native execution on %s",
@@ -2994,7 +3682,7 @@ def main(argv=None):
 
     if args.run:
         return run_headless(app, triggers, settings, args.run, args.format,
-                            profile=profile)
+                            export=args.export, profile=profile)
 
     try:
         run_gui(settings, triggers, app, args.config_dir, profiles)

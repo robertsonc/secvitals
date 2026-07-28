@@ -128,6 +128,25 @@ class TestGuiBuildSmoke(unittest.TestCase):
         done = sv.PresenterSession([], settings, label="Empty")
         sv.open_presenter_window(FakeWidget(), app, done, settings)
 
+    def test_report_dialog_builds_empty_and_populated(self):
+        """The save-report window is built from live ledger data, including the
+        nothing-fired-yet path, and must pass the same widget-option validation."""
+        import secvitals as sv
+        import tempfile, shutil
+        settings = sv.load_settings("config")
+        triggers = sv.load_catalog("config", settings)
+        tmp = tempfile.mkdtemp(prefix="sv-gui-ev-")
+        try:
+            settings.raw["evidence"] = {"log": False, "dir": tmp}
+            app = sv.App(settings, triggers, "config")
+            sv.run_gui(settings, triggers, app, "config")     # sets the module-level `tk`
+            sv.open_report_dialog(FakeWidget(), app, triggers, settings)   # empty ledger
+            uid = next(t for t in triggers if t.id == "ns-uid")
+            app.ledger.add(uid, {"state": sv.ALLOWED, "reason": "ok"}, settings)
+            sv.open_report_dialog(FakeWidget(), app, triggers, settings)   # populated
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_manifest_dialog_builds(self):
         """The signal-manifest preview is a second window built from live catalog data;
         it must survive the same widget-option validation as the main window."""

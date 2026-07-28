@@ -92,6 +92,23 @@ SID, talking point, where to look on the customer's console, then the observed s
 a running scoreboard by state and class. See
 [docs/milestones/M2-presenter-experience.md](docs/milestones/M2-presenter-experience.md).
 
+### Leave something behind
+
+```bash
+py secvitals.py --run all --export demo.html   # HTML leave-behind (.json / .csv too)
+py secvitals.py --last-session                 # re-read the last run, fire nothing
+```
+
+Or click **⬇ Save report** in the window. Every run is recorded in a **hash-chained
+ledger** stamped with digests of the code and catalog that produced it, so a report can
+be shown not to have been quietly edited. The report keeps three columns strictly
+separate — what the catalog **expected** to fire, what this host **observed**, and what
+the presenter **confirmed** on the customer's console — and names the policy dimensions
+the session did *not* exercise.
+
+**Local disk only.** Nothing is uploaded, nothing phones home, and there is still no
+listening socket. See [docs/milestones/M1-evidence-and-reporting.md](docs/milestones/M1-evidence-and-reporting.md).
+
 ## What the result states mean
 
 | State | What happened locally | Reading it |

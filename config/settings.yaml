@@ -20,6 +20,11 @@ run:
   # Set control_host to "" to disable.
   control_host: "1.1.1.1"
   control_port: 443
+  # Stamp an X-SecVitals-Run: <run id> header on curl triggers so the customer's console
+  # can be filtered to exactly this run. OFF by default on purpose: it adds a header to
+  # traffic whose whole job is to match a signature faithfully, and it marks that traffic
+  # as synthetic. Turn it on when correlation matters more than fidelity.
+  correlation_header: false
 
 webcc:
   # IP-reputation (ns-iprep) probes live Tor relays. The node list is cached with a TTL
@@ -30,6 +35,15 @@ webcc:
   tor_list_ttl_s: 3600
   ip_rep_sample: 6                # probe the first N well-formed relay IPs
   node_probe_timeout_s: 5
+
+evidence:
+  # Run evidence — the hash-chained ledger behind "Save report", --export, and
+  # --last-session. LOCAL DISK ONLY: nothing is uploaded, there is still no listening
+  # socket, and no telemetry of any kind is sent.
+  log: true
+  # Where evidence lands. Empty = the per-user default
+  # (%LOCALAPPDATA%\SecVitals\runs on Windows, ~/.local/share/secvitals/runs elsewhere).
+  dir: ""
 
 update:
   # Pinned, non-overridable release source. The updater fails CLOSED without a valid

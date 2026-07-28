@@ -21,7 +21,8 @@ FEED_URL = "https://example.invalid/tor.txt"
 def mk_app(control_host="1.1.1.1", sample=3):
     settings = sv.Settings(raw={"run": {"control_host": control_host, "control_port": 443},
                                 "webcc": {"ip_rep_sample": sample, "node_probe_timeout_s": 1,
-                                          "tor_list_url": FEED_URL}})
+                                          "tor_list_url": FEED_URL},
+                                "evidence": {"log": False}})
     trig = sv.Trigger.from_dict({"id": "ip-rep-tor", "label": "tor", "class": "ns-iprep",
                                  "runner": "iprep", "argv": ["iprep"],
                                  "flags": ["needs_internet"]}, 30.0)
@@ -93,7 +94,8 @@ class TestIprep(unittest.TestCase):
         # ip-rep-tor carries hits_live_suspect_hosts; with the gate off it must not run.
         settings = sv.Settings(raw={"enable_live_suspect_hosts": False,
                                     "run": {"control_host": "1.1.1.1"},
-                                    "webcc": {"tor_list_url": FEED_URL}})
+                                    "webcc": {"tor_list_url": FEED_URL},
+                                    "evidence": {"log": False}})
         trig = sv.Trigger.from_dict({"id": "ip-rep-tor", "label": "tor", "class": "ns-iprep",
                                      "runner": "iprep", "argv": ["iprep"],
                                      "flags": ["needs_internet", "hits_live_suspect_hosts"]}, 30.0)

@@ -190,3 +190,39 @@ class TestGating(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSettingsAccessors(unittest.TestCase):
+    """Every Settings config accessor must be a @property.
+
+    Regression guard for a merge hazard: two branches each added a property to this
+    class, sharing the leading `@property` line as context. Concatenating both sides
+    left the second `def` undecorated — so `settings.evidence_log_enabled` returned a
+    bound method, which is always truthy, silently re-enabling evidence logging that an
+    operator had turned OFF. A decorator lost this way changes a default without
+    changing a single line of visible logic, so it is asserted rather than eyeballed."""
+
+    def test_no_config_accessor_is_left_undecorated(self):
+        settings = sv.Settings(raw={})
+        offenders = []
+        for name in dir(sv.Settings):
+            if name.startswith("_"):
+                continue
+            attr = getattr(sv.Settings, name, None)
+            if callable(attr) and not isinstance(attr, property):
+                continue                       # a genuine method, not an accessor
+            if isinstance(attr, property):
+                value = getattr(settings, name)
+                if callable(value):
+                    offenders.append(name)     # a property returning a callable is a smell
+        self.assertEqual(offenders, [])
+
+    def test_known_toggles_evaluate_to_real_booleans(self):
+        """A bound method is truthy, so `if settings.x:` would pass either way."""
+        settings = sv.Settings(raw={"evidence": {"log": False}})
+        for name in ("enable_live_suspect_hosts", "evidence_log_enabled",
+                     "correlation_header", "check_update_on_start"):
+            if hasattr(sv.Settings, name):
+                value = getattr(settings, name)
+                self.assertIsInstance(value, bool, f"{name} is {type(value).__name__}")
+        self.assertFalse(settings.evidence_log_enabled)   # the setting is honoured

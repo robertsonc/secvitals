@@ -10,7 +10,7 @@ demo. It fires the traffic and reports what it saw **locally** — `allowed`,
 `blocked`, or `error` — and never pretends to be the authority. The customer
 reads the real verdict on their own management console, already on screen.
 
-Everything in this document is grounded in the code as of version **0.1.2**
+Everything in this document is grounded in the code as of version **0.6.0**
 (`secvitals.py`, `config/catalog.yaml`, `config/settings.yaml`). It is organized
 in three parts:
 
@@ -46,7 +46,7 @@ reputation, and DLP / content inspection); east–west is deferred (see §1.9).
 
 | Property | Choice | Why it matters for a demo |
 |---|---|---|
-| **Form factor** | Single‑file, stdlib‑only **Tkinter window** (`secvitals.py`, ~2,500 lines). No browser, no server. | Nothing to stand up on the SE laptop; opens in its own window with its own taskbar icon. |
+| **Form factor** | Single‑file, stdlib‑only **Tkinter window** (`secvitals.py`, ~4,400 lines). No browser, no server. | Nothing to stand up on the SE laptop; opens in its own window with its own taskbar icon. |
 | **Execution** | **Native** — `curl.exe` (Windows 10 1803+) for HTTP; built‑in stdlib probes for DNS and TCP; a built‑in IP‑reputation probe. **No WSL, no shell, no download‑and‑execute.** | Windows‑origin traffic (representative); the same IDS signatures trip without shipping a third‑party binary. |
 | **What fires** | A **fixed catalog** (`config/catalog.yaml`). Commands are argv lists, never built from free text; optional params are allowlist/pattern‑validated. | The signal set is auditable and repeatable — a *known quantity*, not ad‑hoc traffic. |
 | **What it reports** | A **three‑state classifier** where `blocked` and `error` never collapse. | A broken environment is reported as `error`, never a false `blocked` that would misrepresent the customer's product. |
@@ -56,17 +56,23 @@ reputation, and DLP / content inspection); east–west is deferred (see §1.9).
 ### 1.3 The test cases it supports today — the trigger catalog
 
 In Security Vitals' vocabulary, a **"test case" is a demo trigger**: a fixed unit
-of traffic designed to trip a specific control. There are **41 triggers** across
-four active classes (plus one reserved class):
+of traffic designed to trip a specific control. There are **53 triggers** across
+**five** active classes — the `ew` class, reserved and empty since Phase 0, is now
+filled:
 
 | Class | UI label | Triggers | Catalog commands | On‑wire requests |
 |---|---|---:|---:|---:|
-| `ns-ids` | NORTH‑SOUTH · IDS / IPS | 19 | 43 | 43 |
-| `ns-webcc` | NORTH‑SOUTH · WEB CATEGORIES & REPUTATION (SWG) | 18 | 18 | 18 |
+| `ns-ids` | NORTH‑SOUTH · IDS / IPS | 23 | 52 | 52 |
+| `ns-webcc` | NORTH‑SOUTH · WEB CATEGORIES & REPUTATION (SWG) | 20 | 20 | 20 |
 | `ns-dlp` | NORTH‑SOUTH · DATA LOSS PREVENTION (content inspection) | 3 | 4 | 4 |
-| `ns-iprep` | NORTH‑SOUTH · IP REPUTATION | 1 | 1 | 6 (node sample) |
-| `ew` | EAST‑WEST | **0** (reserved / deferred) | 0 | 0 |
-| **Total** | | **41** | **66** | **71** |
+| `ns-iprep` | NORTH‑SOUTH · IP REPUTATION | 4 | 4 | 24 (4 × node sample) |
+| `ew` | EAST‑WEST | 3 | 3 | 0 until targets are configured |
+| **Total** | | **53** | **83** | **100** |
+
+**66 signals across 41 triggers** by default; **100 across 50** with the
+live‑suspect gate on. The three `ew` triggers contribute **0** until a site defines
+`east_west.targets` — they are *not configured*, which is deliberately its own
+state, distinct from *gated* and emphatically distinct from *blocked* (§1.4).
 
 > #### The "known quantity" — exactly how many signals hit the wire
 >
@@ -91,7 +97,7 @@ four active classes (plus one reserved class):
 > **Signal manifest** button compute it from the live catalog and send nothing
 > (§2.1a).
 
-**The full catalog (all 41 triggers):**
+**The full catalog (all 53 triggers):**
 
 | # | id | Test case | Class | Runner | Req | Threat | Sev | Expected to fire (SID / rule) | Gated |
 |--:|---|---|---|---|--:|---|---|---|:--:|
@@ -115,6 +121,10 @@ four active classes (plus one reserved class):
 | 15c | `ns-spring4shell` | Spring4Shell class‑loader probe (CVE‑2022‑22965) | ns-ids | curl | 1 | exploit | warn | ET EXPLOIT — Spring class‑loader manipulation | — |
 | 15d | `ns-scanner-ua` | Scanner user agents (Nikto/sqlmap/Nmap) | ns-ids | curl | **3** | recon | warn | ET SCAN — scanner user agent observed outbound | — |
 | 16 | `web-cat-gambling` | Gambling — bet365.com | ns-webcc | curl | 1 | policy | info | SWG category Gambling · Deny → timeout | — |
+| 16a | `ns-dns-dga` | DGA‑style domains (high‑entropy generated names) | ns-ids | dns | **3** | c2 | warn | ET DNS / DGA heuristics — algorithmically generated lookups | — |
+| 16b | `ns-dns-tunnel` | DNS tunnelling (long labels, TXT + NULL) | ns-ids | dns | **3** | c2 | crit | ET DNS — tunnelling / exfiltration over TXT and NULL | — |
+| 16c | `ns-doh` | DNS‑over‑HTTPS (resolver bypass) | ns-ids | curl | **2** | policy | warn | ET POLICY — DNS over HTTPS (DoH) usage | — |
+| 16d | `ns-uid-v6` | Linux UID over **IPv6** (address‑family parity) | ns-ids | curl | 1 | recon | warn | SID 2100498 over IPv6 — same signature on the v6 path | — |
 | 17 | `web-cat-social` | Social Networking — facebook.com | ns-webcc | curl | 1 | policy | info | SWG Social Networking · Deny → timeout | — |
 | 18 | `web-cat-streaming` | Streaming Media — youtube.com | ns-webcc | curl | 1 | policy | info | SWG Streaming Media · Deny → timeout | — |
 | 19 | `web-cat-proxy` | Proxy / Anonymizer — hidemyass.com | ns-webcc | curl | 1 | policy | warn | SWG Proxy Avoidance · Deny → timeout | — |
@@ -131,13 +141,21 @@ four active classes (plus one reserved class):
 | 25e | `web-cat-weapons` | Weapons — guns.com | ns-webcc | curl | 1 | policy | info | SWG category Weapons · Deny → timeout | — |
 | 25f | `web-cat-drugs` | Marijuana / Drugs — leafly.com | ns-webcc | curl | 1 | policy | info | SWG category Marijuana / Drugs · Deny → timeout | — |
 | 25g | `web-cat-hacking` | Hacking / exploit tooling — exploit‑db.com | ns-webcc | curl | 1 | policy | warn | SWG category Hacking · Deny → timeout | **●** |
+| 25h | `web-cat-social-v6` | Social Networking over **IPv6** (SWG parity) | ns-webcc | curl | 1 | policy | info | SWG category Social Networking over IPv6 · Deny → timeout | — |
+| 25i | `web-cat-social-h3` | Social Networking over **HTTP/3** (QUIC parity) | ns-webcc | curl | 1 | policy | warn | SWG category over HTTP/3 · a UDP/443 flow — no log entry is itself the finding | — |
 | 25h | `web-cat-adult` | Adult content — category test | ns-webcc | curl | 1 | policy | warn | SWG category Adult · Deny → timeout | **●** |
 | 26 | `ip-rep-tor` | IP Reputation — Tor Proxy nodes (:443) | ns-iprep | iprep | 1* | policy | warn | IP reputation "Tor Proxy" · Deny → timeouts (ratio) | **●** |
+| 26a | `ip-rep-botnet` | IP Reputation — botnet C2 (Feodo Tracker) | ns-iprep | iprep | 1 * | c2 | crit | IP reputation 'Botnet C2 / Malware' · Deny → timeouts (ratio) | **●** |
+| 26b | `ip-rep-scanner` | IP Reputation — SSH brute‑force sources (:22) | ns-iprep | iprep | 1 * | recon | warn | IP reputation 'Scanner / brute‑force' · Deny → timeouts (ratio) | **●** |
+| 26c | `ip-rep-spammer` | IP Reputation — mail‑abuse sources (:25) | ns-iprep | iprep | 1 * | policy | warn | IP reputation 'Spam source' · Deny → timeouts (ratio) | **●** |
 | 27 | `dlp-pan` | Credit‑card data (synthetic test PAN) | ns-dlp | curl | 1 | dlp | crit | DLP — credit‑card number in an outbound POST body | — |
 | 28 | `dlp-ssn` | Personal data (never‑issued SSN) | ns-dlp | curl | 1 | dlp | crit | DLP — US SSN pattern in an outbound POST body | — |
 | 29 | `dlp-secrets` | Credentials & keys (documentation examples) | ns-dlp | curl | **2** | dlp | crit | DLP — cloud access key / private‑key material | — |
+| 30 | `ew-server-zone` | Segmentation — workstation → server zone | ew | ew | 1 † | lateral | crit | East–west policy · DENY admin ports (SMB/RDP/SSH/SQL) | ○ |
+| 31 | `ew-user-zone` | Segmentation — peer workstation isolation | ew | ew | 1 † | lateral | warn | East–west policy · client isolation between peers | ○ |
+| 32 | `ew-dmz` | Segmentation — DMZ → internal pivot | ew | ew | 1 † | lateral | crit | East–west policy · DMZ → internal should DENY | ○ |
 
-<sub>`Req` = number of catalog commands. `*` `ip-rep-tor` has one command but probes `ip_rep_sample` (6) live relays on the wire. `●` = gated by `hits_live_suspect_hosts`, off by default. Lettered rows were added in roadmap wave 1.</sub>
+<sub>`Req` = number of catalog commands. `*` an `iprep` trigger has one command but probes `ip_rep_sample` (6) live addresses on the wire — 4 feeds × 6 = 24. `†` an `ew` trigger probes one port per entry in its target's `ports` list, and contributes **0** until `east_west.targets` is defined. `●` = gated by `hits_live_suspect_hosts`, off by default. `○` = *not configured* for this site — a different state from gated, and not a policy result. Lettered rows were added in roadmap waves 1 and 2.</sub>
 
 **On the exploit and DLP payloads.** Both packs are built to be *inert by
 construction*, because a demo tool must never actually attack anything or leak
@@ -163,7 +181,7 @@ into one of **five** result states, and it is deliberate about which two must
 | **allowed** | The trigger ran; the expected response came back. | IDS is in **detect‑only** mode, or the SWG category is not set to Deny. |
 | **blocked** | The flow was dropped inline (reset / timeout / policy deny). | **IPS / SWG enforcement is working** — the money shot. |
 | **error** | The trigger couldn't run (DNS, TLS, no route, curl missing). | **Not a policy result.** Fix the environment; never read as a block. |
-| **invalid** | A gated live‑suspect trigger is off, *or* the IP‑rep egress control failed. | Enable the gate in a lab, or fix egress. |
+| **invalid** | A gated live‑suspect trigger is off; the IP‑rep egress control failed; an east‑west target is **not configured** for this site; or `curl` is missing. | Enable the gate in a lab, fix egress, define `east_west.targets`, or install curl. Never a policy result. |
 | **ratio** | IP reputation reached N‑of‑M live suspect nodes. | A ratio, not a verdict; the inline IP‑rep stats are authoritative. |
 
 `blocked` and `error` **never collapse** — that distinction is the whole demo.
@@ -241,12 +259,18 @@ verifiable on the inline stack, by design.
 
 ### 1.9 What's deferred
 
-**East–west (E/W)** — lateral‑movement / internal‑segmentation testing — is
-scoped but unbuilt. The `ew` class and its UI label exist as reserved schema, but
-there are **zero** E/W triggers. The decision record (`CONFIRMED.md` §7) sketches
-two future tiers: a tier‑1 policy/port probe (no listener required) and a tier‑2
-payload‑signature test (needs a second deployable reflector with its own update
-surface). E/W is the largest single gap and anchors the roadmap's long lead item.
+**East–west tier 1 has shipped** — three segmentation triggers fill the formerly
+empty `ew` class (§3.3). What remains deferred is **tier 2**: payload‑signature
+testing east–west. IDS content rules carry `flow:established,to_server`, so payload
+is only evaluated after a completed three‑way handshake — which needs a **second
+deployable** reflector/listener with its own update surface. That breaks the
+single‑file guardrail, so it stays out until the update path is hardened for two
+artifacts. See `CONFIRMED.md` §7.
+
+Also unverified rather than deferred: **no build has been launched on real
+Windows**. `tkinter` cannot be installed in CI, so the window is covered by a
+fake‑widget smoke test that catches the Tcl option errors which broke 0.1.1 — but
+presenter mode and the report dialog have never opened an actual window.
 
 ---
 
@@ -283,11 +307,22 @@ py secvitals.py --list --format json   # the same, machine-readable
 ```
 
 …or click **☰ Signal manifest** in the window. The window's header also shows the
-running total (`55 signals · 35 triggers`), and each trigger card carries its own
+running total (`66 signals · 41 triggers`), and each trigger card carries its own
 signal chip — so `ip-rep-tor` reads *6 signals*, not *1 command*.
 
-Use this to open the demo with a concrete promise: *"I'm about to generate 55
-attributable signals across 35 triggers — here's the list."*
+Use this to open the demo with a concrete promise: *"I'm about to generate 66
+attributable signals across 41 triggers — here's the list."*
+
+The manifest separates three reasons a trigger will not run, because they mean
+different things and only one of them is fixable with a toggle:
+
+- **DISABLED — reaches live suspect infrastructure** — the gate (§2.7).
+- **NOT CONFIGURED HERE** — east–west triggers with no `east_west.targets`
+  defined for this site. No gate can supply a target.
+- neither — it runs.
+
+The "if the gate were enabled" figure counts only what the **gate** can unlock, so
+it never promises signals that configuration alone would deliver.
 
 ### 2.1b Pre‑brief with headless mode
 
@@ -309,6 +344,85 @@ do. Exit codes are policy‑neutral:
 | **2** | Usage or config problem (unknown trigger id/class, bad config). |
 
 A red build here means *fix your environment*, never *the customer's stack failed*.
+
+### 2.1c Demo profiles — run a story, not an inventory
+
+"Run all" is catalog order, which is an inventory. A **profile** is a curated,
+ordered subset with a committed signal count:
+
+```bash
+py secvitals.py --profiles                     # what's available + each count
+py secvitals.py --profile exec-5min --list     # the plan for that profile
+py secvitals.py --profile exec-5min --run all  # fire it, in profile order
+```
+
+Five ship in `settings.yaml`: `exec-5min` (6 signals), `ids-story` (21),
+`swg-story` (9), `data-protection` (5), `modern-cve` (6). A profile only ever
+**selects** existing catalog ids — it never defines a command — and every id is
+validated at startup, so a typo fails at launch rather than on stage.
+
+In the window, **🎤 Presenter mode** walks one trigger at a time in large type:
+expected SID, talking point, where to look on the customer's console, then the
+observed state and a running scoreboard by state and class. The scoreboard counts
+what **this host observed**; it is never a claim about the customer's stack.
+
+### 2.1d Leave something behind — the evidence report
+
+```bash
+py secvitals.py --run all --export demo.html   # HTML leave-behind (.json / .csv too)
+py secvitals.py --last-session                 # re-read the last run, fire nothing
+```
+
+…or click **⬇ Save report**. Every run is recorded in a **hash‑chained ledger**
+stamped with SHA‑256 digests of the code and catalog that produced it, so a report
+can be shown not to have been quietly edited after the fact.
+
+The report keeps three kinds of evidence in three columns that are never merged:
+
+| Column | Source | Authority |
+|---|---|---|
+| **Expected to fire** | the fixed catalog | what *should* happen if the control enforces |
+| **Observed locally** | this host's classifier | honest, but only about what *this host* saw |
+| **Confirmed on console** | the presenter ticking a box | a human attestation, not a measurement |
+
+That third column is the per‑card **Console:** toggle (*not marked → confirmed ✓ →
+not seen*). It is stored beside the machine's observation, never on top of it, and
+deliberately sits **outside** the hash chain — a human annotation added after the
+run would otherwise look identical to tampering.
+
+**Local disk only.** Nothing is uploaded, and no browser is launched on your behalf.
+
+### 2.1e Pre‑flight — is this host ready?
+
+```bash
+py secvitals.py --preflight        # exit 0 ready, 1 not ready
+py secvitals.py --strict-catalog   # refuse to start unless the catalog is signed
+```
+
+`--preflight` checks curl, egress control, and the catalog signature. It answers
+exactly one question — *can this console run its triggers from here?* — and says so
+in its own output. It is **not** a prediction of what policy will allow or block;
+that is what firing the triggers is for.
+
+### 2.1f East–west: probing internal segmentation
+
+`ew-server-zone`, `ew-user-zone` and `ew-dmz` probe whether one internal zone can
+reach another. Tier 1 is a bare TCP connect — no payload, no listener needed.
+
+Targets are **your** addresses, so nothing ships pre‑filled. Until you define
+`east_west.targets`, these report *"not configured"*. Reading a result:
+
+| Outcome | What happened | Reported as |
+|---|---|---|
+| SYN‑ACK | reachable, listening | reachable |
+| **RST** | the SYN **arrived** and the host answered — path open, port closed | **reachable** |
+| timeout | no answer at all | **blocked** |
+| unreachable | `ENETUNREACH` / ICMP unreachable — *this* host has no route | **error** |
+
+A **RST is not a block** — it proves the packet got there, and reporting it as
+blocked would credit the firewall with work the host did. A control port on the
+same target is probed first; if the host itself does not answer, the result is
+`error`, never a false `blocked`.
 
 ### 2.2 The window
 
@@ -384,8 +498,13 @@ enable_live_suspect_hosts: true
 ```
 
 This turns on `ns-badcert`, `ns-tor`, `web-cat-p2p`, `web-cat-hacking`,
-`web-cat-adult`, and `ip-rep-tor` — the difference between a 55‑signal and a
-71‑signal run.
+`web-cat-adult`, `ip-rep-tor`, `ip-rep-botnet`, `ip-rep-scanner` and
+`ip-rep-spammer` — the difference between a 66‑signal and a 100‑signal run.
+
+The three reputation feeds beyond Tor reach **real** botnet‑C2, scanner and
+mail‑abuse addresses, and `ip-rep-scanner`/`ip-rep-spammer` probe **:22 and :25**,
+which some corporate egress policies deny outright. That is a legitimate `blocked`,
+but know it so it is not misread as IP‑reputation enforcement specifically.
 
 ### 2.8 Configuration knobs (`settings.yaml`)
 
@@ -394,12 +513,22 @@ Logic and config are separate. You edit `settings.yaml`; the **catalog is fixed*
 
 | Setting | Default | What it controls |
 |---|---|---|
-| `enable_live_suspect_hosts` | `false` | The four LIVE triggers (§2.7). |
+| `enable_live_suspect_hosts` | `false` | The nine LIVE triggers (§2.7). |
 | `run.default_timeout_s` | `30` | Per‑trigger timeout ceiling. |
 | `run.control_host` / `control_port` | `1.1.1.1` / `443` | The egress control probe (blocked‑vs‑error disambiguation). Set host to `""` to disable. |
 | `run.min_interval_s` | `0.75` | Minimum spacing between runs. |
-| `webcc.ip_rep_sample` | `6` | How many Tor relays the IP‑rep probe hits. |
-| `webcc.tor_list_url` / `tor_list_ttl_s` | SecOps‑Institute list / `3600` | Source and cache TTL for the relay list. |
+| `run.control_endpoints` | 3 endpoints | Ordered, transport‑matched control list; egress counts as up if **any** answers, so one filtered host cannot mask real blocks. Falls back to `control_host`/`control_port`. |
+| `run.ipv6_control_url` | Cloudflare v6 literal | Tells "this host has no IPv6" apart from "policy dropped it". Empty ⇒ IPv6 triggers report `error` rather than guess. |
+| `run.correlation_header` | `false` | Stamp `X-SecVitals-Run` on curl triggers. **Off by design** — it marks the traffic synthetic. |
+| `run.origin_failover` | `{}` | ERROR‑only failover to an alternate origin. **Empty by design** — see the Wave 2 caveats (§3). |
+| `run.strict_catalog` | `false` | Refuse to start unless `catalog.yaml.sig` verifies. |
+| `webcc.ip_rep_sample` | `6` | How many addresses each IP‑rep feed probes. |
+| `webcc.tor_list_url` / `tor_list_ttl_s` | SecOps‑Institute list / `3600` | Source and cache TTL for the Tor relay list. |
+| `webcc.reputation_feeds` | 3 feeds | Named https IP‑reputation feeds (`botnet-c2`, `scanner`, `spammer`). A trigger names a feed by **fixed token**, never a URL. |
+| `east_west.targets` | `{}` | Your internal zones (host, control port, denied ports). Empty ⇒ `ew` triggers report *not configured*. |
+| `east_west.probe_timeout_s` | `3` | Per‑port east–west probe timeout. |
+| `evidence.log` / `evidence.dir` | `true` / per‑user | Local JSONL evidence log and where artifacts land. Local disk only. |
+| `profiles` | 5 profiles | Curated, ordered run‑sets. Ids are validated against the catalog at startup. |
 | `update.check_on_start` | `false` | Whether to check for updates at launch. |
 
 ### 2.9 Updating
@@ -414,8 +543,9 @@ the new version.
 1. Run `py secvitals.py --run all` **from the customer's network** — the
    pre‑brief. Exit 0 means every trigger produced a policy result; exit 1 tells
    you which origin or control probe to fix *before* you're on stage.
-2. Decide the profile: **default (55 signals)** on a customer‑adjacent network,
-   or **lab (71 signals)** with the gate on. Confirm with `--list`.
+2. Decide the profile: **default (66 signals)** on a customer‑adjacent network,
+   or **lab (100 signals)** with the gate on. Confirm with `--list`, or pick a
+   demo profile with `--profile <name> --list` (§2.1c).
 3. Fire one cheap trigger (`ns-uid`) and confirm you see it on the customer
    console — this proves the correlation path before the real run. Use **Copy
    verification key** to jump straight to the right filter.
@@ -458,6 +588,62 @@ deliberately rejected (§3.6).
 >
 > The suite grew from **89 to 138 tests** alongside these changes.
 
+> ### ✅ Wave 2 — shipped (the rest of the roadmap)
+>
+> Everything else in §3.2–§3.5 is **delivered**, across five independently
+> reviewed milestones. Versions are numeric‑only by design: the updater's version
+> parser strips non‑digits, so `0.2.0-alpha.1` and `0.2.0` would both parse as
+> `(0,2,0)` and an alpha user would never see the final release as newer. The
+> alpha marker lives in the release tag instead.
+>
+> | Milestone | Version | What it delivered |
+> |---|---|---|
+> | **M1 · Evidence & Reporting** | 0.2.0 | Hash‑chained run ledger, provenance stamp, expected/observed/confirmed scorecard, coverage matrix, JSON/CSV/HTML export, local JSONL evidence log, optional correlation header |
+> | **M2 · Presenter Experience** | 0.3.0 | Demo profiles (curated, ordered, validated at startup), presenter mode with a live scoreboard, deterministic pre‑run plan |
+> | **M3 · Coverage Breadth** | 0.4.0 | DNS‑security pack (DGA / tunnelling / DoH), DNS query types, three new reputation feeds, IPv6 & HTTP‑3 parity twins with a transport‑capability gate |
+> | **M4 · East‑West Tier 1** | 0.5.0 | Internal segmentation probing; fills the `ew` class |
+> | **M5 · Trust & Robustness** | 0.6.0 | Multi‑endpoint control probe, catalog signing + `--strict-catalog`, `--preflight`, graceful curl‑absent, ERROR‑only origin failover |
+>
+> Catalog: **41 → 53 triggers**, **71 → 100** lab signals. Suite: **138 → 306
+> tests** across 14 files.
+>
+> #### Three things Wave 2 deliberately did *not* do
+>
+> - **The correlation header ships OFF.** It marks the traffic as synthetic and
+>   adds a header to requests whose whole job is to reproduce a signature
+>   faithfully. That trade belongs to the operator.
+> - **Origin failover ships EMPTY.** An alternate origin that does not serve the
+>   same content can turn a real signal into a benign request — `ns-uid` matches
+>   on the *response body*, so a 404 from an alternate would read as `allowed`
+>   while proving nothing. Enable it only with an origin you control.
+> - **Catalog signing fails VISIBLE, not closed.** Existing installs have no
+>   signature and must keep working, so an unsigned catalog is reported rather
+>   than refused. `--strict-catalog` opts into refusal, and gates every path
+>   including `--list` — an untrusted catalog should not even be enumerated.
+>
+> #### What integration cost, and what it caught
+>
+> The five milestones were built as independent branches off `main`, which meant
+> nine merges as each landed. That found **four defects no single‑branch CI could
+> have caught**, because each only existed once milestones were combined:
+>
+> 1. A **dropped `@property`** — both branches added a `Settings` property under a
+>    shared `@property` line, and concatenating left the second undecorated. A
+>    bound method is always truthy, so evidence logging ran even when an operator
+>    had configured it **off**.
+> 2. A **dropped `return out`** — `load_ew_targets` and `load_profiles` both end
+>    with that exact line; git matched it as shared context and emitted it once.
+>    `load_ew_targets` returned `None`, which would have made every east‑west
+>    trigger raise instead of reporting "not configured".
+> 3. An **availability check split in two** — several call sites still asked only
+>    `gated_disabled`, so the header promised signals that could not fire and the
+>    coverage matrix counted unconfigured triggers as exercisable.
+> 4. A **trigger count that overstated the gate** — "N signals if the gate is
+>    enabled (M triggers)" counted triggers no gate can unlock.
+>
+> Neither of the first two changed a visible line of logic, and both were
+> invisible in the conflict diff. All four now have permanent regression guards.
+
 ### 3.1 The guardrails every feature must respect
 
 The value of this tool is that its signal set is **fixed, honest, and safe**. Any
@@ -483,10 +669,10 @@ Make the signal count exact, reproducible, and provable to the customer.
 |---|---|:--:|:--:|:--:|
 | ✅ **True on‑wire count** (`wire_request_count`) | Fix the console under‑reporting IP‑rep 6× (`to_public` reports `len(commands)=1`); show a per‑profile "N signals across M triggers" tally. | ★★★ | S | Near |
 | ✅ **Dry‑run "Signal Manifest"** | A zero‑egress preview (GUI toggle + `--dry-run`) listing every enabled trigger's redacted argv, destination, expected SID, and **true** on‑wire count — the pre‑brief artifact and the 6× fix in one. | ★★★★ | S | Near |
-| **Per‑run Signal Ledger + export** | Accumulate every fired request (5‑tuple, 3‑state verdict, rc/http, control_ok) and export **JSON / CSV / printable HTML** as a leave‑behind. Local disk only. | ★★★★ | M | Mid |
-| **Expected‑vs‑Observed scorecard** | Pair each trigger's `expected_fire` with its local result, with an SE‑tickable "confirmed on console" column — the demo's reconciliation sheet. | ★★★★ | M | Mid |
-| **Policy‑coverage matrix** | From catalog metadata + run states, show which dimensions (class, threat, severity) were exercised — and name the empty cells (IP‑rep = Tor‑only, E/W = 0) honestly. | ★★★ | S | Near |
-| **Per‑run correlation ID on the wire** | A code‑pinned `X-SecVitals-Run:<uuid>` header so the customer console can be filtered to exactly this run's flows. | ★★ | M | Mid |
+| ✅ **Per‑run Signal Ledger + export** | Accumulate every fired request (5‑tuple, 3‑state verdict, rc/http, control_ok) and export **JSON / CSV / printable HTML** as a leave‑behind. Local disk only. | ★★★★ | M | Mid |
+| ✅ **Expected‑vs‑Observed scorecard** | Pair each trigger's `expected_fire` with its local result, with an SE‑tickable "confirmed on console" column — the demo's reconciliation sheet. | ★★★★ | M | Mid |
+| ✅ **Policy‑coverage matrix** | From catalog metadata + run states, show which dimensions (class, threat, severity) were exercised — and name the empty cells (IP‑rep = Tor‑only, E/W = 0) honestly. | ★★★ | S | Near |
+| ✅ **Per‑run correlation ID on the wire** | A code‑pinned `X-SecVitals-Run:<uuid>` header so the customer console can be filtered to exactly this run's flows. | ★★ | M | Mid |
 
 ### 3.3 Theme B — Coverage breadth *(more, and more modern, signals)*
 
@@ -498,10 +684,10 @@ are **catalog‑only** additions reusing the existing runners and classifier.
 | ✅ **SWG category pack** | ~8–10 new `ns-webcc` category triggers (Generative‑AI / Shadow‑AI, Weapons, Hacking, Adult, Dating, Drugs, Job‑search), awkward hosts gated. Category breadth is how a modern SWG is graded. | ★★★★ | S | Near |
 | ✅ **Modern‑exploit IDS pack** | `ns-ids` triggers carrying **inert** Log4Shell/Spring4Shell/ShellShock/exploit‑kit‑UA strings as fixed argv literals to the benign origin — the marquee‑CVE SIDs every IPS markets, never actually exploiting anything. | ★★★★ | S | Near |
 | ✅ **DLP / data‑exfil pack** | POST obviously‑synthetic test PII (the reserved 4111‑test PAN, a reserved SSN, a fake `AKIA…`/`BEGIN RSA PRIVATE KEY` marker) over HTTP and HTTPS to a benign sink to exercise inline content inspection. | ★★★★ | S | Near |
-| **DNS‑security pack** | Fixed‑string DGA + long‑name tunneling triggers, plus DoH via curl and an optional stdlib TXT query type. | ★★★ | S | Near |
-| **IP‑reputation expansion** | Curated botnet‑C2 / spammer / scanner reputation feeds as gated `ns-iprep` triggers — today IP‑rep is Tor‑only. | ★★★ | M | Mid |
-| **East‑West tier‑1 port probe** | An outbound‑only TCP probe filling the empty `ew` class: SYN‑ACK/RST = reachable, timeout + same‑zone control reachable = blocked, control unreachable = error. First lateral‑movement / segmentation signals. | ★★★★ | L | Mid |
-| **IPv6 / HTTP‑3 (QUIC) twins** | Address‑family and UDP‑443 variants of key triggers to expose policy blind spots (needs a curl control probe so absent v6/QUIC reads as error, not false‑blocked). | ★★★ | L | Mid |
+| ✅ **DNS‑security pack** | Fixed‑string DGA + long‑name tunneling triggers, plus DoH via curl and an optional stdlib TXT query type. | ★★★ | S | Near |
+| ✅ **IP‑reputation expansion** | Curated botnet‑C2 / spammer / scanner reputation feeds as gated `ns-iprep` triggers — today IP‑rep is Tor‑only. | ★★★ | M | Mid |
+| ✅ **East‑West tier‑1 port probe** | An outbound‑only TCP probe filling the empty `ew` class: SYN‑ACK/RST = reachable, timeout + same‑zone control reachable = blocked, control unreachable = error. First lateral‑movement / segmentation signals. | ★★★★ | L | Mid |
+| ✅ **IPv6 / HTTP‑3 (QUIC) twins** | Address‑family and UDP‑443 variants of key triggers to expose policy blind spots (needs a curl control probe so absent v6/QUIC reads as error, not false‑blocked). | ★★★ | L | Mid |
 
 ### 3.4 Theme C — SE workflow, evidence & the verification loop
 
@@ -510,13 +696,13 @@ Make a live demo smoother and give the customer something to keep.
 | Feature | What it adds | Value | Effort | Horizon |
 |---|---|:--:|:--:|:--:|
 | ✅ **Headless batch / pre‑brief mode** (`--run`, `--list`, `--format json`) | Validate egress + which signals fire **from the customer network before the meeting**, and prove the known‑quantity set in CI — reusing `App.run`/`classify()` verbatim. A block exits 0 (a win, not a failure); only error/invalid/config problems exit non‑zero. | ★★★★ | M | Near |
-| **Demo profiles / playlists** | Named, ordered run‑sets (e.g. "5‑minute exec demo", "SWG deep‑dive") so a presenter runs a tight, repeatable, *countable* subset instead of all 26. | ★★★★ | M | Mid |
-| **Presenter mode** | A paced talk‑track over Run‑all surfacing each trigger's talking point / expected SID in large type, plus a persistent big‑font scoreboard by class. | ★★★★ | M | Mid |
-| **Self‑contained HTML demo report** | One `html.escape`'d file combining expected SID + honest local state + 5‑tuple + provenance, opened in the browser — the shareable evidence artifact. | ★★★★ | M | Mid |
+| ✅ **Demo profiles / playlists** | Named, ordered run‑sets (e.g. "5‑minute exec demo", "SWG deep‑dive") so a presenter runs a tight, repeatable, *countable* subset instead of all 41. | ★★★★ | M | Mid |
+| ✅ **Presenter mode** | A paced talk‑track over Run‑all surfacing each trigger's talking point / expected SID in large type, plus a persistent big‑font scoreboard by class. | ★★★★ | M | Mid |
+| ✅ **Self‑contained HTML demo report** | One `html.escape`'d file combining expected SID + honest local state + 5‑tuple + provenance, opened in the browser — the shareable evidence artifact. | ★★★★ | M | Mid |
 | ✅ **`console_hint` + live correlation key** | An optional, load‑validated per‑trigger "where to look" hint plus a composed correlation key (live 5‑tuple + UTC window + expected SID) — turns the 5‑tuple table into a pointer at the right console filter. | ★★★★ | S | Near |
 | ✅ **Copy‑verification‑key button** | One click copies a greppable `UTC \| trigger \| expect SID \| src→dst \| local:state` line straight into the customer console's filter box — no alt‑tab retyping at the money moment. | ★★★★ | S | Near |
-| **Session recap / evidence log** | A local "Save recap" proof‑of‑fire file, and an append‑only JSONL log with "reload last session" (re‑render cards without re‑firing). No upload, no listener. | ★★★ | M | Near–Mid |
-| **Graceful curl‑absent / offline state** | Detect curl‑missing and full‑offline at startup and mark curl triggers **INVALID** with a one‑line remediation banner instead of a wall of ambiguous ERRORs. | ★★★ | S | Near |
+| ✅ **Session recap / evidence log** | A local "Save recap" proof‑of‑fire file, and an append‑only JSONL log with "reload last session" (re‑render cards without re‑firing). No upload, no listener. | ★★★ | M | Near–Mid |
+| ✅ **Graceful curl‑absent / offline state** | Detect curl‑missing and full‑offline at startup and mark curl triggers **INVALID** with a one‑line remediation banner instead of a wall of ambiguous ERRORs. | ★★★ | S | Near |
 
 ### 3.5 Theme D — Trust & robustness of the signal generator
 
@@ -526,11 +712,11 @@ the current code.
 | Feature | What it adds | Value | Effort | Horizon |
 |---|---|:--:|:--:|:--:|
 | ✅ **Activate `expected_on_*` predicates** | The `expected_on_allow`/`expected_on_block` fields are validated at load but **never consulted** by `classify()`. Wiring them in (reachable‑only) lets an SWG block page served at HTTP 200 or via redirect stop reading as `allowed` — without ever turning an error into a block. | ★★★★ | M | Mid |
-| **Sign & verify the catalog** | Today only `secvitals.py` is authenticated; the catalog is not. Sign `catalog.yaml` and show a verified/modified provenance badge, so the fired traffic provably matches the reviewed catalog. | ★★★ | M | Mid |
-| **Multi‑endpoint control probe** | The blocked‑vs‑error decision hinges on **one** host (`1.1.1.1:443`); if the customer filters it, real blocks degrade to errors. Make it an ordered, transport‑matched list (blocked only if all fail). | ★★★ | M | Mid |
-| **ERROR‑only failover origin** | Auto‑failover to a fixed alternate origin **only when a request honestly ERRORs** (never past blocked/allowed), so a down `testmynids.org` doesn't silently shrink the IDS signal count. | ★★★ | M | Mid |
-| **Pre‑flight environment check** | Verify curl present, control egress up, and the origin answers — explicitly a *readiness* gate, **not** a per‑trigger block predictor. | ★★★ | M | Mid |
-| **Hash‑chained run‑evidence + provenance stamp** | Disk‑only, telemetry‑free run evidence stamped with code + catalog SHA‑256 for after‑the‑fact correlation. | ★★★ | M | Mid |
+| ✅ **Sign & verify the catalog** | Today only `secvitals.py` is authenticated; the catalog is not. Sign `catalog.yaml` and show a verified/modified provenance badge, so the fired traffic provably matches the reviewed catalog. | ★★★ | M | Mid |
+| ✅ **Multi‑endpoint control probe** | The blocked‑vs‑error decision hinges on **one** host (`1.1.1.1:443`); if the customer filters it, real blocks degrade to errors. Make it an ordered, transport‑matched list (blocked only if all fail). | ★★★ | M | Mid |
+| ✅ **ERROR‑only failover origin** | Auto‑failover to a fixed alternate origin **only when a request honestly ERRORs** (never past blocked/allowed), so a down `testmynids.org` doesn't silently shrink the IDS signal count. | ★★★ | M | Mid |
+| ✅ **Pre‑flight environment check** | Verify curl present, control egress up, and the origin answers — explicitly a *readiness* gate, **not** a per‑trigger block predictor. | ★★★ | M | Mid |
+| ✅ **Hash‑chained run‑evidence + provenance stamp** | Disk‑only, telemetry‑free run evidence stamped with code + catalog SHA‑256 for after‑the‑fact correlation. | ★★★ | M | Mid |
 
 ### 3.6 Deliberately out of scope (and why)
 
@@ -575,3 +761,21 @@ Everything in the first wave is Near‑term (S/M effort), respects all seven
 guardrails, and moves the needle directly on *known quantity* and *high quality*.
 The larger bets — **East‑West tier‑1**, **demo profiles/presenter mode**, and
 **catalog signing** — are the natural second wave.
+
+> **Both waves are now delivered.** The first wave shipped in 0.1.x; the second
+> shipped as milestones M1–M5 (0.2.0 → 0.6.0), covering every remaining item in
+> §3.2–§3.5. The rejected idea in §3.6 remains rejected, and tier‑2 east–west
+> remains deferred for the reason given in §1.9 — it needs a second deployable.
+
+### 3.8 What is left
+
+With §3.2–§3.5 delivered, the honest backlog is short and mostly *verification*
+rather than construction:
+
+| Item | Why it is still open |
+|---|---|
+| **Real‑Windows validation** | `tkinter` cannot be installed in CI, so no build has opened an actual window. Presenter mode and the report dialog are the least‑exercised code in the product. This is the single highest‑value next step. |
+| **Independent review of wave‑1 code** | The wave‑1 changes were merged and are green, but the adversarial review pass over them never completed (a tooling failure, twice). They have had less scrutiny than the wave‑2 designs. |
+| **East–west tier 2** | Payload signatures east–west need a second deployable listener; out until the update path is hardened for two artifacts (§1.9). |
+| **Signing the shipped catalog** | The machinery and `tools/sign_catalog.sh` exist and are tested, but the published `catalog.yaml` is not yet signed, so installs report `unsigned`. |
+| **Feed durability** | Three of the four reputation feeds are third‑party lists (abuse.ch, blocklist.de). A dead feed reports `error`, never a false block — but their availability is outside our control. |

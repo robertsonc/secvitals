@@ -42,7 +42,7 @@ import time
 import urllib.error
 import urllib.request
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 APP_NAME = "Security Vitals"
 
 log = logging.getLogger("secvitals")
@@ -80,7 +80,7 @@ CLASSES = {"ns-ids", "ns-webcc", "ns-iprep", "ns-dlp", "ew"}   # `ew` reserved /
 #   probes; iprep = built-in IP-reputation probe. A trigger reproduces the exact requests
 #   a tmNIDS test sends (curl URLs/headers/UAs, a DNS query, a TCP connect), so it trips
 #   the same IDS/IPS signatures without shelling a third-party binary.
-RUNNERS = {"curl", "dns", "tcp", "iprep"}
+RUNNERS = {"curl", "dns", "tcp", "iprep", "ew"}
 FLAGS = {"needs_internet", "needs_et_ruleset", "hits_live_suspect_hosts"}
 SEVERITIES = {"info", "warn", "crit"}
 
@@ -396,6 +396,12 @@ class Settings:
         return float(_dget(self.raw, "run.min_interval_s", 0.75))
 
     @property
+    def ew_probe_timeout(self):
+        """How long an east-west port probe waits. Short: internal RTTs are sub-millisecond,
+        so a wait of seconds only slows the demo without changing any answer."""
+        return float(_dget(self.raw, "east_west.probe_timeout_s", 3))
+
+    @property
     def ipv6_control_url(self):
         """Known-good IPv6 endpoint used to tell "this host has no IPv6" apart from
         "the customer's policy dropped it". An address literal, so the answer does not
@@ -526,6 +532,35 @@ class Trigger:
         return ("hits_live_suspect_hosts" in self.flags
                 and not settings.enable_live_suspect_hosts)
 
+    def ew_target_name(self):
+        """The east-west target this trigger names, or "" if it is not an ew trigger."""
+        if self.runner != "ew":
+            return ""
+        cmd = self.commands[0] if self.commands else []
+        return cmd[1] if len(cmd) > 1 else ""
+
+    def unconfigured(self, settings):
+        """True when this trigger cannot run HERE because the site has not defined its
+        target. Distinct from gated (deliberately off) and from blocked (a policy
+        result): "we never configured this" is its own honest answer."""
+        name = self.ew_target_name()
+        if not name:
+            return False
+        try:
+            return name not in load_ew_targets(settings)
+        except ConfigError:
+            return True
+
+    def unavailable_reason(self, settings):
+        """Why this trigger will not run, or None if it will."""
+        if self.gated_disabled(settings):
+            return ("this trigger reaches live suspect infrastructure and is disabled "
+                    "(enable_live_suspect_hosts is false)")
+        if self.unconfigured(settings):
+            return (f"no east-west target named {self.ew_target_name()!r} is configured — "
+                    "add it under east_west.targets in settings.yaml. Not a policy result.")
+        return None
+
     def on_wire_count(self, settings):
         """How many requests this trigger actually puts ON THE WIRE.
 
@@ -535,6 +570,12 @@ class Trigger:
         This is the number to quote when promising a known quantity of signals."""
         if self.runner == "iprep":
             return max(1, int(settings.ip_rep_sample))
+        if self.runner == "ew":
+            try:
+                target = load_ew_targets(settings).get(self.ew_target_name())
+            except ConfigError:
+                target = None
+            return len(target.ports) if target else 0
         return len(self.commands)
 
     def console_hint_text(self):
@@ -617,6 +658,80 @@ def _validate_params(tid, params, commands):
     missing = used - names - _BUILTIN_TOKENS
     if missing:
         raise ConfigError(f"{tid}: commands reference undeclared params {sorted(missing)}")
+
+
+# ===========================================================================
+# East–west targets  —  the customer's own internal zones
+# ===========================================================================
+# North–south triggers can ship with fixed destinations because the internet is the same
+# everywhere. East–west cannot: the targets are the customer's internal addresses, and
+# they differ at every site. So the catalog names a TARGET, and the operator defines what
+# that name means in settings.yaml — exactly the pattern M3 used for reputation feeds.
+# A trigger can therefore only ever probe an address someone deliberately configured.
+#
+# Tier 1 only (CONFIRMED.md §7): a bare TCP connect, no payload and no listener needed.
+# Tier 2 (payload signatures) needs a second deployable and stays deferred.
+EW_TARGET_NAME_RE = r"[a-z0-9][a-z0-9\-]{0,31}"
+
+
+@dataclasses.dataclass
+class EwTarget:
+    name: str
+    label: str
+    host: str
+    control_port: int      # expected REACHABLE — proves the host is up
+    ports: list            # ports policy is expected to DENY
+    zone: str = ""
+
+    def to_public(self):
+        return {"name": self.name, "label": self.label, "host": self.host,
+                "control_port": self.control_port, "ports": list(self.ports),
+                "zone": self.zone}
+
+
+def load_ew_targets(settings):
+    """Read `east_west.targets` from settings.yaml.
+
+    Absent is normal — a fresh install has no idea what the customer's zones are — and
+    is not an error. Malformed IS an error, because a half-understood target would send
+    packets somewhere nobody chose."""
+    raw = _dget(settings.raw, "east_west.targets", None)
+    if raw in (None, "", {}):
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError("east_west.targets must be a mapping of name -> target")
+    out = {}
+    for name, body in raw.items():
+        if not isinstance(name, str) or not re.fullmatch(EW_TARGET_NAME_RE, name):
+            raise ConfigError(f"east_west.targets: invalid target name {name!r}")
+        if not isinstance(body, dict):
+            raise ConfigError(f"east_west.targets.{name}: must be a mapping")
+        host = str(body.get("host", "") or "").strip()
+        if not host:
+            raise ConfigError(f"east_west.targets.{name}: needs a host (IP or name)")
+
+        def _port(value, what):
+            try:
+                port = int(value)
+            except (TypeError, ValueError):
+                raise ConfigError(f"east_west.targets.{name}: {what} must be an integer") from None
+            if not 1 <= port <= 65535:
+                raise ConfigError(f"east_west.targets.{name}: {what} out of range")
+            return port
+
+        control_port = _port(body.get("control_port", 0), "control_port")
+        ports = body.get("ports")
+        if not isinstance(ports, list) or not ports:
+            raise ConfigError(f"east_west.targets.{name}: needs a non-empty 'ports' list")
+        ports = [_port(p, "ports entry") for p in ports]
+        if control_port in ports:
+            raise ConfigError(f"east_west.targets.{name}: control_port {control_port} must "
+                              "not also be listed in ports — it is the reachability "
+                              "reference, so it cannot also be a thing under test")
+        out[name] = EwTarget(name=name, label=str(body.get("label", name)), host=host,
+                             control_port=control_port, ports=ports,
+                             zone=str(body.get("zone", "")))
+    return out
 
 
 # ===========================================================================
@@ -1327,6 +1442,37 @@ def _tcp_probe(host, port, timeout):
     return _tcp_probe_flow(host, port, timeout)[0]
 
 
+# East–west connect outcomes. Four, not three, because "no route from here" is a local
+# environment fact and must never be filed alongside "dropped in transit by policy".
+EW_OPEN, EW_REFUSED, EW_TIMEOUT, EW_UNREACHABLE = "open", "refused", "timeout", "unreachable"
+
+
+def _tcp_connect_outcome(host, port, timeout):
+    """(outcome, flow) for one east–west port probe.
+
+      open        SYN-ACK — reachable, something is listening.
+      refused     RST — the SYN ARRIVED and the host answered. Reachable; the port is
+                  merely closed. Calling this "blocked" would credit the firewall with
+                  work the host did.
+      timeout     no answer at all — consistent with a drop in transit.
+      unreachable ENETUNREACH/EHOSTUNREACH and friends: this host has no route, or a
+                  router replied ICMP-unreachable. That is an environment fact, not a
+                  policy verdict, so it is kept separate from `timeout`.
+
+    Order matters below: socket.timeout and ConnectionRefusedError are both OSError
+    subclasses, so they must be caught first."""
+    flow = _flow("TCP", dst_port=port, host=host)
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout) as sock:
+            return EW_OPEN, _sock_flow(sock, "TCP", host)
+    except socket.timeout:
+        return EW_TIMEOUT, flow
+    except ConnectionRefusedError:
+        return EW_REFUSED, flow
+    except (OSError, ValueError):
+        return EW_UNREACHABLE, flow
+
+
 def _dec(b):
     if b is None:
         return ""
@@ -1618,7 +1764,7 @@ class RunLedger:
             cell = cells.setdefault((t.cls, threat),
                                     {"catalog": 0, "enabled": 0, "fired": 0, "result": 0})
             cell["catalog"] += 1
-            if not t.gated_disabled(settings):
+            if not t.unavailable_reason(settings):
                 cell["enabled"] += 1
             if t.id in fired:
                 cell["fired"] += 1
@@ -1960,13 +2106,10 @@ class App:
         trigger = self.by_id.get(trigger_id)
         if trigger is None:
             return None, {"error": "unknown trigger id"}
-        if trigger.gated_disabled(self.settings):
-            return trigger, {
-                "state": INVALID,
-                "reason": ("this trigger reaches live suspect infrastructure and is disabled "
-                           "(enable_live_suspect_hosts is false)"),
-                "expected_fire": trigger.expected_fire,
-            }
+        unavailable = trigger.unavailable_reason(self.settings)
+        if unavailable:
+            return trigger, {"state": INVALID, "reason": unavailable,
+                             "expected_fire": trigger.expected_fire}
         if not self._run_lock.acquire(blocking=False):
             return trigger, {"state": ERROR, "reason": "another trigger is already running"}
         try:
@@ -1974,6 +2117,10 @@ class App:
             if gap > 0:
                 time.sleep(min(gap, 5.0))       # rate limiting (spacing between runs)
             log.info("run start id=%s", trigger_id)
+            if trigger.runner == "ew":
+                out = self._run_ew(trigger)
+                log.info("run done id=%s state=%s", trigger_id, out.get("state"))
+                return trigger, out
             if trigger.runner == "iprep":
                 out = self._run_iprep(trigger)
                 log.info("run done id=%s state=%s", trigger_id, out.get("state"))
@@ -2003,6 +2150,113 @@ class App:
         finally:
             self._last_run_end = time.monotonic()
             self._run_lock.release()
+
+    def _run_ew(self, trigger):
+        """East–west tier 1: is this internal port reachable from this zone?
+
+        A bare TCP connect, no payload, no listener required. Three outcomes per port,
+        and the distinction between them is the whole feature:
+
+          SYN-ACK (connect succeeds)  -> REACHABLE, and something is listening
+          RST     (refused)           -> REACHABLE — the packet arrived and the host
+                                         answered. Segmentation is NOT dropping it;
+                                         the port is merely closed. Reporting this as
+                                         "blocked" would credit the firewall with work
+                                         the host did.
+          timeout (no answer at all)  -> dropped in transit == segmentation working
+
+        A timeout is only meaningful if the host is actually up, so a CONTROL PORT on the
+        SAME target is probed first. Control unreachable => `error`: the host is down or
+        unroutable, and nothing can be concluded about policy. Never a false `blocked`.
+        Called while the run lock is held."""
+        settings = self.settings
+        try:
+            targets = load_ew_targets(settings)
+        except ConfigError as e:
+            return {"state": ERROR, "expected_fire": trigger.expected_fire,
+                    "reason": f"east-west targets are misconfigured: {e}"}
+        target = targets.get(trigger.ew_target_name())
+        if target is None:
+            return {"state": INVALID, "expected_fire": trigger.expected_fire,
+                    "reason": (f"no east-west target named {trigger.ew_target_name()!r} is "
+                               "configured — add it under east_west.targets in "
+                               "settings.yaml. Not a policy result.")}
+
+        timeout = settings.ew_probe_timeout
+        flows, details = [], []
+        control_ok, control_flow = _tcp_probe_flow(target.host, target.control_port, timeout)
+        flows.append(control_flow)
+        if not control_ok:
+            details.append(f"{target.host}:{target.control_port}  control  UNREACHABLE")
+            return {
+                "state": ERROR,
+                "expected_fire": trigger.expected_fire,
+                "console_hint": trigger.console_hint_text(),
+                "reason": (f"the control port {target.host}:{target.control_port} did not "
+                           "answer, so this host is down or unroutable from here. Nothing "
+                           "can be concluded about segmentation policy (not a block)."),
+                "requests": 0,
+                "wire_requests": trigger.on_wire_count(settings),
+                "stdout": "\n".join(details),
+                "flow": _clip(_format_flows(flows), 4000),
+            }
+        details.append(f"{target.host}:{target.control_port}  control  reachable "
+                       "(the host is up, so a timeout below is a policy drop)")
+
+        dropped, reachable, unreachable = [], [], []
+        for port in target.ports:
+            outcome, flow = _tcp_connect_outcome(target.host, port, timeout)
+            flows.append(flow)
+            if outcome == EW_OPEN:
+                reachable.append(port)
+                details.append(f"{target.host}:{port}  SYN-ACK      reachable — open, "
+                               "segmentation is not blocking this")
+            elif outcome == EW_REFUSED:
+                reachable.append(port)
+                details.append(f"{target.host}:{port}  RST          reachable — closed on "
+                               "the host, but the packet got there (not a firewall drop)")
+            elif outcome == EW_TIMEOUT:
+                dropped.append(port)
+                details.append(f"{target.host}:{port}  timeout      dropped in transit — "
+                               "segmentation working")
+            else:
+                unreachable.append(port)
+                details.append(f"{target.host}:{port}  unreachable  no route / ICMP "
+                               "unreachable — environment, not a policy result")
+
+        total = len(target.ports)
+        summary = (f"{len(dropped)} of {total} port(s) dropped in transit, "
+                   f"{len(reachable)} reachable")
+        if unreachable:
+            summary += f", {len(unreachable)} unreachable (no route)"
+        summary += " (control OK)"
+
+        decided = len(dropped) + len(reachable)
+        if not decided:
+            # Every port failed for a routing reason: that says nothing about policy.
+            state = ERROR
+            reason = (summary + " — no port produced a policy result, so this is an "
+                                "environment problem, not a block")
+        elif dropped and not reachable:
+            state, reason = BLOCKED, summary + " — segmentation is enforcing on every port tested"
+        elif reachable and not dropped:
+            state, reason = ALLOWED, summary + " — every port tested was reachable from this zone"
+        else:
+            state = BLOCKED if len(dropped) > len(reachable) else ALLOWED
+            reason = summary + " (mixed — see the per-port breakdown)"
+        return {
+            "state": state,
+            "reason": reason,
+            "expected_fire": trigger.expected_fire,
+            "console_hint": trigger.console_hint_text(),
+            "ratio": {"blocked": len(dropped), "reached": len(reachable),
+                      "unreachable": len(unreachable), "total": total},
+            "requests": total,
+            "wire_requests": trigger.on_wire_count(settings),
+            "duration_s": None,
+            "stdout": "\n".join(details),
+            "flow": _clip(_format_flows(flows), 4000),
+        }
 
     def _run_iprep(self, trigger):
         """IP-reputation probe: a control egress probe first (fail => whole test invalid),
@@ -2202,21 +2456,32 @@ def signal_manifest(triggers, settings):
     the `iprep` fan-out honestly (see Trigger.on_wire_count), which a naive count of
     catalog commands under-reports."""
     rows, classes = [], {}
-    enabled = gated = signals = signals_if_gate_on = 0
+    enabled = gated = unconfigured = signals = signals_if_gate_on = 0
     for t in triggers:
+        # Three different reasons a trigger will not run, kept apart because they mean
+        # different things: gated (deliberately off), unconfigured (this site never told
+        # us where to probe), and runnable. Lumping them together would tell an operator
+        # to flip a gate that cannot possibly help.
         is_gated = t.gated_disabled(settings)
+        is_unconfigured = t.unconfigured(settings)
         count = t.on_wire_count(settings)
-        signals_if_gate_on += count
+        if not is_unconfigured:
+            signals_if_gate_on += count
         cmds = _preview_commands(t)
         dests = [d for d in (_command_destination(t.runner, c) for c in cmds) if d]
         rows.append({
             "id": t.id, "label": t.label, "class": t.cls, "runner": t.runner,
             "severity": t.severity, "threat_class": t.threat_class,
             "wire_request_count": count, "gated_disabled": is_gated,
+            "unconfigured": is_unconfigured,
+            "unavailable_reason": t.unavailable_reason(settings),
             "flags": list(t.flags), "destinations": dests,
             "expected_fire": t.expected_fire, "console_hint": t.console_hint_text(),
             "commands": [_redact(c) for c in cmds],
         })
+        if is_unconfigured:
+            unconfigured += 1
+            continue
         if is_gated:
             gated += 1
             continue
@@ -2231,6 +2496,7 @@ def signal_manifest(triggers, settings):
         "profile": "lab" if settings.enable_live_suspect_hosts else "default",
         "enable_live_suspect_hosts": settings.enable_live_suspect_hosts,
         "totals": {"triggers_enabled": enabled, "triggers_gated": gated,
+                   "triggers_unconfigured": unconfigured,
                    "triggers_total": len(triggers), "signals": signals,
                    "signals_if_gate_enabled": signals_if_gate_on},
         "classes": [classes[k] for k in classes],
@@ -2281,16 +2547,30 @@ def format_signal_manifest(manifest, verbose=False):
                 for argv in r["commands"]:
                     out.append(f"  {'':<22}    $ " + " ".join(argv))
         out.append("")
-    gated = [r for r in manifest["triggers"] if r["gated_disabled"]]
+    gated = [r for r in manifest["triggers"]
+             if r["gated_disabled"] and not r.get("unconfigured")]
     if gated:
         out.append(f"DISABLED — reaches live suspect infrastructure ({len(gated)}): "
                    + ", ".join(r["id"] for r in gated))
         out.append("  Enable with enable_live_suspect_hosts in settings.yaml — a lab you control only.")
         out.append("")
+    missing = [r for r in manifest["triggers"] if r.get("unconfigured")]
+    if missing:
+        out.append(f"NOT CONFIGURED HERE ({len(missing)}): "
+                   + ", ".join(r["id"] for r in missing))
+        out.append("  These need a target for this site — define east_west.targets in "
+                   "settings.yaml.")
+        out.append("  Not gated, and not a policy result: we simply have not been told "
+                   "where to probe.")
+        out.append("")
     out.append(f"TOTAL: {t['signals']} signals across {t['triggers_enabled']} enabled triggers")
     if t["triggers_gated"]:
+        # Count only what the GATE can unlock. triggers_total would include triggers
+        # that are unconfigured for this site, which no gate can make runnable —
+        # exactly the kind of quiet overstatement the manifest exists to prevent.
+        unlockable = t["triggers_total"] - t.get("triggers_unconfigured", 0)
         out.append(f"       {t['signals_if_gate_enabled']} signals if the live-suspect gate is enabled "
-                   f"({t['triggers_total']} triggers)")
+                   f"({unlockable} triggers)")
     return "\n".join(out)
 
 
@@ -2619,7 +2899,7 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
     def start_run_all():
         if run_state["running"]:
             return
-        ids = [t.id for t in triggers if not by_id[t.id].gated_disabled(settings)]
+        ids = [t.id for t in triggers if not by_id[t.id].unavailable_reason(settings)]
         if not ids:
             return
         run_state["running"], run_state["stop"] = True, False
@@ -2638,7 +2918,7 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
         run_all_btn.pack(side="left", pady=2)
         status_var.set("")
         for tid in cards:
-            if not by_id[tid].gated_disabled(settings):
+            if not by_id[tid].unavailable_reason(settings):
                 cards[tid]["fire"].configure(state="normal")
 
     def stop_run_all():
@@ -2660,7 +2940,7 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
     tk.Label(meta, text=f"v{__version__}", fg=GUI_DIM, bg=GUI_BG,
              font=(GUI_MONO, 9)).pack(anchor="e")
     # The known quantity, stated up front: how many signals a full run puts on the wire.
-    enabled_triggers = [t for t in triggers if not t.gated_disabled(settings)]
+    enabled_triggers = [t for t in triggers if not t.unavailable_reason(settings)]
     planned_signals = sum(t.on_wire_count(settings) for t in enabled_triggers)
     tk.Label(meta, text=f"{planned_signals} signals · {len(enabled_triggers)} triggers",
              fg=GUI_ACCENT, bg=GUI_BG, font=(GUI_MONO, 9, "bold")).pack(anchor="e")
@@ -2755,7 +3035,9 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
         return set_content, reset
 
     def build_card(t):
-        disabled = t.gated_disabled(settings)
+        unavailable = t.unavailable_reason(settings)
+        disabled = bool(unavailable)
+        gated_live = t.gated_disabled(settings)
         expand = {"open": False}
         wrap = tk.Frame(inner, bg=GUI_GRID)                       # 1px border via padding
         wrap.pack(fill="x", padx=8, pady=3)
@@ -2776,7 +3058,8 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
         if "hits_live_suspect_hosts" in t.flags:
             tk.Label(head, text="LIVE", fg=GUI_WARN, bg=GUI_SURFACE, font=(GUI_MONO, 8),
                      padx=6, pady=1, highlightbackground=GUI_WARN, highlightthickness=1).pack(side="left", padx=8)
-        status = tk.Label(head, text=("disabled (live)" if disabled else "not run"),
+        status = tk.Label(head, text=("disabled (live)" if gated_live
+                                      else "not configured" if disabled else "not run"),
                           fg=(GUI_GOLD if disabled else GUI_FAINT), bg=GUI_SURFACE, font=(GUI_MONO, 9))
         status.pack(side="right")
 
@@ -2815,7 +3098,8 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
         actions.pack(fill="x", pady=(10, 0))
         fire_btn = _gui_button(actions, "Fire", lambda tid=t.id: fire(tid), primary=True)
         if disabled:
-            fire_btn.configure(state="disabled", text="Disabled (live)")
+            fire_btn.configure(state="disabled",
+                               text="Disabled (live)" if gated_live else "Not configured")
         fire_btn.pack(side="left")
         copy_btn = _gui_button(actions, "Copy verification key",
                                lambda tid=t.id: copy_text(cards[tid].get("verify_key"), tid))
@@ -2843,7 +3127,8 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
 
         if disabled:
             reason.configure(text=("Reaches live suspect infrastructure — enable "
-                                   "enable_live_suspect_hosts in a controlled lab to run it."),
+                                   "enable_live_suspect_hosts in a controlled lab to run it."
+                                   if gated_live else unavailable),
                              fg=GUI_GOLD)
             reason.pack(anchor="w", fill="x", pady=(6, 0))
 
@@ -2899,7 +3184,7 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
         # window (catches result-rendering bugs a static layout pass can't).
         if os.environ.get("SECV_SELFTEST_FIRE"):
             for t in triggers:
-                if not t.gated_disabled(settings):
+                if not t.unavailable_reason(settings):
                     root.after(200, lambda tid=t.id: fire(tid))
                     break
         root.update_idletasks()
@@ -3697,7 +3982,7 @@ def select_triggers(triggers, selector, settings, profile=None):
         by_id = {t.id: t for t in triggers}
         return [t for t in profile.triggers(by_id) if not t.gated_disabled(settings)]
     if selector in (None, "", "all"):
-        return [t for t in triggers if not t.gated_disabled(settings)]
+        return [t for t in triggers if not t.unavailable_reason(settings)]
     wanted = [w.strip() for w in str(selector).split(",") if w.strip()]
     by_id = {t.id: t for t in triggers}
     classes = {t.cls for t in triggers}
@@ -3903,10 +4188,11 @@ def main(argv=None):
         return 0
 
     app = App(settings, triggers, args.config_dir)
-    planned = sum(t.on_wire_count(settings) for t in triggers if not t.gated_disabled(settings))
+    planned = sum(t.on_wire_count(settings) for t in triggers
+                  if not t.unavailable_reason(settings))
     log.info("%s %s — %d triggers (%d enabled, %d signals), native execution on %s",
              APP_NAME, __version__, len(triggers),
-             sum(1 for t in triggers if not t.gated_disabled(settings)), planned, sys.platform)
+             sum(1 for t in triggers if not t.unavailable_reason(settings)), planned, sys.platform)
 
     if args.run:
         return run_headless(app, triggers, settings, args.run, args.format,

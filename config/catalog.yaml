@@ -734,3 +734,66 @@
   expected_fire: "DLP — cloud access key / private-key material in an outbound HTTP POST body"
   talking_point: "AKIAIOSFODNN7EXAMPLE is the key AWS itself uses in its documentation, and the PEM block is truncated filler — recognizable to a secrets matcher, useless to an attacker."
   console_hint: "DLP / content-inspection log — filter by the 5-tuple below; expect a credentials or private-key data-pattern match."
+
+# ---------------------------------------------------------------------------
+# EAST–WEST (tier 1) — internal segmentation / lateral movement.
+#
+# North–south triggers ship with fixed destinations because the internet is the same
+# everywhere. East–west cannot: the targets are the CUSTOMER'S internal addresses. So a
+# trigger names a TARGET and the operator defines what that name means under
+# east_west.targets in settings.yaml. A trigger can only ever probe an address someone
+# deliberately configured — no target, no traffic.
+#
+# Until a site configures its targets these triggers report `invalid` ("not configured"),
+# which is deliberately its own answer: not gated, and emphatically not `blocked`.
+#
+# Tier 1 is a bare TCP connect — no payload, no listener needed. The three outcomes:
+#   SYN-ACK -> reachable, something is listening
+#   RST     -> reachable; the packet ARRIVED and the host answered. Segmentation is not
+#              dropping it, the port is just closed. This is NOT a block.
+#   timeout -> dropped in transit; segmentation is doing its job
+# A control port on the SAME target is probed first: if the host itself does not answer,
+# the result is `error`, never a false `blocked`.
+#
+# Tier 2 (payload signatures east–west) needs a second deployable listener and stays
+# deferred — see CONFIRMED.md §7.
+# ---------------------------------------------------------------------------
+
+- id: ew-server-zone
+  label: "Segmentation — workstation to server zone"
+  class: ew
+  runner: ew
+  commands:
+    - ["ew-probe", "server-zone"]
+  flags: []
+  severity: crit
+  threat_class: lateral
+  expected_fire: "East–west policy · workstation zone → server zone should DENY admin ports (SMB/RDP/SSH/SQL)"
+  talking_point: "The lateral-movement path ransomware actually uses. A workstation has no business reaching SMB or RDP in the server zone — if it can, one compromised laptop reaches everything."
+  console_hint: "East-west / intra-zone policy log — filter by the source and destination zones below; expect a deny on each port that timed out."
+
+- id: ew-user-zone
+  label: "Segmentation — peer workstation isolation"
+  class: ew
+  runner: ew
+  commands:
+    - ["ew-probe", "user-zone"]
+  flags: []
+  severity: warn
+  threat_class: lateral
+  expected_fire: "East–west policy · client isolation — peer workstations should not reach each other"
+  talking_point: "Client isolation stops worms moving desktop to desktop. Most networks assume it is on; this shows whether it is."
+  console_hint: "East-west / intra-zone policy log — expect a deny between two hosts in the same user zone."
+
+- id: ew-dmz
+  label: "Segmentation — DMZ to internal pivot"
+  class: ew
+  runner: ew
+  commands:
+    - ["ew-probe", "dmz"]
+  flags: []
+  severity: crit
+  threat_class: lateral
+  expected_fire: "East–west policy · DMZ → internal should DENY (no pivot path back inside)"
+  talking_point: "The classic breach path: compromise something internet-facing, then pivot inward. The DMZ should be a dead end, not a doorway."
+  console_hint: "East-west / inter-zone policy log — filter DMZ source to internal destination; expect a deny."

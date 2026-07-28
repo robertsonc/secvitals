@@ -99,23 +99,27 @@ class TestSignalManifest(unittest.TestCase):
         m = sv.signal_manifest(self.triggers, self.settings)
         t = m["totals"]
         self.assertEqual(t["triggers_total"], len(self.triggers))
-        self.assertEqual(t["triggers_enabled"] + t["triggers_gated"], len(self.triggers))
+        # three buckets, not two: runnable, gated off, and never configured here
+        self.assertEqual(t["triggers_enabled"] + t["triggers_gated"]
+                         + t["triggers_unconfigured"], len(self.triggers))
         # enabled signals are the sum of the enabled triggers' true on-wire counts
         expected = sum(x.on_wire_count(self.settings) for x in self.triggers
-                       if not x.gated_disabled(self.settings))
+                       if not x.unavailable_reason(self.settings))
         self.assertEqual(t["signals"], expected)
-        # the gate-on figure counts every trigger, and must be strictly larger while
-        # anything is gated off
+        # the gate-on figure counts every trigger the GATE could unlock — it must not
+        # promise signals that only site configuration can unlock
         self.assertEqual(t["signals_if_gate_enabled"],
-                         sum(x.on_wire_count(self.settings) for x in self.triggers))
+                         sum(x.on_wire_count(self.settings) for x in self.triggers
+                             if not x.unconfigured(self.settings)))
         self.assertGreater(t["signals_if_gate_enabled"], t["signals"])
         self.assertEqual(m["profile"], "default")
 
-    def test_lab_profile_enables_everything(self):
+    def test_lab_profile_enables_everything_the_gate_controls(self):
         lab = sv.Settings(raw={"enable_live_suspect_hosts": True})
         m = sv.signal_manifest(self.triggers, lab)
         self.assertEqual(m["profile"], "lab")
         self.assertEqual(m["totals"]["triggers_gated"], 0)
+        # unconfigured triggers stay unavailable: a gate cannot supply a target
         self.assertEqual(m["totals"]["signals"], m["totals"]["signals_if_gate_enabled"])
 
     def test_iprep_counted_at_full_fan_out(self):

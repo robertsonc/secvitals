@@ -82,6 +82,45 @@ webcc:
       url: "https://lists.blocklist.de/lists/mail.txt"
       port: 25
 
+# East–west (tier 1) — internal segmentation testing.
+#
+# These targets are YOUR network, so nothing ships pre-filled: the catalog's ew triggers
+# report "not configured" until you define the names they reference. That is deliberately
+# its own answer — not gated, and emphatically not `blocked`.
+#
+# For each target:
+#   host          the internal address to probe (an IP avoids DNS surprises)
+#   control_port  a port you EXPECT to be reachable on that host. It proves the host is
+#                 up, so a timeout on the ports below is a policy drop rather than a dead
+#                 host. It must not also appear in `ports`.
+#   ports         the ports policy is expected to DENY from where this console runs
+#
+# Reading the result: SYN-ACK or RST both mean the packet ARRIVED (reachable — a RST is
+# the host answering, not the firewall dropping). Only a timeout means dropped in transit.
+east_west:
+  probe_timeout_s: 3
+  targets: {}
+  # Replace the empty mapping above with your zones, for example:
+  # targets:
+  #   server-zone:
+  #     label: "Server zone — file/RDP/database host"
+  #     zone: "servers"
+  #     host: "10.20.30.40"
+  #     control_port: 443
+  #     ports: [445, 3389, 22, 1433]
+  #   user-zone:
+  #     label: "Peer workstation (client isolation)"
+  #     zone: "users"
+  #     host: "10.10.10.55"
+  #     control_port: 135
+  #     ports: [445, 3389, 5985]
+  #   dmz:
+  #     label: "DMZ host — pivot back inside"
+  #     zone: "dmz"
+  #     host: "192.168.100.10"
+  #     control_port: 443
+  #     ports: [445, 3389, 22]
+
 # Demo profiles — curated, ORDERED subsets of the catalog.
 #
 # A profile only ever SELECTS existing catalog ids; it never defines a command, so the

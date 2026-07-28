@@ -12,10 +12,10 @@ fires the traffic and honestly reports what it observed locally.
   This host  →  IDS/IPS + Secure Web Gateway  →  Internet
 ```
 
-This build covers **north–south** functions: IDS/IPS, web categorization / reputation,
-IP reputation (Tor, botnet-C2, scanner and spammer feeds), DNS security, and DLP /
-content inspection — with IPv6 and HTTP/3 parity twins to expose transport blind spots.
-East–west is deferred.
+This build covers **north–south** functions — IDS/IPS, web categorization /
+reputation, IP reputation (Tor, botnet-C2, scanner and spammer feeds), DNS security,
+and DLP / content inspection — with IPv6 and HTTP/3 parity twins to expose transport
+blind spots, plus **east–west tier 1** (internal segmentation probing).
 
 **The known quantity.** The catalog is fixed, so the number of signals a run puts on the
 wire is exact and repeatable: **66 signals across 41 triggers** by default, or **100
@@ -147,6 +147,22 @@ checked **before anything is sent**. If this host can't use the transport, the r
 `error` with a plain reason, and nothing goes on the wire. It is never reported as a
 block. See [docs/milestones/M3-coverage-breadth.md](docs/milestones/M3-coverage-breadth.md).
 
+### East–west (internal segmentation)
+
+`ew-server-zone`, `ew-user-zone` and `ew-dmz` probe whether one internal zone can reach
+another — the lateral-movement path ransomware actually uses. Tier 1 only: a bare TCP
+connect, no payload and no listener needed.
+
+Targets are **your** addresses, so nothing ships pre-filled. Define them under
+`east_west.targets` in `settings.yaml`; until then these triggers report *"not
+configured"*, which is its own answer — not gated, and not a block.
+
+Reading it: **SYN-ACK or RST both mean reachable** (an RST proves the packet arrived and
+the host answered — that is not a firewall drop). Only a **timeout** means dropped in
+transit, and only when a control port on the same host confirms the host is up. If the
+control is unreachable the result is `error`, never a false `blocked`. See
+[docs/milestones/M4-east-west-tier1.md](docs/milestones/M4-east-west-tier1.md).
+
 ### Live suspect-infrastructure gate
 
 Some triggers reach **real** suspect hosts, live Tor nodes, or destinations that simply
@@ -230,4 +246,5 @@ full decision record.
       mode, modern-exploit / SWG-category / DLP catalog packs, verification key +
       console hints, and `expected_on_*` classifier refinement
       (see [docs/SOLUTION-AND-ROADMAP.md](docs/SOLUTION-AND-ROADMAP.md))
-- [ ] E/W — deferred (schema reserves `ew`; not implemented)
+- [x] E/W tier 1 — internal segmentation probing (`ew` class filled)
+- [ ] E/W tier 2 — payload signatures east–west (needs a second deployable; deferred)

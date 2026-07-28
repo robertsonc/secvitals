@@ -44,7 +44,11 @@ class TestLoad(unittest.TestCase):
             self.assertEqual(t.commands[0][0], "curl")
         for t in by_class["ns-iprep"]:
             self.assertEqual(t.runner, "iprep")
-        self.assertEqual(len(triggers), 50)
+        # east-west tier 1 fills the previously empty `ew` class
+        self.assertEqual(len(by_class.get("ew", [])), 3)
+        for t in by_class["ew"]:
+            self.assertEqual(t.runner, "ew")
+        self.assertEqual(len(triggers), 53)
 
         # multi-request triggers reproduce every request the tmNIDS test sends
         malua = next(t for t in triggers if t.id == "ns-malua")

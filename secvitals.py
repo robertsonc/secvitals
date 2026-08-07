@@ -84,6 +84,18 @@ RUNNERS = {"curl", "dns", "tcp", "iprep", "ew"}
 FLAGS = {"needs_internet", "needs_et_ruleset", "hits_live_suspect_hosts"}
 SEVERITIES = {"info", "warn", "crit"}
 
+# Measurement mode — the assurance tier a trigger belongs to.
+#   best-effort  : fired SINGLE-ENDED at a PUBLIC origin. Realistic and independent, but the
+#                  customer's IDS/IPS MAY OR MAY NOT register an event, and the result is a
+#                  heuristic LOCAL read. Every trigger in the shipping catalog is this tier.
+#   ground-truth : fired DUAL-ENDED against a reflector you control, so arrival is confirmed
+#                  on the far side and a block/allow/mishandle is a GENUINE, PROVABLE event.
+#                  That tier is the reflector POC (see poc/ and docs/EFFECTIVENESS-ROADMAP.md);
+#                  none ship in the console catalog yet, but the schema carries the label so
+#                  the two tiers can be shown side by side and never confused.
+MODES = {"best-effort", "ground-truth"}
+DEFAULT_MODE = "best-effort"
+
 # Where a presenter looks for THIS class of signal on the inline stack's own console.
 # A catalog entry may override with its own `console_hint`; these are the fallbacks.
 # Deliberately vendor-neutral — every stack names these views differently.
@@ -515,6 +527,7 @@ class Trigger:
     timeout: float
     console_hint: str = ""      # optional "where to look on the inline console"
     requires: list = dataclasses.field(default_factory=list)   # transports this needs
+    mode: str = "best-effort"   # assurance tier: best-effort (heuristic) or ground-truth
 
     @staticmethod
     def from_dict(d, default_timeout):
@@ -564,6 +577,9 @@ class Trigger:
             raise ConfigError(f"{tid}: console_hint must be a string")
         if len(hint) > 300:
             raise ConfigError(f"{tid}: console_hint is too long (max 300 characters)")
+        mode = d.get("mode", DEFAULT_MODE)
+        if mode not in MODES:
+            raise ConfigError(f"{tid}: mode must be one of {sorted(MODES)}, got {mode!r}")
         return Trigger(
             id=tid,
             label=str(d.get("label", tid)),
@@ -581,6 +597,7 @@ class Trigger:
             timeout=float(d.get("timeout_s", default_timeout)),
             console_hint=hint,
             requires=list(requires),
+            mode=mode,
         )
 
     def gated_disabled(self, settings):
@@ -643,6 +660,7 @@ class Trigger:
             "id": self.id,
             "label": self.label,
             "class": self.cls,
+            "mode": self.mode,
             "runner": self.runner,
             "flags": self.flags,
             "severity": self.severity,
@@ -1921,6 +1939,7 @@ class RunLedger:
                 "id": trigger.id,
                 "label": trigger.label,
                 "class": trigger.cls,
+                "mode": trigger.mode,
                 "runner": trigger.runner,
                 "severity": trigger.severity,
                 "threat_class": trigger.threat_class,
@@ -1981,7 +2000,8 @@ class RunLedger:
         kinds of evidence."""
         return [{
             "seq": r["seq"], "ts": r["ts"], "id": r["id"], "label": r["label"],
-            "class": r["class"], "severity": r["severity"],
+            "class": r["class"], "mode": r.get("mode", DEFAULT_MODE),
+            "severity": r["severity"],
             "expected": r["expected_fire"], "observed": r["state"],
             "reason": r["reason"], "signals": r["wire_requests"],
             "confirmed": r["confirmed"], "verify_key": r["verify_key"],
@@ -2046,9 +2066,10 @@ class RunLedger:
     def to_json(self, triggers=None, settings=None):
         return json.dumps(self.to_dict(triggers, settings), indent=2, default=str)
 
-    CSV_COLUMNS = ("seq", "ts", "run_id", "id", "label", "class", "runner", "severity",
-                   "threat_class", "state", "reason", "rc", "http_code", "duration_s",
-                   "wire_requests", "expected_fire", "confirmed", "verify_key", "hash")
+    CSV_COLUMNS = ("seq", "ts", "run_id", "id", "label", "class", "mode", "runner",
+                   "severity", "threat_class", "state", "reason", "rc", "http_code",
+                   "duration_s", "wire_requests", "expected_fire", "confirmed",
+                   "verify_key", "hash")
 
     def to_csv(self):
         import csv
@@ -2164,7 +2185,8 @@ def render_html_report(ledger, triggers=None, settings=None):
 
     # -- scorecard --------------------------------------------------------
     out.append("<h2>Expected vs observed vs confirmed</h2><div class='wrap'><table>"
-               "<tr><th>#</th><th>Time (UTC)</th><th>Trigger</th><th>Expected to fire</th>"
+               "<tr><th>#</th><th>Time (UTC)</th><th>Trigger</th><th>Mode</th>"
+               "<th>Expected to fire</th>"
                "<th>Observed locally</th><th>Confirmed on console</th><th>Signals</th></tr>")
     for row in ledger.scorecard():
         css = _STATE_CSS.get(row["observed"], "")
@@ -2172,15 +2194,19 @@ def render_html_report(ledger, triggers=None, settings=None):
             f"<tr><td class='mono'>{row['seq']}</td><td class='mono'>{_esc(row['ts'])}</td>"
             f"<td><strong>{_esc(row['label'])}</strong><br><span class='mono' "
             f"style='color:#6f787c'>{_esc(row['id'])}</span></td>"
+            f"<td class='mono'>{_esc(row.get('mode', 'best-effort'))}</td>"
             f"<td>{_esc(row['expected'])}</td>"
             f"<td><span class='badge {css}'>{_esc(row['observed'])}</span><div class='note'>"
             f"{_esc(row['reason'])}</div></td>"
             f"<td>{_esc(_CONFIRMED_LABEL.get(row['confirmed'], row['confirmed']))}</td>"
             f"<td class='mono'>{_esc(row['signals'])}</td></tr>")
-    out.append("</table></div><div class='note'>“Expected” is what the catalog says the "
-               "signal should trip. “Observed locally” is this host's honest read. "
-               "“Confirmed on console” is the presenter's own attestation — a human "
-               "annotation, deliberately kept separate and outside the evidence chain.</div>")
+    out.append("</table></div><div class='note'>“Mode” is the measurement tier: "
+               "<strong>best-effort</strong> (single-ended to a public origin — a heuristic "
+               "read that may or may not have registered an event) vs "
+               "<strong>ground-truth</strong> (dual-ended over a reflector you control — a "
+               "proven event). “Expected” is what the catalog says the signal should trip. "
+               "“Observed locally” is this host's honest read. “Confirmed on console” is the "
+               "presenter's own attestation — kept separate and outside the evidence chain.</div>")
 
     # -- coverage ---------------------------------------------------------
     coverage = doc.get("coverage")
@@ -2709,7 +2735,7 @@ def signal_manifest(triggers, settings):
     This is the answer to 'how many signals am I about to generate?' — and it counts
     the `iprep` fan-out honestly (see Trigger.on_wire_count), which a naive count of
     catalog commands under-reports."""
-    rows, classes = [], {}
+    rows, classes, modes = [], {}, {}
     enabled = gated = unconfigured = signals = signals_if_gate_on = 0
     for t in triggers:
         # Three different reasons a trigger will not run, kept apart because they mean
@@ -2724,7 +2750,8 @@ def signal_manifest(triggers, settings):
         cmds = _preview_commands(t)
         dests = [d for d in (_command_destination(t.runner, c) for c in cmds) if d]
         rows.append({
-            "id": t.id, "label": t.label, "class": t.cls, "runner": t.runner,
+            "id": t.id, "label": t.label, "class": t.cls, "mode": t.mode,
+            "runner": t.runner,
             "severity": t.severity, "threat_class": t.threat_class,
             "wire_request_count": count, "gated_disabled": is_gated,
             "unconfigured": is_unconfigured,
@@ -2746,6 +2773,9 @@ def signal_manifest(triggers, settings):
                                           "triggers": 0, "signals": 0})
         slot["triggers"] += 1
         slot["signals"] += count
+        mslot = modes.setdefault(t.mode, {"mode": t.mode, "triggers": 0, "signals": 0})
+        mslot["triggers"] += 1
+        mslot["signals"] += count
     return {
         "profile": "lab" if settings.enable_live_suspect_hosts else "default",
         "enable_live_suspect_hosts": settings.enable_live_suspect_hosts,
@@ -2754,6 +2784,7 @@ def signal_manifest(triggers, settings):
                    "triggers_total": len(triggers), "signals": signals,
                    "signals_if_gate_enabled": signals_if_gate_on},
         "classes": [classes[k] for k in classes],
+        "modes": [modes[k] for k in modes],
         "triggers": rows,
     }
 
@@ -2817,6 +2848,21 @@ def format_signal_manifest(manifest, verbose=False):
         out.append("  Not gated, and not a policy result: we simply have not been told "
                    "where to probe.")
         out.append("")
+    modes = {m["mode"]: m for m in manifest.get("modes", [])}
+    be = modes.get("best-effort", {"triggers": 0, "signals": 0})
+    gt = modes.get("ground-truth", {"triggers": 0, "signals": 0})
+    out.append("MEASUREMENT MODE — what a result here can prove")
+    out.append(f"  best-effort   {be['signals']:>3} signals / {be['triggers']:>2} triggers   "
+               "single-ended to public origins — a heuristic local read (MAY OR MAY NOT "
+               "register an IDS/IPS event)")
+    out.append(f"  ground-truth  {gt['signals']:>3} signals / {gt['triggers']:>2} triggers   "
+               "dual-ended over a reflector you control — proves a genuine event")
+    if not gt["triggers"]:
+        out.append("                    (no ground-truth triggers in the console catalog yet — "
+                   "that tier is the reflector POC:")
+        out.append("                     poc/, docs/EFFECTIVENESS-ROADMAP.md · "
+                   "python3 poc/harness.py --manifest)")
+    out.append("")
     out.append(f"TOTAL: {t['signals']} signals across {t['triggers_enabled']} enabled triggers")
     if t["triggers_gated"]:
         # Count only what the GATE can unlock. triggers_total would include triggers
@@ -3330,6 +3376,7 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
                      padx=6, pady=1, highlightbackground=bd, highlightthickness=1).pack(side="left", padx=(0, 5))
 
         chip(t.cls, GUI_ACCENT, GUI_ACCENT_DK)
+        chip(t.mode, GUI_DIM, GUI_GRID)          # assurance tier: best-effort / ground-truth
         if t.threat_class:
             chip(t.threat_class, GUI_DIM, GUI_GRID)
         chip(t.severity, SEV_COLOR.get(t.severity, GUI_DIM), SEV_COLOR.get(t.severity, GUI_GRID))

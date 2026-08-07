@@ -95,6 +95,16 @@ score. The POC already renders this contrast — `python3 poc/harness.py --manif
 both tiers side by side and sends nothing; ground-truth results are labelled as such in
 every report.
 
+**The label now ships in the console too.** Every trigger carries a `mode` (a validated
+catalog field defaulting to `best-effort`), and the console surfaces it where it matters:
+the **Signal manifest** (`--list` / `--dry-run` / the window) prints a *Measurement mode*
+summary — today `best-effort  66 signals / 41 triggers` beside `ground-truth  0` with a
+pointer to the reflector POC — every card shows a mode chip, and the run evidence (the
+scorecard, the CSV, and the HTML report) gains a **Mode** column. Nothing about *what is
+sent* changes; the label only states what a result can prove. When ground-truth triggers
+are eventually added to the console catalog, they slot into the same manifest and report
+with zero further plumbing.
+
 ## 3. Where `secvitals` stands today
 
 **What already maps to MINION (a strong base):**

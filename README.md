@@ -255,3 +255,6 @@ full decision record.
       testing, and doubles as the deferred "second deployable." See the roadmap in
       [docs/EFFECTIVENESS-ROADMAP.md](docs/EFFECTIVENESS-ROADMAP.md) and the working POC
       under [`poc/`](poc/) (`python3 poc/harness.py --demo`)
+- [x] Measurement-mode label — every trigger carries a `mode` (`best-effort` by default);
+      the **Signal manifest** and the run report label the tier so a heuristic public-origin
+      read is never mistaken for a proven, dual-ended **ground-truth** result

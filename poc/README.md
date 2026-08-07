@@ -53,6 +53,31 @@ reaches the far side this run, the path is not proven up and every miss is `erro
 wall of false blocks — the same discipline as `secvitals`' three-state classifier, now
 backed by real end-to-end delivery rather than a probe to `1.1.1.1`.
 
+## Two measurement modes (best-effort vs ground-truth)
+
+This POC is the **ground-truth** tier. It is meant to sit *alongside* the existing
+`secvitals` catalog, which is the **best-effort** tier — and the tool should show both,
+clearly labelled, so a heuristic read is never mistaken for proof:
+
+| | **Best-effort** (existing secvitals catalog) | **Ground-truth** (this POC) |
+|---|---|---|
+| Path | single-ended → **public** origin | dual-ended → a **reflector you control** |
+| Payloads | real-world (tmNIDS, EICAR, Safe Browsing, category hosts) | curated, inert |
+| A result means | **heuristic local read** — the IDS/IPS **may or may not** register an event | **proven arrival** — a genuine, repeatable block/allow/**mishandle** event |
+| Strengths | realism, independence, customer-adjacent-safe | certainty, repeatability, provable |
+| Costs | no far-end proof; leans on public origins being up | needs the reflector; traffic goes to your infra |
+| **Scored?** | **no** — coverage & realism | **yes** — only ground-truth feeds the score |
+
+See both tiers side by side (sends nothing):
+
+```bash
+python3 poc/harness.py --manifest
+```
+
+Only ground-truth tests are scored — a Security Effectiveness number is computed **only**
+from outcomes that were *proven*. Best-effort tests earn breadth and independence, not a
+score, and every ground-truth report is labelled `mode: ground-truth`.
+
 ## Security Effectiveness score
 
 ```
@@ -109,7 +134,8 @@ management interface.)
 | `reflector.py` | device B — the receiver; HMAC-signed ledger of what arrived |
 | `control.py` | **demo/test only** — mock inline control for the loopback demo |
 | `effectiveness.py` | pure, network-free scoring (fully unit-tested) |
-| `probes.json` | fixed, inert paired catalog (malicious + benign) |
+| `probes.json` | fixed, inert **ground-truth** catalog (malicious + benign) |
+| `best_effort.json` | display-only **best-effort** catalog, for the `--manifest` contrast |
 
 Tests: `python3 -m unittest tests.test_effectiveness_poc`
 

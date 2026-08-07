@@ -74,6 +74,27 @@ simultaneously (a) deliver the deferred east-west tier-2, (b) unlock a false-pos
 denominator, and (c) unlock any defensible effectiveness score. One artifact, three
 deferred capabilities. That is why it ranks first — and why the POC builds *only* it.
 
+### Two measurement modes (the assurance model)
+
+The reflector does not *replace* the existing catalog — it adds a second, higher-assurance
+way to test. The two tiers are complementary, and the product should **show both, clearly
+labelled**, so nobody mistakes a best-effort read for proof:
+
+| | **Best-effort** (today's catalog) | **Ground-truth** (the reflector) |
+|---|---|---|
+| Path | single-ended → **public** origin | dual-ended → a **reflector you control** |
+| Payloads | real-world (tmNIDS, EICAR, Safe Browsing, category hosts) | curated, inert |
+| What a result means | a **heuristic local read** — the IDS/IPS **may or may not** register an event | **proven arrival** — a genuine, repeatable block/allow/**mishandle** event |
+| Strengths | realism, independence, customer-adjacent-safe | certainty, repeatability, provable |
+| Costs | no far-end proof; leans on public origins/signatures being up | needs the second deployable; traffic goes to your infra |
+| **Scored?** | **no** — coverage & realism | **yes** — only ground-truth feeds the effectiveness score |
+
+That last row is the honesty rule: a Security Effectiveness number is computed **only** from
+tests whose outcome was *proven*. Best-effort tests earn breadth and independence, not a
+score. The POC already renders this contrast — `python3 poc/harness.py --manifest` lists
+both tiers side by side and sends nothing; ground-truth results are labelled as such in
+every report.
+
 ## 3. Where `secvitals` stands today
 
 **What already maps to MINION (a strong base):**

@@ -62,6 +62,20 @@ def load_catalog(path):
     return probes
 
 
+def load_best_effort(path):
+    """Load the best-effort catalog (display-only). Missing file -> empty list, since the
+    best-effort tier is optional and, in the product, lives in the main secvitals catalog."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except FileNotFoundError:
+        return []
+    tests = doc.get("tests") or []
+    if not isinstance(tests, list):
+        raise ValueError(f"{path}: 'tests' must be a list")
+    return tests
+
+
 # ---------------------------------------------------------------------------
 # the wire
 # ---------------------------------------------------------------------------
@@ -187,7 +201,61 @@ def run(control_base, reflector_base, probes, secret, timeout=5.0, run_id=None):
     card["generated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     card["grade"] = effectiveness.grade(card["security_effectiveness_pct"])
     card["ledger_error"] = err
+    # These are ground-truth results by construction: they were measured dual-ended over a
+    # reflector you control. Only this tier is scored — see build_manifest() for the
+    # contrast with the best-effort tier.
+    card["mode"] = "ground-truth"
     return card
+
+
+# ---------------------------------------------------------------------------
+# the two measurement modes (the "assurance model") — show them side by side
+# ---------------------------------------------------------------------------
+# best-effort  : the existing secvitals catalog. Real-world payloads fired SINGLE-ENDED at
+#                PUBLIC origins. Realistic and independent, but the result is a heuristic
+#                local read — the IDS/IPS MAY OR MAY NOT register an event, unprovably.
+# ground-truth : the dual-ended tests, run between secvitals and a reflector you control.
+#                Curated payloads whose arrival is confirmed on the far side, so a
+#                block/allow/mishandle is a GENUINE, PROVABLE event. Only this tier is scored.
+def build_manifest(gt_probes, be_tests):
+    """A zero-egress preview of BOTH tiers so a run can show what it can — and cannot —
+    prove. Sends nothing; it only reads the two catalogs."""
+    def gt_row(p):
+        return {"id": p["id"], "class": p.get("class", ""), "label": p.get("label", ""),
+                "origin": "your reflector", "expect": p.get("expect", "")}
+
+    def be_row(t):
+        return {"id": t["id"], "class": t.get("class", ""), "label": t.get("label", ""),
+                "origin": t.get("origin", "public"), "expect": t.get("expect", "")}
+
+    return {"modes": [
+        {"mode": "ground-truth", "dual_ended": True, "scored": True,
+         "origin": "a reflector you control, behind the control under test",
+         "measurement": "proven arrival — a genuine, repeatable block/allow/mishandle event",
+         "count": len(gt_probes), "tests": [gt_row(p) for p in gt_probes]},
+        {"mode": "best-effort", "dual_ended": False, "scored": False,
+         "origin": "public infrastructure (tmNIDS, EICAR, Safe Browsing, category hosts)",
+         "measurement": "heuristic local read — MAY OR MAY NOT register an IDS/IPS event",
+         "count": len(be_tests), "tests": [be_row(t) for t in be_tests]},
+    ]}
+
+
+def format_manifest(manifest):
+    L = ["=" * 74, "  MEASUREMENT MODES — what each tier can prove", "=" * 74]
+    for m in manifest["modes"]:
+        tag = "dual-ended · SCORED" if m["scored"] else "single-ended · not scored"
+        L.append("")
+        L.append(f"  {m['mode'].upper()}   ({tag})")
+        L.append(f"    origin      : {m['origin']}")
+        L.append(f"    measurement : {m['measurement']}")
+        L.append(f"    tests       : {m['count']}")
+        for t in m["tests"]:
+            L.append(f"      {t['id']:<18} {t.get('class',''):<10} {t['label']}")
+            L.append(f"      {'':<18} {'':<10} → {t['origin']}  ·  expect: {t.get('expect') or '—'}")
+    L.append("")
+    L.append("  Best-effort is realism + independence (runs in the wild); ground-truth is")
+    L.append("  certainty + repeatability (proves the event). Only ground-truth is scored.")
+    return "\n".join(L)
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +286,9 @@ def format_text(card):
     L.append("  " + "-" * 62)
     for p in card["probes"]:
         L.append("  " + _probe_line(p))
+    L.append("")
+    L.append("  mode: ground-truth (dual-ended, over your reflector) — only these are scored.")
+    L.append("  best-effort tests (public origin, single-ended) → run  harness.py --manifest")
     if card.get("ledger_error"):
         L.append("")
         L.append(f"  ! ledger: {card['ledger_error']}")
@@ -290,7 +361,7 @@ def format_html(card):
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <title>Security Effectiveness — secvitals POC</title><style>{_HTML_CSS}</style></head><body>
 <h1>Security Control Effectiveness</h1>
-<div class="sub">paired-device effectiveness measurement · run {_esc(card['run_id'])} · {_esc(card['generated'])}</div>
+<div class="sub">paired-device effectiveness measurement · mode: ground-truth (dual-ended) · run {_esc(card['run_id'])} · {_esc(card['generated'])}</div>
 <div class="hero"><div class="big">{_fmtpct(card['security_effectiveness_pct'])}</div>
 <div class="grade">grade {_esc(card['grade'])}</div></div>
 <div class="kv">
@@ -306,7 +377,9 @@ def format_html(card):
 <p class="note">Effectiveness = block-rate × (1 − false-positive-rate). Ground truth comes
 from an HMAC-signed reflector on the far side of the control; ERROR (path down) is never
 scored as a block, and “mishandled” means the payload arrived altered — a state a
-single-host probe cannot see. Inert by construction; local disk only.</p>
+single-host probe cannot see. These are <b>ground-truth</b> (dual-ended) results — only
+this tier is scored; best-effort public-origin tests are a separate tier (see the
+manifest). Inert by construction; local disk only.</p>
 </body></html>"""
 
 
@@ -351,7 +424,11 @@ def main(argv=None):
     p.add_argument("--demo", action="store_true",
                    help="self-contained loopback demo (reflector + mock control + harness)")
     p.add_argument("--catalog", default=os.path.join(here, "probes.json"),
-                   help="probe catalog (default poc/probes.json)")
+                   help="ground-truth probe catalog (default poc/probes.json)")
+    p.add_argument("--best-effort", default=os.path.join(here, "best_effort.json"),
+                   help="best-effort catalog for the manifest (display-only)")
+    p.add_argument("--manifest", action="store_true",
+                   help="show BOTH measurement tiers (ground-truth vs best-effort) — sends nothing")
     p.add_argument("--control-url", help="base URL to SEND probes through (the control in "
                                          "the path); in real use, the reflector's address")
     p.add_argument("--reflector-url", help="base URL to READ the signed ledger (management)")
@@ -362,6 +439,17 @@ def main(argv=None):
     p.add_argument("--out", metavar="FILE", help="write report to FILE (.html/.json/.txt)")
     p.add_argument("--format", choices=("text", "json"), default="text")
     args = p.parse_args(argv)
+
+    if args.manifest:
+        manifest = build_manifest(load_catalog(args.catalog),
+                                  load_best_effort(args.best_effort))
+        text = json.dumps(manifest, indent=2) if args.format == "json" else format_manifest(manifest)
+        if args.out:
+            with open(args.out, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            print(f"manifest written to {args.out}")
+        print(text)
+        return 0
 
     if args.demo:
         card = run_demo(args.catalog, secret=args.secret)

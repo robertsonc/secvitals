@@ -25,8 +25,9 @@ from poc import reflector                     # noqa: E402
 from poc import control                       # noqa: E402
 from poc import harness                       # noqa: E402
 
-CATALOG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                       "poc", "probes.json")
+_POC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "poc")
+CATALOG = os.path.join(_POC, "probes.json")
+BEST_EFFORT = os.path.join(_POC, "best_effort.json")
 
 
 def R(pid, klass, outcome, **kw):
@@ -258,6 +259,7 @@ class TestEndToEnd(unittest.TestCase):
         self.assertGreaterEqual(card["malicious"]["mishandled"], 1)   # spring4shell sanitized
         self.assertEqual(card["not_scored"]["errors"], 0)
         self.assertEqual(card["not_scored"]["control_canary"], ef.ARRIVED)
+        self.assertEqual(card["mode"], "ground-truth")   # dual-ended results are labelled
 
     def test_leaky_and_false_positive_control(self):
         # blocks only EICAR (so 6 threats leak) and wrongly blocks a benign article (1 FP)
@@ -329,6 +331,34 @@ class TestCatalogAndReport(unittest.TestCase):
         self.assertIn("<table", html)
         self.assertIn("Security Control Effectiveness", html)
         json.loads(json.dumps(card))                     # card is JSON-serialisable
+
+
+class TestManifest(unittest.TestCase):
+    """The two-tier 'assurance model': ground-truth (dual-ended, scored) shown beside
+    best-effort (single-ended, public origin, not scored)."""
+
+    def test_best_effort_loads_and_missing_is_empty(self):
+        be = harness.load_best_effort(BEST_EFFORT)
+        self.assertGreaterEqual(len(be), 1)
+        self.assertTrue(all("id" in t for t in be))
+        self.assertEqual(harness.load_best_effort("/no/such/file.json"), [])
+
+    def test_manifest_has_both_tiers(self):
+        gt = harness.load_catalog(CATALOG)
+        be = harness.load_best_effort(BEST_EFFORT)
+        modes = {m["mode"]: m for m in harness.build_manifest(gt, be)["modes"]}
+        self.assertEqual(modes["ground-truth"]["count"], len(gt))
+        self.assertTrue(modes["ground-truth"]["scored"])
+        self.assertFalse(modes["best-effort"]["scored"])       # never scored — no ground truth
+        self.assertEqual(modes["best-effort"]["count"], len(be))
+
+    def test_manifest_text_shows_the_contrast(self):
+        man = harness.build_manifest(harness.load_catalog(CATALOG),
+                                     harness.load_best_effort(BEST_EFFORT))
+        text = harness.format_manifest(man)
+        self.assertIn("GROUND-TRUTH", text)
+        self.assertIn("BEST-EFFORT", text)
+        self.assertIn("MAY OR MAY NOT", text)                  # the best-effort caveat
 
 
 if __name__ == "__main__":

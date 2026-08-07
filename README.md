@@ -248,3 +248,9 @@ full decision record.
       (see [docs/SOLUTION-AND-ROADMAP.md](docs/SOLUTION-AND-ROADMAP.md))
 - [x] E/W tier 1 — internal segmentation probing (`ew` class filled)
 - [ ] E/W tier 2 — payload signatures east–west (needs a second deployable; deferred)
+- [~] MINION-style effectiveness measurement — a paired sender/reflector **proof of
+      concept** that measures a control's effectiveness from *ground truth* (block / allow /
+      **mishandle**) instead of a single-host guess, computes a Security Effectiveness
+      score with false-positive testing, and doubles as the deferred "second deployable."
+      See the roadmap in [docs/MINION-OSS-ROADMAP.md](docs/MINION-OSS-ROADMAP.md) and the
+      working POC under [`poc/`](poc/) (`python3 poc/minion_harness.py --demo`)

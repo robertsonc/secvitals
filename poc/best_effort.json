@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "mode": "best-effort",
+  "note": "Best-effort tests mirror the MAIN secvitals catalog (config/catalog.yaml): real-world-style payloads fired SINGLE-ENDED at PUBLIC origins (tmNIDS/testmynids.org, EICAR, Google Safe Browsing test pages, category hosts). They are realistic and independent — they run on a customer-adjacent network and use the same signatures a real attacker would trip — but the result is a HEURISTIC local read (allowed/blocked/error): the customer's IDS/IPS MAY OR MAY NOT register an event, and there is no far-end proof that it did. This catalog is DISPLAY-ONLY for the POC's --manifest, so the ground-truth and best-effort tiers can be shown side by side; the dual-ended run does not fire these (they have no reflector far-end). In the product this tier is run by the existing secvitals console.",
+  "tests": [
+    {
+      "id": "be-uid",
+      "class": "malicious",
+      "threat": "recon",
+      "label": "Linux uid=0(root) check",
+      "origin": "testmynids.org",
+      "expect": "IDS alert — GPL SID 2100498"
+    },
+    {
+      "id": "be-malware-ua",
+      "class": "malicious",
+      "threat": "malware",
+      "label": "Malware user-agents",
+      "origin": "testmynids.org",
+      "expect": "ET USER_AGENTS SIDs"
+    },
+    {
+      "id": "be-c2",
+      "class": "malicious",
+      "threat": "c2",
+      "label": "Malware C2 beacon",
+      "origin": "testmynids.org",
+      "expect": "ET MALWARE C2 SIDs"
+    },
+    {
+      "id": "be-eicar",
+      "class": "malicious",
+      "threat": "malware",
+      "label": "EICAR test file over HTTP",
+      "origin": "public EICAR host",
+      "expect": "AV / URL-reputation block"
+    },
+    {
+      "id": "be-malware-gsb",
+      "class": "malicious",
+      "threat": "malware",
+      "label": "Malware page (Google Safe Browsing test)",
+      "origin": "testsafebrowsing.appspot.com",
+      "expect": "web-threat block"
+    },
+    {
+      "id": "be-cat-gambling",
+      "class": "benign",
+      "threat": "policy",
+      "label": "Gambling category (acceptable-use)",
+      "origin": "bet365.com",
+      "expect": "SWG category deny (if policy set)"
+    }
+  ]
+}

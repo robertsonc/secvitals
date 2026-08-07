@@ -1,4 +1,4 @@
-"""Tests for the MINION-style effectiveness POC (poc/).
+"""Tests for the effectiveness POC (poc/).
 
 The POC's whole claim is that a paired sender + reflector produces GROUND TRUTH, so the
 honesty properties are what matter most here:
@@ -21,9 +21,9 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from poc import effectiveness as ef          # noqa: E402
-from poc import minion_reflector as reflector  # noqa: E402
-from poc import minion_control as control     # noqa: E402
-from poc import minion_harness as harness     # noqa: E402
+from poc import reflector                     # noqa: E402
+from poc import control                       # noqa: E402
+from poc import harness                       # noqa: E402
 
 CATALOG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                        "poc", "probes.json")

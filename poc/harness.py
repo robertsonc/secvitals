@@ -1,4 +1,4 @@
-"""MINION POC — the harness (device A): send probes, reconcile, score, report.
+"""Effectiveness POC — the harness (device A): send probes, reconcile, score, report.
 
 This is the sender. It runs on the demo host (behind the security control) and runs no
 listener of its own. For each probe in the fixed catalog it:
@@ -31,10 +31,10 @@ import urllib.request
 
 try:                                            # run as a script from poc/ …
     import effectiveness
-    import minion_reflector
-    import minion_control
-except ImportError:                             # … or imported as poc.minion_harness
-    from poc import effectiveness, minion_reflector, minion_control
+    import reflector
+    import control
+except ImportError:                             # … or imported as poc.harness
+    from poc import effectiveness, reflector, control
 
 
 # ---------------------------------------------------------------------------
@@ -106,10 +106,10 @@ def fetch_ledger(reflector_base, run_id, secret, timeout=5.0):
     try:
         with urllib.request.urlopen(url, timeout=timeout) as resp:
             body = resp.read()
-            sig = resp.headers.get("X-Minion-Sig", "")
+            sig = resp.headers.get("X-Reflector-Sig", "")
     except (urllib.error.URLError, OSError) as e:
         return None, f"ledger unreachable on the management channel: {e}"
-    expect = minion_reflector.sign(secret, body)
+    expect = reflector.sign(secret, body)
     if not sig or not _consteq(sig, expect):
         return None, "ledger HMAC did not verify — ground truth is untrusted"
     try:
@@ -288,9 +288,9 @@ def format_html(card):
     perf_txt = ("—" if perf["p50_ms"] is None
                 else f"p50 {perf['p50_ms']}ms · p95 {perf['p95_ms']}ms · {perf['throughput_per_s']}/s")
     return f"""<!doctype html><html><head><meta charset="utf-8">
-<title>MINION POC — Security Effectiveness</title><style>{_HTML_CSS}</style></head><body>
+<title>Security Effectiveness — secvitals POC</title><style>{_HTML_CSS}</style></head><body>
 <h1>Security Control Effectiveness</h1>
-<div class="sub">MINION-style paired-device measurement · run {_esc(card['run_id'])} · {_esc(card['generated'])}</div>
+<div class="sub">paired-device effectiveness measurement · run {_esc(card['run_id'])} · {_esc(card['generated'])}</div>
 <div class="hero"><div class="big">{_fmtpct(card['security_effectiveness_pct'])}</div>
 <div class="grade">grade {_esc(card['grade'])}</div></div>
 <div class="kv">
@@ -326,13 +326,13 @@ def write_report(card, path):
 # ---------------------------------------------------------------------------
 # self-contained demo
 # ---------------------------------------------------------------------------
-def run_demo(catalog_path, secret=minion_reflector.DEFAULT_SECRET, verbose=False):
+def run_demo(catalog_path, secret=reflector.DEFAULT_SECRET, verbose=False):
     """Stand up reflector + mock control on loopback and run the harness end-to-end. This
     is the one-command proof that the paired loop works; in production there is no mock
     control — the customer's real stack sits in the path instead."""
     probes = load_catalog(catalog_path)
-    rserver, raddr, _ = minion_reflector.start_reflector(secret=secret, verbose=verbose)
-    cserver, caddr, _ = minion_control.start_control(raddr, verbose=verbose)
+    rserver, raddr, _ = reflector.start_reflector(secret=secret, verbose=verbose)
+    cserver, caddr, _ = control.start_control(raddr, verbose=verbose)
     try:
         reflector_base = f"http://{raddr[0]}:{raddr[1]}"
         control_base = f"http://{caddr[0]}:{caddr[1]}"
@@ -345,8 +345,8 @@ def run_demo(catalog_path, secret=minion_reflector.DEFAULT_SECRET, verbose=False
 
 def main(argv=None):
     here = os.path.dirname(os.path.abspath(__file__))
-    p = argparse.ArgumentParser(prog="minion_harness",
-                                description="MINION POC harness — measure control "
+    p = argparse.ArgumentParser(prog="harness",
+                                description="Effectiveness-POC harness — measure control "
                                             "effectiveness from ground truth")
     p.add_argument("--demo", action="store_true",
                    help="self-contained loopback demo (reflector + mock control + harness)")
@@ -355,9 +355,9 @@ def main(argv=None):
     p.add_argument("--control-url", help="base URL to SEND probes through (the control in "
                                          "the path); in real use, the reflector's address")
     p.add_argument("--reflector-url", help="base URL to READ the signed ledger (management)")
-    p.add_argument("--secret", default=os.environ.get("MINION_SECRET",
-                                                       minion_reflector.DEFAULT_SECRET),
-                   help="shared HMAC secret (or MINION_SECRET)")
+    p.add_argument("--secret", default=os.environ.get("SECVITALS_REFLECTOR_SECRET",
+                                                       reflector.DEFAULT_SECRET),
+                   help="shared HMAC secret (or SECVITALS_REFLECTOR_SECRET)")
     p.add_argument("--timeout", type=float, default=5.0, help="per-probe send timeout (s)")
     p.add_argument("--out", metavar="FILE", help="write report to FILE (.html/.json/.txt)")
     p.add_argument("--format", choices=("text", "json"), default="text")

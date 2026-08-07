@@ -1,10 +1,10 @@
-"""MINION POC — the reflector (device B): ground truth of what crossed the control.
+"""Effectiveness POC — the reflector (device B): ground truth of what crossed the control.
 
 This is the "second deployable" secvitals' own decision record (CONFIRMED.md §7) says an
 east-west / effectiveness test needs. It runs on infrastructure YOU control on the far
 side of the security stack under test — a lab VM, a cloud host — *not* on the demo host.
 The demo host still runs no listener; only the sender (the harness) lives there. That is
-how the paired MINION architecture is reconciled with secvitals' "no network surface on
+how the paired sender/receiver architecture is reconciled with secvitals' "no network surface on
 the demo host" guardrail: the surface moves to a box you own and expect to be reachable.
 
 What it does, and nothing more:
@@ -14,7 +14,7 @@ What it does, and nothing more:
                                  payload — only its length and digest. Inert by design.
   GET  /ledger/<run_id>          Returns the run's {token: {sha256,len,ts}} as JSON, with
                                  an HMAC-SHA256 signature over the exact body in the
-                                 X-Minion-Sig header, so the harness can trust that this
+                                 X-Reflector-Sig header, so the harness can trust that this
                                  ground truth was not spoofed in transit.
   GET  /healthz                  Liveness of the reflector's management endpoint.
 
@@ -42,7 +42,7 @@ import time
 MAX_BODY = 64 * 1024                    # a receiver, not a file drop
 _PATH_PROBE = re.compile(r"^/probe/([A-Za-z0-9._-]{1,64})/([A-Za-z0-9]{1,64})$")
 _PATH_LEDGER = re.compile(r"^/ledger/([A-Za-z0-9._-]{1,64})$")
-DEFAULT_SECRET = "minion-poc-shared-secret-change-me"
+DEFAULT_SECRET = "secvitals-reflector-shared-secret-change-me"
 
 
 class Ledger:
@@ -77,7 +77,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     ledger: Ledger
     secret: str
 
-    server_version = "MinionReflector/0.1"
+    server_version = "SecvitalsReflector/0.1"
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
@@ -91,7 +91,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         if sign_body:
-            self.send_header("X-Minion-Sig", sign(self.server.secret, body))
+            self.send_header("X-Reflector-Sig", sign(self.server.secret, body))
         self.end_headers()
         self.wfile.write(body)
 
@@ -149,18 +149,18 @@ def start_reflector(host="127.0.0.1", port=0, secret=DEFAULT_SECRET, verbose=Fal
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(prog="minion_reflector",
-                                description="MINION POC reflector (run this on the far "
+    p = argparse.ArgumentParser(prog="reflector",
+                                description="Effectiveness-POC reflector (run this on the far "
                                             "side of the control, on infra you own)")
     p.add_argument("--bind", default="0.0.0.0", help="interface to bind (default 0.0.0.0)")
     p.add_argument("--port", type=int, default=8899, help="port to listen on (default 8899)")
-    p.add_argument("--secret", default=os.environ.get("MINION_SECRET", DEFAULT_SECRET),
-                   help="shared HMAC secret (or set MINION_SECRET)")
+    p.add_argument("--secret", default=os.environ.get("SECVITALS_REFLECTOR_SECRET", DEFAULT_SECRET),
+                   help="shared HMAC secret (or set SECVITALS_REFLECTOR_SECRET)")
     p.add_argument("--verbose", action="store_true", help="log every request")
     args = p.parse_args(argv)
     server = ReflectorServer((args.bind, args.port), Ledger(), args.secret, verbose=args.verbose)
     host, port = server.server_address
-    print(f"MINION reflector listening on {host}:{port}  (ledger is HMAC-signed)")
+    print(f"reflector listening on {host}:{port}  (ledger is HMAC-signed)")
     print("  POST /probe/<run_id>/<token>   GET /ledger/<run_id>   GET /healthz")
     try:
         server.serve_forever()

@@ -1,8 +1,8 @@
-# MINION-style effectiveness POC — paired ground-truth measurement
+# Effectiveness POC — paired ground-truth measurement
 
 This directory is a **proof of concept**, not part of the shipping `secvitals` console. It
 demonstrates the one capability that separates an *open-source* re-imagining of
-[MINION by NSS Labs](../docs/MINION-OSS-ROADMAP.md) from what `secvitals` does today: a
+[MINION by NSS Labs](../docs/EFFECTIVENESS-ROADMAP.md) from what `secvitals` does today: a
 **paired sender + reflector** that measures a security control's effectiveness from
 **ground truth** instead of a single-host guess.
 
@@ -69,12 +69,12 @@ score.
 ## Run the self-contained demo
 
 Everything runs over loopback with no external network. A bundled **mock control**
-(`minion_control.py`, demo-only) stands in for the real security stack so you can see the
+(`control.py`, demo-only) stands in for the real security stack so you can see the
 whole loop on one machine:
 
 ```bash
-python3 poc/minion_harness.py --demo
-python3 poc/minion_harness.py --demo --out /tmp/effectiveness.html   # + a static report
+python3 poc/harness.py --demo
+python3 poc/harness.py --demo --out /tmp/effectiveness.html   # + a static report
 ```
 
 Expected: 6 threats **blocked**, 1 **mishandled** (Spring4Shell sanitized in transit), 0
@@ -88,13 +88,13 @@ at it:
 
 ```bash
 # on infra you control, on the far side of the control under test:
-python3 poc/minion_reflector.py --bind 0.0.0.0 --port 8899 --secret "$MINION_SECRET"
+python3 poc/reflector.py --bind 0.0.0.0 --port 8899 --secret "$SECVITALS_REFLECTOR_SECRET"
 
 # on the demo host (behind the control):
-python3 poc/minion_harness.py \
+python3 poc/harness.py \
     --control-url  http://<reflector-host>:8899 \   # data path — traverses the control
     --reflector-url http://<reflector-host>:8899 \  # management read of the signed ledger
-    --secret "$MINION_SECRET" --out effectiveness.html
+    --secret "$SECVITALS_REFLECTOR_SECRET" --out effectiveness.html
 ```
 
 (`--control-url` and `--reflector-url` are the same address here — the control is in the
@@ -105,13 +105,13 @@ management interface.)
 
 | File | Role |
 |---|---|
-| `minion_harness.py` | device A — send, reconcile, score, report, CLI, `--demo` |
-| `minion_reflector.py` | device B — the receiver; HMAC-signed ledger of what arrived |
-| `minion_control.py` | **demo/test only** — mock inline control for the loopback demo |
+| `harness.py` | device A — send, reconcile, score, report, CLI, `--demo` |
+| `reflector.py` | device B — the receiver; HMAC-signed ledger of what arrived |
+| `control.py` | **demo/test only** — mock inline control for the loopback demo |
 | `effectiveness.py` | pure, network-free scoring (fully unit-tested) |
 | `probes.json` | fixed, inert paired catalog (malicious + benign) |
 
-Tests: `python3 -m unittest tests.test_minion_poc`
+Tests: `python3 -m unittest tests.test_effectiveness_poc`
 
 ## Scope & honesty
 
@@ -126,7 +126,7 @@ Tests: `python3 -m unittest tests.test_minion_poc`
 - **Local disk only.** Nothing phones home. The demo host still has no inbound socket; the
   reflector is a separate deployable you place and own.
 
-See [`../docs/MINION-OSS-ROADMAP.md`](../docs/MINION-OSS-ROADMAP.md) for how this POC
+See [`../docs/EFFECTIVENESS-ROADMAP.md`](../docs/EFFECTIVENESS-ROADMAP.md) for how this POC
 becomes a product: false-positive corpora, evasion matrices, TLS-inspection tests,
 performance-under-load, a Security Value Map, continuous runs, and how each is reconciled
 with the seven guardrails.

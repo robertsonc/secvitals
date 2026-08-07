@@ -1,4 +1,4 @@
-"""Security-effectiveness scoring — the honest, network-free core of the MINION POC.
+"""Security-effectiveness scoring — the honest, network-free core of the effectiveness POC.
 
 This module never touches the network. It takes the *ground-truth outcome* of each
 probe — learned by the harness by reconciling what the sender emitted against what the
@@ -96,9 +96,10 @@ def _counts(results, klass):
 
 
 def performance_summary(latencies_ms, duration_s=None):
-    """A lightweight stand-in for MINION's performance axis: p50/p95 round-trip latency
-    over the probes that completed, and effective throughput. POC-scale — a real build
-    would drive concurrent load; here it just characterises the happy path honestly."""
+    """A lightweight stand-in for the performance axis a full platform measures: p50/p95
+    round-trip latency over the probes that completed, and effective throughput. POC-scale
+    — a real build would drive concurrent load; here it just characterises the happy path
+    honestly."""
     lat = sorted(x for x in latencies_ms if x is not None)
     out = {"samples": len(lat), "p50_ms": None, "p95_ms": None,
            "max_ms": None, "throughput_per_s": None}

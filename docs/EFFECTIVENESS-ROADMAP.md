@@ -1,4 +1,4 @@
-# From `secvitals` to a MINION: an open-source roadmap for measuring security-control effectiveness
+# Measuring security-control effectiveness: an open-source roadmap for `secvitals`
 
 *A plan to evolve `secvitals` from an honest single-host signal generator into an
 open-source, ground-truth **effectiveness** measurement platform that mimics
@@ -134,16 +134,16 @@ real Security Effectiveness score from ground truth.
 
 **Components** (see [`poc/README.md`](../poc/README.md) for the topology diagram):
 
-- `minion_reflector.py` — **device B**, the receiver: an `http.server` that records
+- `reflector.py` — **device B**, the receiver: an `http.server` that records
   `token → sha256(body)` for each arrival and returns an **HMAC-signed** ledger. It only
   ever *hashes* payloads (never executes/resolves/stores them) and caps body size. It is
   the *only* component that listens, and it runs on infra you own behind the control.
-- `minion_harness.py` — **device A**, the sender: mints a per-probe nonce, sends each
+- `harness.py` — **device A**, the sender: mints a per-probe nonce, sends each
   probe toward the far side, reads and **verifies** the signed ledger, and **reconciles**
   sent-vs-received into the four ground-truth outcomes below. Scores, reports (text / JSON
   / static HTML), and ships a one-command `--demo`.
 - `effectiveness.py` — the pure, network-free **scoring core** (fully unit-tested).
-- `minion_control.py` — a **demo/test-only** mock inline control so the whole loop runs on
+- `control.py` — a **demo/test-only** mock inline control so the whole loop runs on
   loopback; there is no mock in a real engagement.
 - `probes.json` — the fixed, inert paired catalog (benign + malicious).
 
@@ -162,7 +162,7 @@ real Security Effectiveness score from ground truth.
 excluded from the denominators and reported by name — the honesty rule inherited straight
 from the three-state classifier.
 
-**One command, end to end** (`python3 poc/minion_harness.py --demo`):
+**One command, end to end** (`python3 poc/harness.py --demo`):
 
 ```
 ==================================================================
@@ -182,7 +182,7 @@ Spring4Shell payload the control *sanitizes* rather than drops — a state the c
 single-host design is blind to), benign traffic **allowed**, the canary confirming the
 path is up. Point the control at a dead upstream and every probe honestly scores `error`,
 never a false block; feed the harness the wrong HMAC secret and the untrusted ledger scores
-`error`-for-all. Both are covered by `tests/test_minion_poc.py` (23 tests).
+`error`-for-all. Both are covered by `tests/test_effectiveness_poc.py` (23 tests).
 
 ## 6. Phased roadmap
 

@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "note": "Fixed MINION-POC probe catalog. Every payload is INERT BY CONSTRUCTION — a test string the reflector only ever hashes, never executes or resolves — mirroring how secvitals' DLP/exploit packs stay safe (EICAR is a benign AV test string; the JNDI reference points at the RFC 2606 reserved .invalid TLD and is never resolved; the PAN is the universal 4111 test value; the UA/id strings are just strings). Malicious probes SHOULD be stopped by an effective control; benign probes should pass untouched. `expect` is the catalog's claim, kept strictly separate from what is observed.",
+  "note": "Fixed effectiveness-POC probe catalog. Every payload is INERT BY CONSTRUCTION — a test string the reflector only ever hashes, never executes or resolves — mirroring how secvitals' DLP/exploit packs stay safe (EICAR is a benign AV test string; the JNDI reference points at the RFC 2606 reserved .invalid TLD and is never resolved; the PAN is the universal 4111 test value; the UA/id strings are just strings). Malicious probes SHOULD be stopped by an effective control; benign probes should pass untouched. `expect` is the catalog's claim, kept strictly separate from what is observed.",
   "probes": [
     {
       "id": "control-canary",
@@ -8,7 +8,7 @@
       "role": "control",
       "label": "Control canary (benign heartbeat)",
       "threat": "none",
-      "payload": "SECV-MINION-CANARY benign end-to-end heartbeat",
+      "payload": "SECV-CANARY benign end-to-end heartbeat",
       "expect": "arrive"
     },
     {

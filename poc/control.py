@@ -1,4 +1,4 @@
-"""MINION POC — a mock inline control (DEMO / TEST ONLY).
+"""Effectiveness POC — a mock inline control (DEMO / TEST ONLY).
 
 In a real engagement there is NO mock: the harness sends probes straight at the
 reflector's public address and the customer's actual inline stack (IDS/IPS, SWG, DLP)
@@ -162,8 +162,8 @@ def start_control(upstream, host="127.0.0.1", port=0, policy=None, verbose=False
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(prog="minion_control",
-                                description="MINION POC mock inline control (DEMO ONLY — "
+    p = argparse.ArgumentParser(prog="control",
+                                description="Effectiveness-POC mock inline control (DEMO ONLY — "
                                             "stands in for the real security stack)")
     p.add_argument("--bind", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8898)
@@ -174,7 +174,7 @@ def main(argv=None):
     host, _, port = args.upstream.partition(":")
     server = ControlServer((args.bind, args.port), (host, int(port)), verbose=args.verbose)
     bhost, bport = server.server_address
-    print(f"MINION mock control on {bhost}:{bport} -> reflector {args.upstream} (DEMO ONLY)")
+    print(f"mock control on {bhost}:{bport} -> reflector {args.upstream} (DEMO ONLY)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

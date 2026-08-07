@@ -17,6 +17,14 @@ a firewall/IPS/endpoint product — it **evaluates** those products, measuring w
 control "effectively **detects, blocks, allows, or mishandles** defined threats and
 traffic."
 
+NSS now frames the platform as **Continuous Control Validation (CCV)** — "an AI-enabled
+Continuous Control Validation platform designed to deliver continuous, real-world testing
+of cybersecurity controls **and AI systems**," positioned as "redefining cybersecurity
+assurance … purpose-built to support modern GRC programs." It runs at hyperscale against a
+standing, **daily-updated** corpus — **4,000+ exploits, 1,000+ evasion techniques, and 1M+
+malware samples** — a very different scale from a fixed demo catalog, and a reminder that
+the corpus, not just the plumbing, is a first-class part of the product.
+
 The architectural heart is a **pair of devices connected by software**: one **sends**
 crafted malicious *and* benign traffic through the control under test, and the paired
 device **receives** on the far side and confirms what actually arrived. Because NSS owns
@@ -24,18 +32,20 @@ device **receives** on the far side and confirms what actually arrived. Because 
 alterations, and threats that passed *undetected*, none of which a single-host generator
 can observe. On top of that ground truth MINION reports:
 
-- **True-positive block rate** on exploit and malware corpora (reference firewall round:
-  3,326 exploit + 11,311 malware samples);
+- **True-positive block rate** on exploit and malware corpora (a reference firewall round
+  used 3,326 exploit + 11,311 malware samples; the standing platform corpus is far larger —
+  see the daily-updated figures above);
 - **Evasion resistance** — the same threat wrapped many ways (5,752 variations across 53
-  categories); the drop in block rate is the evasion gap;
+  categories in that round; 1,000+ evasion techniques platform-wide); the drop in block
+  rate is the evasion gap;
 - **False-positive accuracy** — legitimate traffic wrongly blocked, now MINION's primary
   measure of operational overhead (it explicitly *replaced* the old price-per-Mbps metric);
 - **Encrypted-traffic handling** (TLS/SSL weighted ~95% of the mix) and **performance /
   stability under load** (throughput, latency, 55 stress tests);
 - a composite **Security Effectiveness** score (top products score >99%), delivered
   through a self-service, executive-ready **data platform** with comparison and
-  decision-support views, positioned as **continuous** ("from attestation to continuous,
-  measurable proof") and **audit-ready**.
+  decision-support views, positioned as **Continuous Control Validation** ("from
+  attestation to continuous, measurable proof") and **audit-ready**.
 
 It descends directly from NSS Labs' historic **Security Value Map** — *Security
 Effectiveness* (a composite of exploit/malware block rate and evasion resistance) plotted
@@ -198,7 +208,8 @@ measurable (the SVM's green dot vs blue dot); rollups report per tactic.
 metrics, an evasion-adjusted variant, an inline-SVG **Security Value Map**, per-class and
 per-ATT&CK scoreboards, and longitudinal trend lines — extending `render_html_report`.
 Continuous runs (cron / systemd / Actions) append to the ledger for drift detection: a
-control that silently stops blocking shows up as a trend break.
+control that silently stops blocking shows up as a trend break — the open-source take on
+NSS's **Continuous Control Validation**, minus the managed service.
 
 **Phase 4 — Encrypted-traffic + performance-under-load (gated lab).** Reflector terminates
 TLS (self-signed origin) → inspected-vs-uninspected block rate. A stdlib concurrent load
@@ -213,6 +224,14 @@ senders); add OCSF/SARIF findings export and report signing for GRC/audit ingest
 inert on the wire; the reflector produces `mishandled` by byte-diffing arrived-vs-sent,
 never by executing attacker code. True-compromise testing is out of scope and the
 delivery-proxy limitation is stated plainly wherever a result is reported.
+
+**Scope note — AI-system validation.** NSS now folds *AI systems* into the same Continuous
+Control Validation platform ("testing of cybersecurity controls **and AI systems**"). This
+roadmap addresses the **network-security-control** half — the traffic-effectiveness
+measurement the paired reflector unlocks. Validating AI models/guardrails is a distinct
+discipline (adversarial-prompt and jailbreak corpora, output classifiers, refusal/leak
+scoring) to which the sent-vs-received byte-diff does not transfer, and it is out of scope
+here. Worth naming so the mapping is honest about which half of MINION this mimics.
 
 ## 7. Reconciling MINION with the seven guardrails
 
@@ -241,6 +260,11 @@ guarantee rather than eroding it.
 - NSS Labs / CyberRatings — *When Firewalls Fail Gracefully*.
 - NSS Labs — NGFW/NGIPS **Security Value Map** comparative reports (methodology lineage:
   Security Effectiveness, evasion resistance, TCO per protected Mbps).
+- NSS Labs — [*Our Story*](https://nsslabs.com/our-story/) (NSS Labs 2.0 / LLC; Continuous
+  Control Validation for cybersecurity **and AI**; daily-updated corpus of 4,000+ exploits,
+  1,000+ evasion techniques, 1M+ malware samples).
+- Yahoo Finance / PR Newswire — [*NSS Labs Introduces Minion*](https://finance.yahoo.com/news/nss-labs-introduces-minion-managed-100000174.html)
+  (announcement reprint).
 - Existing project docs: [`docs/SOLUTION-AND-ROADMAP.md`](SOLUTION-AND-ROADMAP.md),
   [`CONFIRMED.md`](../CONFIRMED.md) §7 (deferred east-west tier-2), and the POC in
   [`poc/`](../poc/).

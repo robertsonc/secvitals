@@ -374,10 +374,6 @@ class TestOriginFailover(unittest.TestCase):
         self.assertIn("verify the alternate serves the same content", text)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestCurlChecksCompose(unittest.TestCase):
     """M3's transport-capability gate and M5's curl-presence check both shell out to
     `curl --version`, and both can veto the same trigger. The ordering matters: when
@@ -415,3 +411,10 @@ class TestCurlChecksCompose(unittest.TestCase):
         reason = sv.unmet_requirement(trigger, sv.Settings(raw={}))
         self.assertIn("HTTP/3", reason)
         self.assertIn("not a policy result", reason)
+
+
+# Must stay at the very bottom: unittest.main() calls sys.exit(), so any class defined
+# below it is never reached when this file is run directly — the run still reports OK,
+# just with fewer tests than discovery collects.
+if __name__ == "__main__":
+    unittest.main()

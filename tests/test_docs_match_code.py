@@ -56,7 +56,29 @@ class TestDocsMatchCatalog(unittest.TestCase):
         self.assertEqual(len(documented), len(set(documented)), "duplicate rows")
 
     def test_roadmap_states_the_current_version(self):
+        """This failed for real when main advanced to 0.7.0 while the PR sat open —
+        which is the guard working. Keeping it means a release cannot quietly leave the
+        solution guide describing an older product."""
         self.assertIn(f"version **{sv.__version__}**", _read(ROADMAP))
+
+    def test_measurement_modes_are_documented(self):
+        """Every mode the code can assign must be explained somewhere a reader will look.
+        `allowed` means something materially different under each one, so an undocumented
+        mode is an unexplained caveat on every result in the guide."""
+        text = _read(ROADMAP)
+        for mode in sorted(sv.MODES):
+            self.assertIn(mode.replace("-", "\u2011"), text, f"{mode} undocumented")
+
+    def test_stated_mode_split_matches_the_catalog(self):
+        """The guide claims all triggers are best-effort. The day one becomes
+        ground-truth, that sentence is wrong and this test says so."""
+        modes = {t.mode for t in self.triggers}
+        text = _read(ROADMAP)
+        if modes == {"best-effort"}:
+            self.assertIn(f"All {len(self.triggers)} triggers today are", text)
+        else:
+            self.assertNotIn(f"All {len(self.triggers)} triggers today are", text,
+                             "the catalog now mixes modes; the guide still claims one")
 
     def test_class_table_totals_agree_with_the_catalog(self):
         text = _read(ROADMAP)

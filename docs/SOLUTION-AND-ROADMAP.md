@@ -10,7 +10,7 @@ demo. It fires the traffic and reports what it saw **locally** — `allowed`,
 `blocked`, or `error` — and never pretends to be the authority. The customer
 reads the real verdict on their own management console, already on screen.
 
-Everything in this document is grounded in the code as of version **0.6.0**
+Everything in this document is grounded in the code as of version **0.7.0**
 (`secvitals.py`, `config/catalog.yaml`, `config/settings.yaml`). It is organized
 in three parts:
 
@@ -208,6 +208,25 @@ How each runner decides:
 - **IP reputation** runs the control probe first (fail → whole test `invalid`),
   then reports **N‑of‑M blocked** as a ratio — never a single verdict, because a
   lone reach may be a live relay and a lone block may be an offline node.
+
+#### 1.4a Measurement mode — what a local verdict can and cannot know
+
+As of 0.7.0 every trigger carries a **measurement mode**, because the honest classifier
+has a ceiling that is worth naming:
+
+| Mode | How the traffic is fired | What it can prove |
+|---|---|---|
+| **best‑effort** | Single‑ended at a public origin. | Realistic and independent, but this host only sees its *own* end. A silent drop and a silently altered payload are indistinguishable from a normal failure. |
+| **ground‑truth** | Dual‑ended against a reflector you control. | Arrival is *confirmed* on the far side, so silent drops and alterations become visible. |
+
+**All 53 triggers today are `best‑effort`.** That is not a defect — single‑ended,
+public‑origin traffic is what makes the catalog realistic and independent of any
+infrastructure the customer has to trust. But it bounds what `allowed` means: it means
+*this host completed the request*, not *the payload arrived unaltered*.
+
+`--list` reports the split, and the HTML report labels each row. The plan for closing the
+gap is a separate document: **[docs/EFFECTIVENESS-ROADMAP.md](EFFECTIVENESS-ROADMAP.md)**,
+with a working proof of concept in [`poc/`](../poc/).
 
 ### 1.5 Attribution: the 5‑tuple
 
@@ -779,3 +798,4 @@ rather than construction:
 | **East–west tier 2** | Payload signatures east–west need a second deployable listener; out until the update path is hardened for two artifacts (§1.9). |
 | **Signing the shipped catalog** | The machinery and `tools/sign_catalog.sh` exist and are tested, but the published `catalog.yaml` is not yet signed, so installs report `unsigned`. |
 | **Feed durability** | Three of the four reputation feeds are third‑party lists (abuse.ch, blocklist.de). A dead feed reports `error`, never a false block — but their availability is outside our control. |
+| **Ground‑truth measurement** | Every trigger is `best‑effort` today (§1.4a): single‑ended, so silent drops and alterations are invisible. Closing that gap needs a paired reflector, and is planned separately in [docs/EFFECTIVENESS-ROADMAP.md](EFFECTIVENESS-ROADMAP.md). |

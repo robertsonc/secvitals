@@ -13,6 +13,46 @@ an observed fact about the source material or a recorded build decision.
 
 ## 0. Revisions (newest first)
 
+### 0c. Spatial glass console (supersedes §2b's "same palette constants as netvitals")
+
+**Date:** 2026-08-13.
+
+The ask: *"make it smoother, modern — a spatial OS / glassmorphic feel, with small
+animations for each of the signal emissions."* The window was flat dark rectangles with
+platform buttons; it read as a form, not as an instrument.
+
+**Decision:** keep every identity mark that means something (the lock-and-EKG logo, HPE
+green `#01A982`, the state colours, the dark surface) and rebuild the surface underneath
+them. §2b's promise of *identical palette constants* to netvitals is retired: the two apps
+still look like siblings, but Security Vitals no longer inherits netvitals' greys.
+
+- **One lit backdrop, sampled not guessed.** Tk has no compositor and no alpha channel, so
+  a translucent panel cannot be composited — it has to be *computed*. The backdrop is an
+  analytic light field (`_backdrop_rgb`): painted once into a `PhotoImage` (generated at a
+  fraction of resolution and zoomed, ~0.25 s for a full window) and sampled by every panel
+  for its own frost tint, drop shadow and glow. That one function is why a pane, its
+  shadow and its rim always agree with what is actually behind them.
+- **Drawn surfaces, real widgets.** Cards are rounded panes drawn on a canvas with the
+  content frame floating on top (Tk always paints embedded windows above canvas items), so
+  text, focus and the clipboard keep behaving while the surface gets corners, shadow and a
+  specular edge. Buttons are canvas-drawn pills — and keep `takefocus`, Return/Space and a
+  visible focus ring, because they replace a `tk.Button` that had all three.
+- **The emission lane.** Every trigger row and the presenter stage carry a lane: this host
+  on the left, the inline stack's gate two-thirds along, the internet on the right. A fire
+  streams **one dot per on-wire signal**; the dots **hold at the gate while the verdict is
+  unknown** — which is the literal truth, since nothing is known until `App.run` returns —
+  then pass through, break against it, or scatter. This is the one place a UI could lie
+  about the product, so: `error` scatters and **never** draws a block, `ratio` shows both
+  outcomes in the observed proportion, and no state is animated before the run reports it.
+- **One clock.** All motion runs on a single ~60 fps driver (`_Anim`) that idles at 90 ms
+  when nothing is moving and drops any callback that raises, so a destroyed widget can
+  never stop the window.
+
+Non-negotiables are untouched: no network surface, no shell, fixed catalog, three-state
+classifier, live-suspect gate, signed fail-closed update. The GUI build smoke test still
+drives `run_gui` against the fake tkinter, so every geometry read goes through a guard
+(`_num`) that tolerates a widget with no window yet.
+
 ### 0b. Native execution — WSL removed (supersedes §0a's WSL-worker bridge)
 
 **Date:** 2026-07-23 (same day, after the Tkinter+WSL build was pushed as PR #4).

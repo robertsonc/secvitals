@@ -38,6 +38,22 @@ So the same IDS/IPS signatures trip, but **nothing downloads or executes a
 third-party binary** and there's no distro to depend on. (It also runs natively on Linux
 for development.)
 
+### What you see
+
+The window is a single lit workspace with frosted panels floating on it — trigger cards,
+the presenter stage, every dialog — all drawn rather than assembled from platform
+widgets, so the console looks the same on any Windows theme and needs no toolkit beyond
+tcl/tk.
+
+Each trigger carries an **emission lane**: the host on the left, the inline stack's
+inspection gate two-thirds along, the internet on the right. Firing streams **one dot per
+on-wire signal** out of the host; they hold at the gate for exactly as long as the verdict
+is unknown, then **pass through** it (allowed), **break against** it (blocked), or
+**scatter** (error). The header carries a live signal wire that beats once per emitted
+signal and a running tally of what this host has observed. The animation is driven only by
+what the console actually observed — an environment failure scatters, and is never drawn
+as a block, for the same reason the classifier never reports one.
+
 ## Install (Windows, one-click)
 
 Double-click **`install.bat`**. A per-user setup window (no admin rights) finds a Windows
@@ -225,7 +241,8 @@ natively, no Windows required.
 ## Provenance
 
 Reuses from the `netvitals` app: the **form factor** — a self-contained Tkinter window
-with the shared visual identity (palette, dark theme, EKG heartbeat) — the **installer UI**
+carrying the same identity marks (the lock-and-EKG logo, HPE green, a dark surface), now
+rendered as the spatial console described above — the **installer UI**
 (the WinForms setup experience: Windows Python + Tkinter, a `pythonw` shortcut, Add/Remove
 Programs), and the **self-update mechanism** (ported and hardened — netvitals' updater had
 no authenticity check). Everything else is new. The original demo scripts and cheatsheets

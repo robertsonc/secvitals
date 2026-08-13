@@ -31,6 +31,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import socket
@@ -2969,38 +2970,55 @@ class PresenterSession:
 
 
 # ===========================================================================
-# Tkinter console  —  self-contained window (no browser, no local server)
+# Tkinter console  —  a self-contained spatial window (no browser, no server)
 # ===========================================================================
-# Visual identity mirrored from netvitals: same palette, EKG heartbeat, dark
-# cards. Trigger cards are rendered from the fixed local catalog; a click fires the
-# trigger in-process (App.run on a background thread) and renders the three honest states
-# (allowed / blocked / error, plus the iprep ratio) — blocked is the product win, error is
-# the environment, and the two never collapse.
-GUI_BG = "#1a1d21"
-GUI_SURFACE = "#23272e"
-GUI_PANEL = "#2c313a"
-GUI_PANEL_HI = "#333a44"
-GUI_GRID = "#363b44"
-GUI_INK = "#f2f4f5"
-GUI_DIM = "#9aa3ad"
-GUI_FAINT = "#6f787c"
+# The console keeps netvitals' identity — the lock-and-EKG mark, the HPE green, the
+# dark surface — but renders it as a spatial workspace: one lit backdrop, and frosted
+# glass panels floating over it. Tk has no compositor and no alpha channel, so every
+# "translucent" effect here is a colour computed against the exact backdrop pixel it
+# sits on (see _backdrop_rgb / _frost_at). That is why the backdrop is an analytic
+# field rather than an image file: a panel can ask what is behind it.
+#
+# Trigger cards are still rendered from the fixed local catalog and a click still fires
+# in-process (App.run on a background thread), reporting the three honest states
+# (allowed / blocked / error, plus the iprep ratio). What is new is that a click also
+# *shows* the traffic: each on-wire signal leaves the host as a dot, holds at the
+# inline stack, and then passes, breaks, or scatters — animation driven only by what
+# the console actually observed, never by what it hopes happened.
+GUI_BG = "#070a12"            # the window's floor, behind everything
+GUI_BG_TOP = "#101c38"        # backdrop gradient — horizon
+GUI_BG_BOT = "#05070f"        # backdrop gradient — deep
+GUI_SURFACE = "#182033"       # nominal frost (real panels compute their own)
+GUI_PANEL = "#1d2639"
+GUI_PANEL_HI = "#27324a"
+GUI_GRID = "#2a3450"
+GUI_INK = "#eef2f8"
+GUI_DIM = "#9fadc6"
+GUI_FAINT = "#7d8ca9"
 GUI_ACCENT = "#01A982"
 GUI_ACCENT_DK = "#017a5e"
+GUI_ACCENT_LT = "#3ee6b4"
 GUI_INFO = "#00B0E6"
 GUI_WARN = "#FF8300"
 GUI_CRIT = "#E0574a"
 GUI_GOLD = "#FEC901"
+GUI_VIOLET = "#7a6cf0"
 GUI_FONT = "Segoe UI"
 GUI_MONO = "Consolas"
 
 SEV_COLOR = {"info": GUI_INFO, "warn": GUI_WARN, "crit": GUI_CRIT}
+
+# One colour per honest state, shared by the cards, the emission lanes and the
+# presenter — so "blocked green" means the same thing everywhere in the window.
+STATE_COLOR = {ALLOWED: GUI_INFO, BLOCKED: GUI_ACCENT, ERROR: GUI_CRIT,
+               INVALID: GUI_GOLD, RATIO: GUI_WARN}
 
 # The presenter's attestation cycles unset -> confirmed -> not-seen. It records what a
 # human saw on the customer's console; it never changes this host's own observation.
 CONFIRM_CYCLE = {CONFIRMED_UNSET: CONFIRMED_YES, CONFIRMED_YES: CONFIRMED_NO,
                  CONFIRMED_NO: CONFIRMED_UNSET}
 CONFIRM_CYCLE_LABEL = {CONFIRMED_UNSET: "Console: not marked",
-                       CONFIRMED_YES: "Console: confirmed \u2713",
+                       CONFIRMED_YES: "Console: confirmed ✓",
                        CONFIRMED_NO: "Console: not seen"}
 CONFIRM_CYCLE_FG = {CONFIRMED_UNSET: GUI_INK, CONFIRMED_YES: GUI_ACCENT, CONFIRMED_NO: GUI_WARN}
 
@@ -3019,18 +3037,827 @@ CLASS_LABEL = {
 }
 
 
-def _draw_logo(cv):
-    """Padlock silhouette (shadow) crossed by a green EKG pulse — the same mark as
-    the web build's SVG, drawn on a 42x40 canvas."""
-    f = GUI_FAINT
-    cv.create_arc(14, 10, 26, 22, start=0, extent=180, style="arc", outline=f, width=2)  # shackle
-    cv.create_line(14, 16, 14, 21, fill=f, width=2)
-    cv.create_line(26, 16, 26, 21, fill=f, width=2)
-    cv.create_rectangle(10, 20, 30, 35, fill=GUI_PANEL, outline=f, width=1)              # body
-    cv.create_oval(18.5, 25, 21.5, 28, fill=f, outline=f)                                # keyhole
-    cv.create_line(20, 27, 20, 31, fill=f, width=2)
-    cv.create_line(1, 27, 14, 27, 17.5, 16, 22, 34, 25.5, 27, 41, 27,                    # EKG pulse
-                   fill=GUI_ACCENT, width=2, capstyle="round", joinstyle="round")
+# ---------------------------------------------------------------------------
+# colour arithmetic — Tk has no alpha, so every blend is computed up front
+# ---------------------------------------------------------------------------
+def _rgb(colour):
+    c = colour.lstrip("#")
+    return (int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16))
+
+
+def _hx(r, g, b):
+    return "#%02x%02x%02x" % (max(0, min(255, int(r))), max(0, min(255, int(g))),
+                              max(0, min(255, int(b))))
+
+
+def _mix(a, b, t):
+    """Blend hex colour `a` toward `b`. t=0 is a, t=1 is b."""
+    ar, ag, ab = _rgb(a)
+    br, bg, bb = _rgb(b)
+    return _hx(ar + (br - ar) * t, ag + (bg - ag) * t, ab + (bb - ab) * t)
+
+
+def _lift(colour, t=0.12):
+    """Toward the light — highlights, hover states, specular edges."""
+    return _mix(colour, "#ffffff", t)
+
+
+def _sink(colour, t=0.30):
+    """Toward the dark — wells, shadows, recessed panes."""
+    return _mix(colour, "#000000", t)
+
+
+def _num(value, default=0):
+    """Geometry reads (winfo_*, bbox) are ints on a live interpreter and None under the
+    headless build test, so every one of them goes through here — a layout pass must
+    never raise just because it is measuring a widget that has no window yet."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _bg_of(widget, default=GUI_SURFACE):
+    """The colour actually behind a widget, so a child can blend into its parent
+    instead of stamping a rectangle of some other shade on top of it."""
+    try:
+        value = widget.cget("bg")
+    except Exception:
+        return default
+    return value if isinstance(value, str) and value.startswith("#") else default
+
+
+# ---------------------------------------------------------------------------
+# the backdrop: one analytic light field, painted once and sampled forever
+# ---------------------------------------------------------------------------
+# fx, fy, radius, colour, strength — soft light sources sitting behind the glass.
+_AURORA = (
+    (0.02, -0.10, 0.80, GUI_ACCENT, 0.58),
+    (1.00, -0.02, 0.66, GUI_INFO, 0.40),
+    (0.78, 1.10, 0.88, GUI_VIOLET, 0.52),
+    (0.30, 0.58, 0.60, "#0d6a92", 0.22),
+    (0.55, 0.24, 0.34, "#123a6e", 0.20),
+)
+
+
+def _backdrop_rgb(fx, fy, aspect=1.45):
+    """The backdrop colour at fractional position (fx, fy) of the window.
+
+    Single source of truth: the painted image, every panel's frost tint and every
+    drop shadow are derived from this one function, which is what keeps a "translucent"
+    surface consistent with what is actually behind it."""
+    tr, tg, tb = _rgb(GUI_BG_TOP)
+    dr, dg, db = _rgb(GUI_BG_BOT)
+    e = fy ** 0.72                      # ease the horizon high in the frame
+    r = tr + (dr - tr) * e
+    g = tg + (dg - tg) * e
+    b = tb + (db - tb) * e
+    for cx, cy, rad, colour, strength in _AURORA:
+        dx = fx - cx
+        dy = (fy - cy) * aspect         # the light pools are wider than they are tall
+        d2 = (dx * dx + dy * dy) / (rad * rad)
+        if d2 >= 1.0:
+            continue
+        k = (1.0 - d2)
+        k = k * k * strength
+        lr, lg, lb = _rgb(colour)
+        r += (lr - r) * k
+        g += (lg - g) * k
+        b += (lb - b) * k
+    vx, vy = (fx - 0.5) * 2.0, (fy - 0.5) * 2.0     # corners fall away
+    v = 1.0 - 0.26 * min(1.0, (vx * vx + vy * vy) * 0.5)
+    return (r * v, g * v, b * v)
+
+
+def _frost_at(fx, fy, lift=0.13, pickup=0.28, base="#141c2e", tint="#cfe0ff"):
+    """The colour of a frosted pane sitting at (fx, fy).
+
+    Real frosted glass is mostly its own material: it picks up some of the light behind
+    it, blurred to a local average, and scatters the rest back as white. Taking the
+    backdrop wholesale would tint every panel bright teal under the aurora and leave no
+    contrast for the state colours, so the pane keeps a cool base and only *some* of
+    what is behind it — which is also what makes two panes at different heights read as
+    the same material rather than two different ones."""
+    sample = _hx(*_backdrop_rgb(fx, fy))
+    return _mix(_mix(base, sample, pickup), tint, lift)
+
+
+def _backdrop_image(w, h):
+    """Render the light field as a PhotoImage.
+
+    Generated at a fraction of the window's resolution and zoomed back up: the field is
+    smooth by construction, so the upscale costs nothing visually and the whole paint is
+    one Tcl call instead of a million. Returns (image, source) — the caller must keep
+    BOTH alive or Tk garbage-collects the pixels out from under the canvas."""
+    w, h = max(16, int(w)), max(16, int(h))
+    cell = max(3, int(math.sqrt(w * h / 45000.0)))
+    cw, ch = int(w // cell) + 2, int(h // cell) + 2
+    src = tk.PhotoImage(width=cw, height=ch)
+    cache, rows = {}, []
+    xs = [(i + 0.5) / cw for i in range(cw)]
+    for j in range(ch):
+        fy = (j + 0.5) / ch
+        row = []
+        for fx in xs:
+            r, g, b = _backdrop_rgb(fx, fy)
+            key = (int(r), int(g), int(b))
+            colour = cache.get(key)
+            if colour is None:
+                colour = cache[key] = _hx(key[0], key[1], key[2])
+            row.append(colour)
+        rows.append("{" + " ".join(row) + "}")
+    src.put(" ".join(rows))
+    return src.zoom(cell), src
+
+
+def _round_pts(x0, y0, x1, y1, r):
+    """Corner points for a rounded rectangle drawn as a smoothed polygon. Each straight
+    run repeats its endpoints so the spline pins the edges flat and only bends at the
+    corners."""
+    r = max(1.0, min(float(r), (x1 - x0) / 2.0, (y1 - y0) / 2.0))
+    return [x0 + r, y0, x0 + r, y0, x1 - r, y0, x1 - r, y0, x1, y0,
+            x1, y0 + r, x1, y0 + r, x1, y1 - r, x1, y1 - r, x1, y1,
+            x1 - r, y1, x1 - r, y1, x0 + r, y1, x0 + r, y1, x0, y1,
+            x0, y1 - r, x0, y1 - r, x0, y0 + r, x0, y0 + r, x0, y0]
+
+
+def _glass(cv, x0, y0, x1, y1, fill, behind, radius=16, stroke=None, shadow=4,
+           glow=None, glow_k=1.0, tags=()):
+    """Draw one frosted surface: a soft drop shadow that fades into `behind`, the pane
+    itself, and a specular hairline along the top edge where the light catches it."""
+    ids = []
+    for i in range(shadow, 0, -1):
+        t = i / float(shadow)
+        col = _mix(behind, "#000000", 0.30 * (1.0 - t) + 0.08)
+        ids.append(cv.create_polygon(
+            _round_pts(x0 - i * 0.6, y0 + i * 0.7, x1 + i * 0.6, y1 + i * 1.3, radius + i),
+            smooth=True, splinesteps=10, fill=col, outline="", tags=tags))
+    if glow and glow_k > 0.01:                 # a lit pane throws colour onto the backdrop
+        for i in (7, 5, 3):
+            ids.append(cv.create_polygon(
+                _round_pts(x0 - i, y0 - i, x1 + i, y1 + i, radius + i),
+                smooth=True, splinesteps=10, outline="",
+                fill=_mix(behind, glow, (0.19 - i * 0.02) * glow_k), tags=tags))
+    ids.append(cv.create_polygon(_round_pts(x0, y0, x1, y1, radius), smooth=True,
+                                 splinesteps=12, fill=fill,
+                                 outline=(stroke or _lift(fill, 0.20)), width=1, tags=tags))
+    ids.append(cv.create_line(x0 + radius * 0.9, y0 + 1.5, x1 - radius * 0.9, y0 + 1.5,
+                              fill=_lift(fill, 0.34), width=1, tags=tags))
+    ids.append(cv.create_line(x0 + radius * 0.5, y1 - 1, x1 - radius * 0.5, y1 - 1,
+                              fill=_sink(fill, 0.22), width=1, tags=tags))
+    return ids
+
+
+# ---------------------------------------------------------------------------
+# one clock for everything that moves
+# ---------------------------------------------------------------------------
+class _Anim:
+    """A single ~60 fps clock shared by the whole window.
+
+    Every animated thing registers a callback here instead of running its own `after`
+    loop, so motion costs one timer no matter how much is moving — and costs almost
+    nothing when nothing is. A callback that raises is dropped, never propagated: a
+    widget destroyed mid-flight must not be able to stop the clock."""
+
+    def __init__(self, root):
+        self.root = root
+        self.jobs = []
+        self._pending = None
+        self._last = time.monotonic()
+        self._schedule(80)
+
+    def add(self, fn, ambient=False):
+        """Register fn(dt, elapsed); return False from it to unregister.
+
+        `ambient` marks a job that is always running and never urgent (the header's
+        heartbeat): the clock runs at half rate while only those are registered, so a
+        console left open on a desk costs a fraction of what an interaction costs."""
+        self.jobs.append([fn, time.monotonic(), bool(ambient)])
+        self._schedule(33 if ambient else 16)
+        return fn
+
+    def drop(self, fn):
+        self.jobs = [j for j in self.jobs if j[0] is not fn]
+
+    def _schedule(self, ms):
+        try:
+            if self._pending is not None:
+                self.root.after_cancel(self._pending)
+        except Exception:
+            pass
+        try:
+            self._pending = self.root.after(ms, self._tick)
+        except Exception:
+            self._pending = None
+
+    def _tick(self):
+        now = time.monotonic()
+        dt = min(0.05, max(0.001, now - self._last))
+        self._last = now
+        for job in list(self.jobs):
+            try:
+                alive = job[0](dt, now - job[1])
+            except Exception:
+                alive = False
+            if alive is False:
+                try:
+                    self.jobs.remove(job)
+                except ValueError:
+                    pass
+        if not self.jobs:
+            self._schedule(90)
+        else:
+            self._schedule(16 if any(not job[2] for job in self.jobs) else 33)
+
+
+def _ease(t):
+    """Smoothstep — used everywhere a value has to arrive without a hard stop."""
+    t = max(0.0, min(1.0, t))
+    return t * t * (3.0 - 2.0 * t)
+
+
+# ---------------------------------------------------------------------------
+# controls
+# ---------------------------------------------------------------------------
+class _Pill:
+    """A button drawn on a canvas: rounded, frosted, lit from within on hover.
+
+    Tk's Button is a hard-edged platform rectangle that would break the surface
+    everywhere it appeared, so the console draws its own — which also gives the press
+    somewhere to put a little physicality."""
+
+    def __init__(self, parent, text, command, kind="ghost", anim=None,
+                 font=None, padx=15, pady=8):
+        self.behind = _bg_of(parent)
+        self.kind = kind
+        self.command = command
+        self.text = text
+        self.enabled = True
+        self.anim = anim
+        self.font = font or (GUI_FONT, 9, "bold")
+        self.padx, self.pady = padx, pady
+        self.glow = 0.0
+        self.target = 0.0
+        self.press = 0.0
+        self._job = None
+        self.focused = False
+        self.h = 30
+        # takefocus stays on: this replaces a tk.Button, and a control you can reach
+        # with Tab and fire with Return has to keep behaving that way.
+        self.cv = tk.Canvas(parent, bg=self.behind, highlightthickness=0, bd=0,
+                            width=90, height=self.h, cursor="hand2", takefocus=1)
+        probe = self.cv.create_text(-500, -500, text=text, font=self.font, anchor="w")
+        self.tw = self._measure(probe, len(text) * 7 + 8)
+        try:
+            self.cv.delete(probe)
+        except Exception:
+            pass
+        self.w = int(self.tw + self.padx * 2)
+        self.h = int(16 + self.pady * 2)
+        try:
+            self.cv.configure(width=self.w, height=self.h)
+        except Exception:
+            pass
+        for seq, fn in (("<Enter>", self._enter), ("<Leave>", self._leave),
+                        ("<Button-1>", self._focus_click), ("<ButtonRelease-1>", self._up),
+                        ("<FocusIn>", self._focus_in), ("<FocusOut>", self._focus_out),
+                        ("<Return>", self._activate), ("<space>", self._activate)):
+            try:
+                self.cv.bind(seq, fn)
+            except Exception:
+                pass
+        self._render()
+
+    def _measure(self, item, fallback):
+        try:
+            box = self.cv.bbox(item)
+            return max(10, int(box[2] - box[0]))
+        except Exception:
+            return fallback
+
+    # -- palette ----------------------------------------------------------
+    def _colours(self):
+        g = self.glow
+        if not self.enabled:
+            return (_lift(self.behind, 0.05), _lift(self.behind, 0.10), GUI_FAINT, None)
+        if self.kind == "primary":
+            fill = _mix(GUI_ACCENT_DK, GUI_ACCENT, 0.55 + 0.45 * g)
+            return (fill, _mix(GUI_ACCENT_LT, "#ffffff", 0.15 * g), "#04140f", GUI_ACCENT)
+        if self.kind == "danger":
+            fill = _mix(_lift(self.behind, 0.06), GUI_CRIT, 0.55 + 0.4 * g)
+            return (fill, GUI_CRIT, "#160707", GUI_CRIT)
+        fill = _lift(self.behind, 0.07 + 0.09 * g)
+        return (fill, _lift(self.behind, 0.20 + 0.22 * g), GUI_INK, None)
+
+    def _render(self):
+        cv = self.cv
+        try:
+            cv.delete("all")
+        except Exception:
+            return
+        fill, stroke, ink, halo = self._colours()
+        dy = 1.0 * self.press
+        r = self.h / 2.0
+        if halo and self.enabled:                 # a lit control spills onto its surround
+            for i, t in ((4, 0.16), (2, 0.26)):
+                cv.create_polygon(_round_pts(1 - i * 0.5, 1 - i * 0.5 + dy,
+                                             self.w - 1 + i * 0.5, self.h - 2 + i * 0.5 + dy, r + i),
+                                  smooth=True, splinesteps=8, outline="",
+                                  fill=_mix(self.behind, halo, t * (0.35 + 0.65 * self.glow)))
+        cv.create_polygon(_round_pts(1, 2 + dy, self.w - 1, self.h - 1 + dy, r),
+                          smooth=True, splinesteps=10, fill=_sink(self.behind, 0.25),
+                          outline="")
+        cv.create_polygon(_round_pts(1, 1 + dy, self.w - 1, self.h - 2 + dy, r),
+                          smooth=True, splinesteps=10, fill=fill, outline=stroke, width=1)
+        if self.focused and self.enabled:          # keyboard focus has to be visible
+            cv.create_polygon(_round_pts(3, 3 + dy, self.w - 3, self.h - 4 + dy, r - 2),
+                              smooth=True, splinesteps=10, fill="", width=1,
+                              outline=_lift(fill, 0.55))
+        cv.create_text(self.w / 2.0, self.h / 2.0 + dy, text=self.text, fill=ink,
+                       font=self.font)
+
+    # -- interaction ------------------------------------------------------
+    def _animate(self):
+        if self.anim is None:
+            self.glow = self.target
+            self._render()
+            return
+        if self._job is not None:
+            return
+
+        def frame(dt, _elapsed):
+            step = dt * 7.0
+            done = True
+            if abs(self.target - self.glow) > 0.01:
+                self.glow += (self.target - self.glow) * min(1.0, step)
+                done = False
+            else:
+                self.glow = self.target
+            if abs(self.press) > 0.01:
+                self.press *= max(0.0, 1.0 - step)
+                done = False
+            self._render()
+            if done:
+                self._job = None
+                return False
+            return True
+        self._job = self.anim.add(frame)
+
+    def _enter(self, _e=None):
+        if self.enabled:
+            self.target = 1.0
+            self._animate()
+
+    def _leave(self, _e=None):
+        self.target = 0.0
+        self._animate()
+
+    def _focus_click(self, _e=None):
+        try:
+            self.cv.focus_set()
+        except Exception:
+            pass
+        if self.enabled:
+            self.press = 1.0
+            self._render()
+
+    def _up(self, _e=None):
+        if not self.enabled:
+            return
+        self.press = 0.6
+        self._animate()
+        if callable(self.command):
+            self.command()
+
+    def _activate(self, _e=None):
+        """Return/Space on a focused control, the same as a click."""
+        if not self.enabled:
+            return
+        self.press = 1.0
+        self._animate()
+        if callable(self.command):
+            self.command()
+        return "break"
+
+    def _focus_in(self, _e=None):
+        self.focused = True
+        self._render()
+
+    def _focus_out(self, _e=None):
+        self.focused = False
+        self._render()
+
+    # -- the tk.Button surface the rest of the console expects -------------
+    def configure(self, **kw):
+        if "state" in kw:
+            self.enabled = kw.pop("state") != "disabled"
+            try:
+                self.cv.configure(cursor="hand2" if self.enabled else "arrow")
+            except Exception:
+                pass
+        if "text" in kw:
+            self.text = kw.pop("text")
+            probe = self.cv.create_text(-500, -500, text=self.text, font=self.font, anchor="w")
+            self.w = int(self._measure(probe, len(self.text) * 7 + 8) + self.padx * 2)
+            try:
+                self.cv.delete(probe)
+                self.cv.configure(width=self.w)
+            except Exception:
+                pass
+        if "bg" in kw:
+            self.behind = kw.pop("bg")
+            try:
+                self.cv.configure(bg=self.behind)
+            except Exception:
+                pass
+        self._render()
+
+    config = configure
+
+    def pack(self, **kw):
+        self.cv.pack(**kw)
+        return self
+
+    def pack_forget(self):
+        self.cv.pack_forget()
+
+    def grid(self, **kw):
+        self.cv.grid(**kw)
+        return self
+
+    def place(self, **kw):
+        self.cv.place(**kw)
+        return self
+
+
+def _gui_button(parent, text, cmd, primary=False, anim=None, font=None):
+    return _Pill(parent, text, cmd, kind=("primary" if primary else "ghost"),
+                 anim=anim, font=font)
+
+
+def _chip_row(parent, items, font=None, pad=7, gap=6, height=19):
+    """A row of small rounded tags on one canvas — one widget instead of a dozen, and
+    rounded, which a bordered tk.Label can never be."""
+    behind = _bg_of(parent)
+    font = font or (GUI_MONO, 8)
+    cv = tk.Canvas(parent, bg=behind, highlightthickness=0, bd=0, height=height,
+                   width=10, takefocus=0)
+    x = 0
+    for text, colour in items:
+        probe = cv.create_text(-500, -500, text=text, font=font, anchor="w")
+        try:
+            box = cv.bbox(probe)
+            tw = int(box[2] - box[0])
+        except Exception:
+            tw = len(text) * 6
+        try:
+            cv.delete(probe)
+        except Exception:
+            pass
+        w = tw + pad * 2
+        cv.create_polygon(_round_pts(x, 1, x + w, height - 1, (height - 2) / 2.0),
+                          smooth=True, splinesteps=8,
+                          fill=_mix(behind, colour, 0.13), outline=_mix(behind, colour, 0.55))
+        cv.create_text(x + w / 2.0, height / 2.0, text=text, fill=_lift(colour, 0.25),
+                       font=font)
+        x += w + gap
+    try:
+        cv.configure(width=max(10, x))
+    except Exception:
+        pass
+    return cv
+
+
+# ---------------------------------------------------------------------------
+# the emission lane — what a click actually does, drawn
+# ---------------------------------------------------------------------------
+class _Lane:
+    """A strip that shows this trigger's signals leaving the host.
+
+    Left node is this host. The gate two-thirds along is the inline IDS/IPS and secure
+    web gateway. The right edge is the internet. Firing streams one dot per on-wire
+    signal out of the host; they hold at the gate for as long as the verdict is unknown
+    — which is exactly the truth, because nothing is known until the run returns — and
+    then pass through it, break against it, or scatter.
+
+    The lane only ever animates a state the console actually observed. An environment
+    failure scatters (error); it never draws a block, for the same reason the classifier
+    never reports one."""
+
+    def __init__(self, parent, anim, width=210, height=26, behind=None, on_emit=None):
+        self.anim = anim
+        self.on_emit = on_emit
+        self.behind = behind or _bg_of(parent)
+        self.w, self.h = int(width), int(height)
+        self.scale = max(0.85, self.h / 26.0)
+        self.cv = tk.Canvas(parent, width=self.w, height=self.h, bg=self.behind,
+                            highlightthickness=0, bd=0, takefocus=0)
+        self.dots = []
+        self.total = 0
+        self.emitted = 0
+        self.verdict = None
+        self.passes = 0            # for `ratio`: how many of the batch got through
+        self.flash = 0.0
+        self.rest = None
+        self._job = None
+        self._t = 0.0                 # own clock: a re-fire restarts the stream cleanly
+        self._label = ""
+        self.redraw()
+
+    # -- geometry ---------------------------------------------------------
+    def _geom(self):
+        return (10.0 * self.scale, self.w * 0.63, self.w - 7.0 * self.scale, self.h / 2.0)
+
+    def resize(self, width):
+        width = int(width)
+        if width == self.w or width < 60:
+            return
+        self.w = width
+        try:
+            self.cv.configure(width=width)
+        except Exception:
+            return
+        self.redraw()
+
+    # -- driving ----------------------------------------------------------
+    def fire(self, count, label=""):
+        """Start streaming `count` signals. The verdict is not known yet — that is the
+        point of the hold at the gate."""
+        self.total = max(1, min(int(count or 1), 14))
+        self.emitted = 0
+        self.dots = []
+        self.verdict = None
+        self.passes = 0
+        self.rest = None
+        self._t = 0.0
+        self._label = label
+        self._start()
+
+    def resolve(self, state, passes=None, label=""):
+        self.verdict = state
+        self.passes = passes if passes is not None else (self.total if state == ALLOWED else 0)
+        self.flash = 1.0
+        self._label = label or self._label
+        if not self.total:                       # resolved without ever firing (gated)
+            self.total, self.emitted = 0, 0
+            self.rest = state
+            self.redraw()
+            return
+        self._start()
+
+    def clear(self):
+        self.dots, self.total, self.emitted = [], 0, 0
+        self.verdict, self.rest, self.flash = None, None, 0.0
+        self._t = 0.0
+        self.redraw()
+
+    def _start(self):
+        if self._job is not None or self.anim is None:
+            self.redraw()
+            return
+        self._job = self.anim.add(self._frame)
+
+    def _frame(self, dt, _elapsed):
+        self._t += dt
+        elapsed = self._t
+        x_host, x_gate, x_end, _y = self._geom()
+        span = max(1.0, x_gate - x_host)
+        speed = span / 0.62                       # a signal reaches the gate in ~0.6s
+        while self.emitted < self.total and elapsed > self.emitted * 0.11:
+            self.dots.append({"x": x_host, "phase": self.emitted * 1.7,
+                              "mode": "fly", "age": 0.0, "vy": 0.0})
+            self.emitted += 1
+            if callable(self.on_emit):
+                try:
+                    self.on_emit()
+                except Exception:
+                    pass
+        held = 0
+        for dot in self.dots:
+            dot["age"] += dt
+            if dot["mode"] == "fly":
+                dot["x"] += speed * dt
+                if dot["x"] >= x_gate - 3.0 * self.scale:
+                    dot["x"] = x_gate - 3.0 * self.scale
+                    if self.verdict is None:
+                        dot["mode"] = "held"
+                    else:                         # a verdict that lands mid-flight still
+                        dot["mode"] = self._outcome()   # gets the full resolve animation
+                        dot["age"] = 0.0
+            if dot["mode"] == "held":
+                held += 1
+                if self.verdict is not None:
+                    dot["mode"] = self._outcome()
+                    dot["age"] = 0.0
+            elif dot["mode"] == "pass":
+                dot["x"] += speed * 1.5 * dt
+            elif dot["mode"] == "hit":
+                dot["x"] -= speed * 0.8 * dt * max(0.0, 1.0 - dot["age"] * 1.6)
+                dot["vy"] += 90.0 * dt
+            elif dot["mode"] == "lost":
+                dot["x"] += speed * 0.25 * dt
+                dot["vy"] += 40.0 * dt
+        # queued signals stack up behind the gate rather than sitting on top of each other
+        if held:
+            slot = 0
+            for dot in self.dots:
+                if dot["mode"] == "held":
+                    dot["x"] = x_gate - (3.0 + slot * 4.2) * self.scale
+                    slot += 1
+        self.dots = [d for d in self.dots
+                     if not (d["mode"] == "pass" and d["x"] > x_end + 6)
+                     and not (d["mode"] in ("hit", "lost") and d["age"] > 0.9)]
+        self.flash = max(0.0, self.flash - dt * 1.6)
+        self.redraw(elapsed)
+        if self.verdict is not None and not self.dots and self.emitted >= self.total \
+                and self.flash <= 0.02:
+            self.rest = self.verdict
+            self._job = None
+            self.redraw()
+            return False
+        return True
+
+    def _outcome(self):
+        """Which way this dot goes — chosen per dot so a ratio can show both."""
+        if self.verdict == ALLOWED:
+            return "pass"
+        if self.verdict == BLOCKED:
+            return "hit"
+        if self.verdict == RATIO:
+            taken = sum(1 for d in self.dots if d["mode"] == "pass")
+            return "pass" if taken < self.passes else "hit"
+        return "lost"
+
+    # -- painting ---------------------------------------------------------
+    def redraw(self, elapsed=0.0):
+        cv = self.cv
+        try:
+            cv.delete("all")
+        except Exception:
+            return
+        x_host, x_gate, x_end, y = self._geom()
+        s = self.scale
+        wire = _mix(self.behind, GUI_DIM, 0.42)
+        live = self.verdict is None and self.emitted and self.emitted <= self.total \
+            and self._job is not None
+        state = self.verdict or self.rest
+        colour = STATE_COLOR.get(state, GUI_FAINT)
+
+        x = x_host + 5 * s                       # the wire out to the world
+        while x < x_end:
+            cv.create_line(x, y, x + 2.6 * s, y, fill=wire, width=max(1, int(1.1 * s)))
+            x += 6.4 * s
+        cv.create_oval(x_host - 4.6 * s, y - 4.6 * s, x_host + 4.6 * s, y + 4.6 * s,
+                       fill=_mix(self.behind, GUI_DIM, 0.22), outline="")
+        cv.create_oval(x_host - 2.6 * s, y - 2.6 * s, x_host + 2.6 * s, y + 2.6 * s,
+                       fill=_mix(self.behind, GUI_DIM, 0.85), outline="")
+
+        gate_h = self.h * 0.36
+        gate_c = colour if state else _mix(self.behind, GUI_DIM, 0.62)
+        if live:                                  # breathing while the verdict is unknown
+            gate_c = _mix(gate_c, GUI_ACCENT_LT, 0.30 + 0.30 * math.sin(elapsed * 5.0))
+        halo = max(self.flash, 0.35 if live else 0.0)
+        if halo > 0.02:
+            for i, t in ((5, 0.18), (3, 0.30)):
+                cv.create_rectangle(x_gate - (1.6 + i * 0.5) * s, y - gate_h - i,
+                                    x_gate + (1.6 + i * 0.5) * s, y + gate_h + i,
+                                    fill=_mix(self.behind, gate_c, t * halo), outline="")
+        cv.create_rectangle(x_gate - 1.4 * s, y - gate_h, x_gate + 1.4 * s, y + gate_h,
+                            fill=gate_c, outline="")
+
+        for dot in self.dots:
+            r = 2.6 * s
+            if dot["mode"] == "pass":
+                c, fade = STATE_COLOR.get(ALLOWED, GUI_INFO), 1.0 - _ease((dot["x"] - x_gate) / max(1.0, x_end - x_gate))
+                r *= 0.85
+            elif dot["mode"] == "hit":
+                c, fade = GUI_ACCENT, max(0.0, 1.0 - dot["age"] * 1.15)
+            elif dot["mode"] == "lost":
+                c, fade = GUI_CRIT, max(0.0, 1.0 - dot["age"] * 1.15)
+            else:
+                c, fade = GUI_ACCENT_LT, 1.0
+            dy = dot["vy"] * dot["age"] * 0.35
+            if dot["mode"] == "held":
+                dy = math.sin(elapsed * 6.0 + dot["phase"]) * 1.2 * s
+            cx, cy = dot["x"], y + dy
+            body = _mix(self.behind, c, max(0.12, fade))
+            cv.create_oval(cx - r * 2.1, cy - r * 1.5, cx + r * 2.1, cy + r * 1.5,
+                           fill=_mix(self.behind, c, 0.22 * fade), outline="")
+            cv.create_oval(cx - r, cy - r, cx + r, cy + r, fill=body, outline="")
+
+        # Only the wall-sized lane gets a caption; in a card row the status text to its
+        # right already says what happened, and a label here would sit on the wire.
+        if self._label and self.h >= 44:
+            cv.create_text(x_end, 2, text=self._label, anchor="ne",
+                           fill=_mix(self.behind, colour if state else GUI_DIM, 0.85),
+                           font=(GUI_MONO, 10))
+
+
+class _Pulse:
+    """The header's live wire: a scrolling trace that spikes once for every signal that
+    leaves this host, tinted by the last state the console observed. Idle, it keeps a
+    slow heartbeat — the same EKG the app has always carried, now actually beating."""
+
+    def __init__(self, canvas, anim, x, y, w, h, behind, tag="pulse"):
+        self.cv, self.tag = canvas, tag
+        self.x, self.y, self.w, self.h = x, y, w, h
+        self.behind = behind
+        self.n = 84
+        self.samples = [0.0] * self.n
+        self.colour = GUI_ACCENT
+        self._acc = 0.0
+        self._beat = 0.0
+        self._idle = 0.0
+        self._draw_in = 0.0
+        if anim is not None:
+            anim.add(self._frame, ambient=True)
+
+    def move(self, x, y, w, h, behind=None):
+        self.x, self.y, self.w, self.h = x, y, w, h
+        if behind:
+            self.behind = behind
+
+    def blip(self, colour=None, amp=1.0):
+        if colour:
+            self.colour = colour
+        self._beat = max(self._beat, amp)
+
+    def _frame(self, dt, _elapsed):
+        self._idle += dt
+        if self._idle > 2.4:                     # a resting heartbeat, so the wire is alive
+            self._idle = 0.0
+            self._beat = max(self._beat, 0.34)
+        self._acc += dt
+        step = 1.0 / 45.0
+        moved = False
+        while self._acc >= step:
+            self._acc -= step
+            self.samples.pop(0)
+            value = self._beat
+            self._beat *= 0.55
+            if value < 0.02:
+                value = 0.0
+            self.samples.append(value)
+            moved = True
+        # The trace is the only thing that animates when the console is doing nothing, so
+        # it redraws at ~30 fps rather than on every tick: a window left open on a desk
+        # for an afternoon should not be a busy loop.
+        self._draw_in -= dt
+        if moved and self._draw_in <= 0.0:
+            self._draw_in = 1.0 / 30.0
+            self._render()
+        return True
+
+    def _render(self):
+        cv = self.cv
+        try:
+            cv.delete(self.tag)
+        except Exception:
+            return False
+        base = self.y + self.h / 2.0
+        dx = self.w / float(self.n - 1)
+        pts, glow = [], []
+        for i, v in enumerate(self.samples):
+            # a spike, then the ring-down: the trace reads as one beat, not a bar chart
+            k = v
+            if i and self.samples[i - 1] > v:
+                k = -v * 0.45
+            px = self.x + i * dx
+            py = base - k * (self.h * 0.44)
+            pts.extend((px, py))
+            glow.extend((px, py))
+        if len(pts) >= 4:
+            cv.create_line(*glow, fill=_mix(self.behind, self.colour, 0.30), width=5,
+                           capstyle="round", joinstyle="round", smooth=True, tags=self.tag)
+            cv.create_line(*pts, fill=_mix(self.behind, self.colour, 0.95), width=1,
+                           capstyle="round", joinstyle="round", smooth=True, tags=self.tag)
+        return True
+
+
+def _draw_logo(cv, x=0, y=0, scale=1.0, behind=GUI_BG, tags=()):
+    """Padlock silhouette crossed by a green EKG pulse — the same mark as the web
+    build's SVG, now lit: a soft halo behind the shackle and a bright core on the
+    pulse, so the identity reads as a light source rather than a line drawing."""
+    def p(*vals):
+        return [(x + v * scale) if i % 2 == 0 else (y + v * scale) for i, v in enumerate(vals)]
+
+    ring = _mix(behind, GUI_ACCENT, 0.16)
+    cv.create_oval(*p(2, 4, 38, 40), fill=ring, outline="", tags=tags)
+    cv.create_oval(*p(6, 8, 34, 36), fill=_mix(behind, GUI_ACCENT, 0.10), outline="", tags=tags)
+    edge = _mix(behind, GUI_DIM, 0.75)
+    cv.create_arc(*p(13, 9, 27, 23), start=0, extent=180, style="arc", outline=edge,
+                  width=max(1, int(2 * scale)), tags=tags)
+    cv.create_line(*p(13, 16, 13, 22), fill=edge, width=max(1, int(2 * scale)), tags=tags)
+    cv.create_line(*p(27, 16, 27, 22), fill=edge, width=max(1, int(2 * scale)), tags=tags)
+    cv.create_polygon(_round_pts(*(p(9, 21, 31, 36) + [4 * scale])), smooth=True,
+                      splinesteps=8, fill=_lift(behind, 0.13), outline=edge, width=1, tags=tags)
+    cv.create_oval(*p(18, 25, 22, 29), fill=edge, outline="", tags=tags)
+    cv.create_line(*p(20, 28, 20, 32), fill=edge, width=max(1, int(2 * scale)), tags=tags)
+    ekg = p(0, 28, 12, 28, 16, 15, 21, 36, 25, 28, 40, 28)
+    cv.create_line(*ekg, fill=_mix(behind, GUI_ACCENT, 0.45), width=max(2, int(5 * scale)),
+                   capstyle="round", joinstyle="round", tags=tags)
+    cv.create_line(*ekg, fill=GUI_ACCENT_LT, width=max(1, int(1.6 * scale)),
+                   capstyle="round", joinstyle="round", tags=tags)
 
 
 def _set_window_icon(root):
@@ -3051,15 +3878,218 @@ def _set_window_icon(root):
             pass
 
 
-def _gui_button(parent, text, cmd, primary=False):
-    return tk.Button(parent, text=text, command=cmd,
-                     bg=(GUI_ACCENT if primary else GUI_PANEL),
-                     fg=("#04120e" if primary else GUI_INK),
-                     activebackground=GUI_ACCENT_DK, activeforeground="white",
-                     relief="flat", bd=0, highlightthickness=0, padx=14, pady=6,
-                     font=(GUI_FONT, 9, "bold"), cursor="hand2")
+# ---------------------------------------------------------------------------
+# a secondary window that lives in the same space as the console
+# ---------------------------------------------------------------------------
+class _GlassDialog:
+    """A Toplevel with the console's backdrop and a single frosted panel on it.
+
+    Content goes into `self.body`, a plain Frame whose background is already the frost
+    colour, so ordinary Labels blend into the pane. Call `show()` once the content is
+    packed: it measures, sizes the window to fit, and paints the backdrop behind it."""
+
+    PAD = 16          # backdrop margin around the pane
+    INSET = 18        # pane margin around the content
+
+    def __init__(self, root, title, min_width=520, resizable=False, fy=0.42):
+        self.root = root
+        self.win = tk.Toplevel(root)
+        self.win.title(title)
+        self.win.configure(bg=GUI_BG)
+        self.win.transient(root)
+        self.min_width = min_width
+        self.behind = _hx(*_backdrop_rgb(0.5, fy))
+        self.frost = _frost_at(0.5, fy, lift=0.15)
+        self.cv = tk.Canvas(self.win, bg=GUI_BG, highlightthickness=0, bd=0)
+        self.cv.pack(fill="both", expand=True)
+        self.body = tk.Frame(self.cv, bg=self.frost)
+        self.item = self.cv.create_window(self.PAD + self.INSET, self.PAD + self.INSET,
+                                          anchor="nw", window=self.body)
+        self._img = self._src = None
+        self._wraps = []
+        self._size = (0, 0)
+        self._pending = None
+        if resizable:
+            try:
+                self.win.bind("<Configure>", self._on_configure)
+            except Exception:
+                pass
+        else:
+            try:
+                self.win.resizable(False, False)
+            except Exception:
+                pass
+        try:
+            self.win.protocol("WM_DELETE_WINDOW", self.destroy)
+        except Exception:
+            pass
+
+    def wrap(self, widget, slack=0):
+        """Register a label whose wraplength should follow the pane width."""
+        self._wraps.append((widget, slack))
+        return widget
+
+    def show(self, width=None, height=None):
+        try:
+            self.body.update_idletasks()
+        except Exception:
+            pass
+        bw = width or max(self.min_width, _num(self.body.winfo_reqwidth(), self.min_width))
+        bh = height or _num(self.body.winfo_reqheight(), 200)
+        w = int(bw + 2 * (self.PAD + self.INSET))
+        h = int(bh + 2 * (self.PAD + self.INSET))
+        try:                                     # open over the console, not in a corner
+            px = _num(self.root.winfo_rootx(), 0)
+            py = _num(self.root.winfo_rooty(), 0)
+            pw = _num(self.root.winfo_width(), w)
+            ph = _num(self.root.winfo_height(), h)
+            x = max(0, px + (pw - w) // 2)
+            y = max(0, py + max(24, (ph - h) // 3))
+            self.win.geometry("%dx%d+%d+%d" % (w, h, x, y))
+        except Exception:
+            try:
+                self.win.geometry("%dx%d" % (w, h))
+            except Exception:
+                pass
+        self.repaint(w, h)
+
+    def repaint(self, w=None, h=None):
+        w = _num(w or self.win.winfo_width(), 0)
+        h = _num(h or self.win.winfo_height(), 0)
+        if w < 80 or h < 80 or (w, h) == self._size:
+            return
+        self._size = (w, h)
+        try:
+            self.cv.configure(width=w, height=h)
+            self.cv.delete("chrome")
+        except Exception:
+            return
+        try:
+            self._img, self._src = _backdrop_image(w, h)
+            self.cv.create_image(0, 0, anchor="nw", image=self._img, tags="chrome")
+        except Exception:
+            pass
+        _glass(self.cv, self.PAD, self.PAD, w - self.PAD, h - self.PAD, self.frost,
+               self.behind, radius=18, shadow=5, tags="chrome")
+        inner = w - 2 * (self.PAD + self.INSET)
+        try:
+            self.cv.itemconfigure(self.item, width=inner,
+                                  height=h - 2 * (self.PAD + self.INSET))
+        except Exception:
+            pass
+        for widget, slack in self._wraps:
+            try:
+                widget.configure(wraplength=max(160, inner - slack))
+            except Exception:
+                pass
+
+    def _on_configure(self, event=None):
+        if event is not None and getattr(event, "widget", None) is not self.win:
+            return
+        try:
+            if self._pending is not None:
+                self.win.after_cancel(self._pending)
+            self._pending = self.win.after(120, lambda: self.repaint())
+        except Exception:
+            pass
+
+    def destroy(self):
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
 
 
+class _Tile:
+    """A rounded, lifted pane *inside* another pane, packed like an ordinary widget.
+
+    Same drawn-surface trick as the trigger cards: a canvas paints the rounded fill and
+    the content frame floats on top of it (Tk always draws embedded windows above canvas
+    items). It re-measures itself whenever its width changes or its content moves, so
+    callers only have to remember `sync()` after they finish packing into `body`."""
+
+    def __init__(self, parent, pad=13, lift=0.06, radius=13, glow=None):
+        self.behind = _bg_of(parent)
+        self.fill = _lift(self.behind, lift)
+        self.pad, self.radius, self.glow = pad, radius, glow
+        self.cv = tk.Canvas(parent, bg=self.behind, highlightthickness=0, bd=0, height=12,
+                            takefocus=0)
+        self.body = tk.Frame(self.cv, bg=self.fill)
+        self.item = self.cv.create_window(pad, pad, anchor="nw", window=self.body)
+        self._w = 0
+        try:
+            self.cv.bind("<Configure>", self._on_configure)
+        except Exception:
+            pass
+
+    def _on_configure(self, event=None):
+        w = _num(getattr(event, "width", None), 0) or _num(self.cv.winfo_width(), 0)
+        if w < 40 or w == self._w:               # only a width change needs new geometry
+            return
+        self._w = w
+        try:
+            self.cv.itemconfigure(self.item, width=w - 2 * self.pad)
+        except Exception:
+            return
+        self.sync()
+
+    def sync(self):
+        try:
+            self.body.update_idletasks()
+            h = _num(self.body.winfo_reqheight(), 30) + 2 * self.pad
+            w = _num(self.cv.winfo_width(), 0)
+            self.cv.configure(height=h)
+            self.cv.delete("chrome")
+        except Exception:
+            return
+        if w > 40:
+            _glass(self.cv, 1, 1, w - 2, h - 4, self.fill, self.behind, radius=self.radius,
+                   shadow=2, glow=self.glow, tags="chrome")
+
+    def pack(self, **kw):
+        self.cv.pack(**kw)
+        return self
+
+    def pack_forget(self):
+        self.cv.pack_forget()
+
+
+def _label(parent, text="", fg=GUI_INK, font=None, **kw):
+    """A Label that inherits its parent's surface — the only way to keep text from
+    stamping a differently-shaded rectangle onto a frosted pane."""
+    kw.setdefault("anchor", "w")
+    kw.setdefault("justify", "left")
+    return tk.Label(parent, text=text, fg=fg, bg=_bg_of(parent),
+                    font=font or (GUI_FONT, 10), **kw)
+
+
+def _descendants(widget, acc=None):
+    """A widget and everything inside it — used to bind pointer events to a whole
+    card at once."""
+    acc = [widget] if acc is None else acc
+    try:
+        children = widget.winfo_children()
+    except Exception:
+        return acc
+    for child in children:
+        acc.append(child)
+        _descendants(child, acc)
+    return acc
+
+
+def _well(parent, height=8):
+    """A recessed pane for raw output: darker than the glass it sits in, so a wall of
+    monospace reads as *inside* the surface rather than painted on it."""
+    frost = _bg_of(parent)
+    return tk.Text(parent, height=height, bg=_sink(frost, 0.42), fg=GUI_INK,
+                   insertbackground=GUI_INK, font=(GUI_MONO, 9), relief="flat",
+                   highlightthickness=1, highlightbackground=_lift(frost, 0.10),
+                   wrap="none", padx=10, pady=8, bd=0)
+
+
+# ---------------------------------------------------------------------------
+# the console window
+# ---------------------------------------------------------------------------
 def run_gui(settings, triggers, app, config_dir=None, profiles=None):
     """Build and run the console window. Raises RuntimeError when no display is
     available (headless without Xvfb / no X server)."""
@@ -3072,15 +4102,26 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
     except tk.TclError as e:
         raise RuntimeError(f"no display available: {e}") from e
     root.title(f"{APP_NAME} {__version__}")
-    root.geometry("980x700")
-    root.minsize(600, 440)
+    root.geometry("1140x820")
+    root.minsize(760, 520)
     root.configure(bg=GUI_BG)
     _set_window_icon(root)
 
+    anim = _Anim(root)
     by_id = {t.id: t for t in triggers}
     cards = {}                                  # trigger id -> widget/var bundle
     run_state = {"running": False, "stop": False}
+    observed = {}                               # state -> count, this session
     ui_queue = queue.Queue()                    # background run threads -> main thread ONLY
+
+    gated = [t for t in triggers if t.gated_disabled(settings)]
+    enabled_triggers = [t for t in triggers if not t.unavailable_reason(settings)]
+    planned_signals = sum(t.on_wire_count(settings) for t in enabled_triggers)
+
+    HEAD_H = 200 if gated else 150
+    BAR_Y0, BAR_H = 14, 118
+    SIDE = 20                                   # card gutter
+    CARD_PAD, CARD_GAP = 13, 11
 
     def pump():
         try:
@@ -3093,10 +4134,206 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
         except queue.Empty:
             pass
         try:
-            root.after(80, pump)
+            root.after(60, pump)
         except tk.TclError:
             pass
 
+    # ---- the lit backdrop, shared by the header and the card stage --------
+    art = {"img": None, "src": None, "w": 0, "h": 0}
+
+    def ensure_backdrop(w, h):
+        if art["img"] is not None and abs(art["w"] - w) < 24 and abs(art["h"] - h) < 24:
+            return art["img"]
+        try:
+            art["img"], art["src"] = _backdrop_image(w, h)
+            art["w"], art["h"] = w, h
+        except Exception:                        # no PhotoImage (or no memory): flat floor
+            art["img"] = None
+        return art["img"]
+
+    # ---- header ----------------------------------------------------------
+    head = tk.Canvas(root, bg=GUI_BG, highlightthickness=0, bd=0, height=HEAD_H)
+    head.pack(fill="x", side="top")
+    head_frost = _frost_at(0.5, 0.05, lift=0.16)
+    head_behind = _hx(*_backdrop_rgb(0.5, 0.06))
+    bar = tk.Frame(head, bg=head_frost)
+    bar_item = head.create_window(34, BAR_Y0 + 72, anchor="nw", window=bar, height=34)
+    pulse = _Pulse(head, anim, 0, 0, 10, 10, head_frost)
+
+    def paint_head(w):
+        try:
+            head.delete("chrome")
+        except Exception:
+            return
+        img = ensure_backdrop(max(w, 400), max(_num(root.winfo_height(), 820), 400))
+        if img is not None:
+            head.create_image(0, 0, anchor="nw", image=img, tags="chrome")
+        _glass(head, SIDE - 2, BAR_Y0, w - SIDE + 2, BAR_Y0 + BAR_H, head_frost,
+               head_behind, radius=20, shadow=5, tags="chrome")
+        _draw_logo(head, 34, BAR_Y0 + 15, 1.0, behind=head_frost, tags="chrome")
+        head.create_text(86, BAR_Y0 + 24, text=APP_NAME, anchor="w", fill=GUI_INK,
+                         font=(GUI_FONT, 19, "bold"), tags="chrome")
+        head.create_text(88, BAR_Y0 + 48, anchor="w", fill=GUI_FAINT, font=(GUI_FONT, 9),
+                         text="inline security-stack console  ·  local result only, nothing uploaded",
+                         tags="chrome")
+        head.create_text(w - SIDE - 20, BAR_Y0 + 24, anchor="e", fill=GUI_ACCENT,
+                         font=(GUI_MONO, 10, "bold"), tags="chrome",
+                         text=f"{planned_signals} signals · {len(enabled_triggers)} triggers")
+        head.create_text(w - SIDE - 20, BAR_Y0 + 46, anchor="e", fill=GUI_FAINT,
+                         font=(GUI_MONO, 9), text=f"v{__version__}", tags="chrome")
+        if w > 940:                              # the live wire needs room; small windows drop it
+            px = w - SIDE - 258
+            pulse.move(px - 176, BAR_Y0 + 10, 176, 34, head_frost)
+            head.create_text(px - 176, BAR_Y0 + 52, anchor="w", fill=GUI_FAINT,
+                             font=(GUI_MONO, 8), text="signal wire",
+                             tags=("chrome", "wirecap"))
+        else:
+            pulse.move(-500, -500, 10, 10, head_frost)
+        head.coords(bar_item, 34, BAR_Y0 + 72)
+        head.itemconfigure(bar_item, width=w - 68)
+        if gated:
+            _glass(head, SIDE - 2, BAR_Y0 + BAR_H + 10, w - SIDE + 2, HEAD_H - 8,
+                   _frost_at(0.5, 0.17, lift=0.11), _hx(*_backdrop_rgb(0.5, 0.17)),
+                   radius=14, shadow=3, glow=GUI_WARN, tags="chrome")
+            head.create_rectangle(SIDE + 8, BAR_Y0 + BAR_H + 22, SIDE + 11, HEAD_H - 20,
+                                  fill=GUI_WARN, outline="", tags="chrome")
+            head.create_text(
+                SIDE + 24, BAR_Y0 + BAR_H + 20, anchor="nw", fill=GUI_DIM,
+                font=(GUI_FONT, 9), width=max(200, w - 2 * SIDE - 60), tags="chrome",
+                text=(f"{len(gated)} trigger(s) reach LIVE suspect infrastructure / live Tor "
+                      "nodes and are disabled (enable_live_suspect_hosts is false in "
+                      "settings.yaml). Enable only in a lab you control."))
+        paint_tally(w)
+        try:
+            head.tag_raise("pulse")              # the live wire stays above the repaint
+        except Exception:
+            pass
+
+    def paint_tally(w=None):
+        """What this host has observed so far, in the header. It is this console's own
+        read and the strip says so — the inline stack's console stays the authority for
+        allowed-vs-blocked, and a running tally must not be mistaken for its verdict."""
+        w = _num(w or head.winfo_width(), 0)
+        try:
+            head.delete("tally")
+        except Exception:
+            return
+        if w <= 940 or not observed:
+            return
+        try:
+            head.delete("wirecap")               # the tally takes the caption's line
+        except Exception:
+            pass
+        cx = w - SIDE - 258 - 176
+        item = head.create_text(cx, BAR_Y0 + 52, anchor="w", fill=GUI_FAINT,
+                                font=(GUI_MONO, 8), text="observed", tags="tally")
+        try:
+            cx = head.bbox(item)[2] + 9
+        except Exception:
+            cx += 58
+        for state in (BLOCKED, ALLOWED, RATIO, ERROR, INVALID):
+            n = observed.get(state)
+            if not n:
+                continue
+            colour = STATE_COLOR.get(state, GUI_DIM)
+            head.create_oval(cx, BAR_Y0 + 49, cx + 6, BAR_Y0 + 55, fill=colour,
+                             outline="", tags="tally")
+            item = head.create_text(cx + 10, BAR_Y0 + 52, anchor="w", fill=_lift(colour, 0.2),
+                                    font=(GUI_MONO, 8), text=f"{n} {state}", tags="tally")
+            try:
+                box = head.bbox(item)
+                cx = box[2] + 10
+            except Exception:
+                cx += 62
+
+    # ---- card stage ------------------------------------------------------
+    stage = tk.Canvas(root, bg=GUI_BG, highlightthickness=0, bd=0)
+    stage.pack(fill="both", expand=True)
+    scroll_state = {"first": 0.0, "last": 1.0, "drag": None}
+
+    def pin_backdrop():
+        """The backdrop belongs to the window, not to the scrolled content, so it is
+        re-pinned to the viewport on every scroll — the cards slide over a fixed light
+        field instead of dragging it along with them."""
+        try:
+            top = stage.canvasy(0)
+            stage.coords("bg", 0, top - HEAD_H)
+            paint_scrollbar(top)
+        except Exception:
+            pass
+
+    def paint_scrollbar(top=None):
+        try:
+            stage.delete("sbar")
+            w = _num(stage.winfo_width(), 0)
+            vh = _num(stage.winfo_height(), 0)
+            top = stage.canvasy(0) if top is None else top
+        except Exception:
+            return
+        if not w or not vh:
+            return
+        first, last = scroll_state["first"], scroll_state["last"]
+        if last - first >= 0.999:
+            return
+        x = w - 11
+        y0, y1 = top + 8, top + vh - 8
+        span = y1 - y0
+        stage.create_polygon(_round_pts(x, y0, x + 5, y1, 2.5), smooth=True, splinesteps=6,
+                             fill=_lift(GUI_BG, 0.09), outline="", tags="sbar")
+        ty0 = y0 + span * first
+        ty1 = max(ty0 + 26, y0 + span * last)
+        stage.create_polygon(_round_pts(x, ty0, x + 5, ty1, 2.5), smooth=True, splinesteps=6,
+                             fill=_mix(GUI_BG, GUI_ACCENT, 0.42), outline="", tags="sbar")
+
+    def on_yview(first, last):
+        scroll_state["first"], scroll_state["last"] = float(first), float(last)
+        pin_backdrop()
+
+    try:
+        stage.configure(yscrollcommand=on_yview)
+    except Exception:
+        pass
+
+    def wheel(event, delta):
+        # bind_all reaches every widget in the application, dialogs included, so the
+        # console's own list only scrolls when the pointer is actually over the console.
+        try:
+            if event is not None and event.widget.winfo_toplevel() is not root:
+                return
+            stage.yview_scroll(delta, "units")
+        except Exception:
+            pass
+
+    stage.bind_all("<MouseWheel>",
+                   lambda e: wheel(e, int(-1 * (e.delta / 120)) if e.delta else 0))
+    stage.bind_all("<Button-4>", lambda e: wheel(e, -3))
+    stage.bind_all("<Button-5>", lambda e: wheel(e, 3))
+    stage.bind_all("<Prior>", lambda e: wheel(e, -12))
+    stage.bind_all("<Next>", lambda e: wheel(e, 12))
+
+    def sbar_press(event):
+        w = _num(stage.winfo_width(), 0)
+        if w and event.x >= w - 18:
+            scroll_state["drag"] = event.y
+            sbar_drag(event)
+
+    def sbar_drag(event):
+        if scroll_state["drag"] is None:
+            return
+        vh = _num(stage.winfo_height(), 1)
+        span = max(1, vh - 16)
+        frac = (event.y - 8) / float(span)
+        visible = scroll_state["last"] - scroll_state["first"]
+        try:
+            stage.yview_moveto(max(0.0, min(1.0, frac - visible / 2.0)))
+        except Exception:
+            pass
+
+    stage.bind("<Button-1>", sbar_press)
+    stage.bind("<B1-Motion>", sbar_drag)
+    stage.bind("<ButtonRelease-1>", lambda e: scroll_state.update(drag=None))
+
+    # ---- shared card helpers ---------------------------------------------
     def _set_status(tid, text, fg=GUI_FAINT):
         c = cards.get(tid)
         if c:
@@ -3134,11 +4371,18 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
             return
         state = out.get("state", ERROR)
         c["runs"] += 1
+        observed[state] = observed.get(state, 0) + 1
+        paint_tally()
+        ratio = out.get("ratio") or {}
+        c["lane"].resolve(state, passes=ratio.get("reached"),
+                          label=(f"{ratio['blocked']}/{ratio['total']} blocked"
+                                 if ratio else state))
+        pulse.blip(STATE_COLOR.get(state, GUI_ACCENT), 1.0)
         runs = f"{c['runs']} run" + ("" if c["runs"] == 1 else "s")
         _set_status(tid, f"last run {time.strftime('%H:%M:%S')}  ·  {runs}",
                     STATE_FG.get(state, GUI_DIM))
         c["reason"].configure(text=out.get("reason", ""))
-        c["reason"].pack(anchor="w", fill="x", pady=(2, 0))
+        c["reason"].pack(anchor="w", fill="x", pady=(8, 0))
         kv = []
         if out.get("rc") is not None:
             kv.append(f"rc={out['rc']}")
@@ -3155,14 +4399,15 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
         c["verify_key"] = out.get("verify_key", "")
         if c["verify_key"]:
             c["set_pane"]("verify", c["verify_key"] + "\n\n" + (out.get("console_hint") or ""))
-            c["copy"].pack(side="left", padx=6)
+            c["copy"].pack(side="left", padx=(8, 0))
         c["seq"] = out.get("seq")
         if c["seq"]:
             c["confirmed"] = CONFIRMED_UNSET
             c["confirm"].configure(text=CONFIRM_CYCLE_LABEL[CONFIRMED_UNSET],
                                    fg=CONFIRM_CYCLE_FG[CONFIRMED_UNSET])
-            c["confirm"].pack(side="left", padx=6)
+            c["confirm"].pack(side="left", padx=(8, 0))
         c["fire"].configure(state="normal")
+        relayout()
 
     def fire(tid):
         if run_state["running"]:
@@ -3173,6 +4418,7 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
         c = cards.get(tid)
         if c:
             c["fire"].configure(state="disabled")
+            c["lane"].fire(t.on_wire_count(settings), label="in flight")
         _set_status(tid, "running…", GUI_DIM)
 
         def work():
@@ -3183,11 +4429,18 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
             ui_queue.put(lambda: set_result(tid, out))
         threading.Thread(target=work, daemon=True).start()
 
+    def arm_lane(tid):
+        card = cards.get(tid)
+        if card:
+            card["lane"].fire(by_id[tid].on_wire_count(settings), label="in flight")
+            _set_status(tid, "running…", GUI_DIM)
+
     def run_all_worker(ids):
         n = len(ids)
         for i, tid in enumerate(ids):
             if run_state["stop"]:
                 break
+            ui_queue.put(lambda tid=tid: arm_lane(tid))
             try:
                 _t, out = app.run(tid, {})           # App.run rate-limits between runs itself
             except Exception as e:
@@ -3204,124 +4457,81 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
             return
         run_state["running"], run_state["stop"] = True, False
         run_all_btn.pack_forget()
-        stop_btn.pack(side="left", pady=2)
+        stop_btn.pack(side="left", before=manifest_btn.cv)
         for tid in ids:
             c = cards.get(tid)
             if c:
                 c["fire"].configure(state="disabled")
-            _set_status(tid, "running…", GUI_DIM)
+            _set_status(tid, "queued…", GUI_DIM)
         threading.Thread(target=run_all_worker, args=(ids,), daemon=True).start()
 
     def run_all_done():
         run_state["running"] = False
         stop_btn.pack_forget()
-        run_all_btn.pack(side="left", pady=2)
+        run_all_btn.pack(side="left", before=manifest_btn.cv)
         status_var.set("")
         for tid in cards:
             if not by_id[tid].unavailable_reason(settings):
                 cards[tid]["fire"].configure(state="normal")
+                if cards[tid]["lane"].rest is None:       # queued but never reached
+                    cards[tid]["lane"].clear()
 
     def stop_run_all():
         run_state["stop"] = True
         status_var.set("Stopping after the current trigger…")
 
-    # ---- header -----------------------------------------------------------
-    header = tk.Frame(root, bg=GUI_BG, padx=16, pady=12)
-    header.pack(fill="x", side="top")
-    logo = tk.Canvas(header, width=42, height=40, bg=GUI_BG, highlightthickness=0)
-    logo.pack(side="left", padx=(0, 12))
-    _draw_logo(logo)
-    titlebox = tk.Frame(header, bg=GUI_BG)
-    titlebox.pack(side="left", anchor="w")
-    tk.Label(titlebox, text=APP_NAME, fg=GUI_INK, bg=GUI_BG,
-             font=(GUI_FONT, 20, "bold")).pack(anchor="w")
-    meta = tk.Frame(header, bg=GUI_BG)
-    meta.pack(side="right", anchor="e")
-    tk.Label(meta, text=f"v{__version__}", fg=GUI_DIM, bg=GUI_BG,
-             font=(GUI_MONO, 9)).pack(anchor="e")
-    # The known quantity, stated up front: how many signals a full run puts on the wire.
-    enabled_triggers = [t for t in triggers if not t.unavailable_reason(settings)]
-    planned_signals = sum(t.on_wire_count(settings) for t in enabled_triggers)
-    tk.Label(meta, text=f"{planned_signals} signals · {len(enabled_triggers)} triggers",
-             fg=GUI_ACCENT, bg=GUI_BG, font=(GUI_MONO, 9, "bold")).pack(anchor="e")
-
-    # ---- toolbar ----------------------------------------------------------
-    bar = tk.Frame(root, bg=GUI_BG, padx=16)
-    bar.pack(fill="x")
-    run_all_btn = _gui_button(bar, "▶  Run all enabled", start_run_all, primary=True)
-    run_all_btn.pack(side="left", pady=2)
-    stop_btn = _gui_button(bar, "■  Stop", stop_run_all)          # packed only while running
-    preview_btn = _gui_button(bar, "☰  Signal manifest",
-                              lambda: open_manifest_dialog(root, triggers, settings))
-    preview_btn.pack(side="left", padx=6, pady=2)
-    presenter_btn = _gui_button(
-        bar, "🎤  Presenter mode",
-        lambda: open_presenter_picker(root, app, triggers, settings, profiles))
-    presenter_btn.pack(side="left", padx=6, pady=2)
-    report_btn = _gui_button(bar, "⬇  Save report",
-                             lambda: open_report_dialog(root, app, triggers, settings))
-    report_btn.pack(side="left", padx=6, pady=2)
-    upd_btn = _gui_button(bar, "⟳  Check for updates", lambda: open_update_dialog(root))
-    upd_btn.pack(side="right", pady=2)
+    # ---- toolbar ---------------------------------------------------------
+    run_all_btn = _gui_button(bar, "▶   Run all enabled", start_run_all, primary=True, anim=anim)
+    run_all_btn.pack(side="left")
+    stop_btn = _gui_button(bar, "■   Stop", stop_run_all, anim=anim)   # only while running
+    manifest_btn = _gui_button(bar, "☰   Signal manifest",
+                               lambda: open_manifest_dialog(root, triggers, settings),
+                               anim=anim)
+    manifest_btn.pack(side="left", padx=(8, 0))
+    _gui_button(bar, "🎤   Presenter mode",
+                lambda: open_presenter_picker(root, app, triggers, settings, profiles),
+                anim=anim).pack(side="left", padx=(8, 0))
+    _gui_button(bar, "⬇   Save report",
+                lambda: open_report_dialog(root, app, triggers, settings),
+                anim=anim).pack(side="left", padx=(8, 0))
+    _gui_button(bar, "⟳   Updates", lambda: open_update_dialog(root),
+                anim=anim).pack(side="right")
     status_var = tk.StringVar(value="")
-    tk.Label(bar, textvariable=status_var, fg=GUI_DIM, bg=GUI_BG,
+    tk.Label(bar, textvariable=status_var, fg=GUI_DIM, bg=head_frost,
              font=(GUI_MONO, 9)).pack(side="left", padx=14)
 
-    # ---- live-infrastructure gate notice ---------------------------------
-    gated = [t for t in triggers if t.gated_disabled(settings)]
-    if gated:
-        tk.Label(root, bg=GUI_SURFACE, fg=GUI_DIM, justify="left", anchor="w",
-                 font=(GUI_FONT, 9), padx=12, pady=8, wraplength=920,
-                 highlightbackground=GUI_WARN, highlightthickness=1,
-                 text=(f"{len(gated)} trigger(s) reach LIVE suspect infrastructure / live Tor nodes and "
-                       "are disabled (enable_live_suspect_hosts is false in settings.yaml). Enable only "
-                       "in a lab you control.")).pack(fill="x", padx=16, pady=(6, 0))
-
-    # ---- scrollable card area --------------------------------------------
-    body = tk.Frame(root, bg=GUI_BG)
-    body.pack(fill="both", expand=True, padx=8, pady=(8, 8))
-    scroll = tk.Canvas(body, bg=GUI_BG, highlightthickness=0)
-    vbar = tk.Scrollbar(body, orient="vertical", command=scroll.yview)
-    inner = tk.Frame(scroll, bg=GUI_BG)
-    inner_id = scroll.create_window((0, 0), window=inner, anchor="nw")
-    scroll.configure(yscrollcommand=vbar.set)
-    scroll.pack(side="left", fill="both", expand=True)
-    vbar.pack(side="right", fill="y")
-    inner.bind("<Configure>", lambda e: scroll.configure(scrollregion=scroll.bbox("all")))
-    scroll.bind("<Configure>", lambda e: scroll.itemconfigure(inner_id, width=e.width))
-    scroll.bind_all("<MouseWheel>", lambda e: scroll.yview_scroll(int(-1 * (e.delta / 120)) if e.delta else 0, "units"))
-    scroll.bind_all("<Button-4>", lambda e: scroll.yview_scroll(-1, "units"))
-    scroll.bind_all("<Button-5>", lambda e: scroll.yview_scroll(1, "units"))
-
+    # ---- one card --------------------------------------------------------
     def _make_pane(parent, title):
-        """L3 detail pane: a toggle line + a text box that only appears once there is
-        content and the presenter opens it. Returns (set_content, reset)."""
+        """L3 detail pane: a toggle line + a recessed well that only appears once there
+        is content and the presenter opens it. Returns (set_content, reset)."""
+        frost = _bg_of(parent)
         state = {"open": False, "text": ""}
-        btn = tk.Label(parent, fg=GUI_FAINT, bg=GUI_SURFACE, font=(GUI_MONO, 9), cursor="hand2")
-        box = tk.Text(parent, height=8, bg=GUI_BG, fg=GUI_INK, insertbackground=GUI_INK,
-                      font=(GUI_MONO, 9), relief="flat", highlightthickness=1,
-                      highlightbackground=GUI_GRID, wrap="none", padx=8, pady=6)
+        btn = tk.Label(parent, fg=GUI_FAINT, bg=frost, font=(GUI_MONO, 9), cursor="hand2",
+                       anchor="w")
+        box = _well(parent)
 
         def _render():
-            btn.configure(text=("▾ " if state["open"] else "▸ ") + title)
+            btn.configure(text=("▾  " if state["open"] else "▸  ") + title,
+                          fg=(GUI_DIM if state["open"] else GUI_FAINT))
             if state["open"]:
                 box.configure(state="normal")
                 box.delete("1.0", "end")
                 box.insert("1.0", state["text"] or "(no output)")
                 box.configure(state="disabled")
-                box.pack(fill="x", pady=(4, 0))
+                box.pack(fill="x", pady=(5, 0))
             else:
                 box.pack_forget()
 
         def toggle(_e=None):
             state["open"] = not state["open"]
             _render()
+            relayout()
         btn.bind("<Button-1>", toggle)
 
         def set_content(text):
             state["text"] = text or ""
             if state["text"]:
-                btn.pack(anchor="w", pady=(8, 0))
+                btn.pack(anchor="w", fill="x", pady=(9, 0))
             else:
                 btn.pack_forget()
                 state["open"] = False
@@ -3334,91 +4544,100 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
             state["text"] = ""
         return set_content, reset
 
-    def build_card(t):
+    def build_card(t, fy):
+        # Every card in a class shares one pane tone, sampled from the light at that
+        # depth: the families read as families, and the glass still varies down the
+        # window instead of stamping one flat colour 53 times.
+        behind = _hx(*_backdrop_rgb(0.5, fy))
         unavailable = t.unavailable_reason(settings)
         disabled = bool(unavailable)
         gated_live = t.gated_disabled(settings)
+        frost = _frost_at(0.5, fy, lift=0.055 if disabled else 0.145)
+        sev = SEV_COLOR.get(t.severity, GUI_FAINT)
+
+        frame = tk.Frame(stage, bg=frost)
+        win = stage.create_window(-2000, 0, anchor="nw", window=frame)
         expand = {"open": False}
-        wrap = tk.Frame(inner, bg=GUI_GRID)                       # 1px border via padding
-        wrap.pack(fill="x", padx=8, pady=3)
-        row = tk.Frame(wrap, bg=GUI_SURFACE)
-        row.pack(fill="x", padx=1, pady=1)
-        accent = tk.Frame(row, bg=SEV_COLOR.get(t.severity, GUI_FAINT), width=3)
-        accent.pack(side="left", fill="y")
-        card = tk.Frame(row, bg=GUI_SURFACE)
-        card.pack(side="left", fill="both", expand=True)
 
         # ---- L1: always-visible summary header (click to expand) ----------
-        head = tk.Frame(card, bg=GUI_SURFACE, padx=12, pady=8, cursor="hand2")
-        head.pack(fill="x")
-        caret = tk.Label(head, text="▸", fg=GUI_FAINT, bg=GUI_SURFACE, font=(GUI_MONO, 10))
-        caret.pack(side="left", padx=(0, 8))
-        tk.Label(head, text=t.label, fg=(GUI_FAINT if disabled else GUI_INK), bg=GUI_SURFACE,
-                 font=(GUI_FONT, 11, "bold"), anchor="w", justify="left").pack(side="left")
+        head_row = tk.Frame(frame, bg=frost, cursor="hand2")
+        head_row.pack(fill="x")
+        caret = tk.Label(head_row, text="▸", fg=GUI_FAINT, bg=frost, font=(GUI_MONO, 9))
+        caret.pack(side="left", padx=(2, 8))
+        bead = tk.Canvas(head_row, width=10, height=10, bg=frost, highlightthickness=0,
+                         bd=0, takefocus=0)
+        bead.create_oval(0, 0, 9, 9, fill=_mix(frost, sev, 0.35), outline="")
+        bead.create_oval(2, 2, 7, 7, fill=sev, outline="")
+        bead.pack(side="left", padx=(0, 9))
+        title = tk.Label(head_row, text=t.label, fg=(GUI_FAINT if disabled else GUI_INK),
+                         bg=frost, font=(GUI_FONT, 11, "bold"), anchor="w", justify="left")
+        title.pack(side="left")
         if "hits_live_suspect_hosts" in t.flags:
-            tk.Label(head, text="LIVE", fg=GUI_WARN, bg=GUI_SURFACE, font=(GUI_MONO, 8),
-                     padx=6, pady=1, highlightbackground=GUI_WARN, highlightthickness=1).pack(side="left", padx=8)
-        status = tk.Label(head, text=("disabled (live)" if gated_live
-                                      else "not configured" if disabled else "not run"),
-                          fg=(GUI_GOLD if disabled else GUI_FAINT), bg=GUI_SURFACE, font=(GUI_MONO, 9))
-        status.pack(side="right")
+            _chip_row(head_row, [("LIVE", GUI_WARN)], height=17).pack(side="left", padx=9)
+        status = tk.Label(head_row, text=("disabled (live)" if gated_live
+                                          else "not configured" if disabled else "not run"),
+                          fg=(GUI_GOLD if disabled else GUI_FAINT), bg=frost,
+                          font=(GUI_MONO, 9))
+        status.pack(side="right", padx=(10, 2))
+        lane = _Lane(head_row, anim, width=232, height=26, behind=frost,
+                     on_emit=lambda: pulse.blip(GUI_ACCENT_LT, 0.85))
+        if not disabled:
+            lane.cv.pack(side="right", padx=(14, 0))
 
         # ---- L2: context + action, hidden until the row is expanded -------
         # NB: a widget's own -pady is a single distance; the (top, bottom) tuple form is
-        # only valid on .pack() (see toggle_expand), never in the constructor.
-        body_l2 = tk.Frame(card, bg=GUI_SURFACE, padx=12)
+        # only valid on .pack() (see toggle_expand), never in a constructor.
+        body_l2 = tk.Frame(frame, bg=frost)
+        wraps = []
 
-        chips = tk.Frame(body_l2, bg=GUI_SURFACE)
-        chips.pack(fill="x", pady=(2, 0))
-
-        def chip(text, fg, bd):
-            tk.Label(chips, text=text, fg=fg, bg=GUI_SURFACE, font=(GUI_MONO, 8),
-                     padx=6, pady=1, highlightbackground=bd, highlightthickness=1).pack(side="left", padx=(0, 5))
-
-        chip(t.cls, GUI_ACCENT, GUI_ACCENT_DK)
-        chip(t.mode, GUI_DIM, GUI_GRID)          # assurance tier: best-effort / ground-truth
+        chips = [(t.cls, GUI_ACCENT), (t.mode, GUI_DIM)]
         if t.threat_class:
-            chip(t.threat_class, GUI_DIM, GUI_GRID)
-        chip(t.severity, SEV_COLOR.get(t.severity, GUI_DIM), SEV_COLOR.get(t.severity, GUI_GRID))
-        # How many signals THIS trigger puts on the wire (iprep fans out; see on_wire_count).
-        wire_n = t.on_wire_count(settings)
-        chip(f"{wire_n} signal" + ("" if wire_n == 1 else "s"), GUI_DIM, GUI_GRID)
+            chips.append((t.threat_class, GUI_DIM))
+        chips.append((t.severity, sev))
+        wire_n = t.on_wire_count(settings)       # iprep fans out; see on_wire_count
+        chips.append((f"{wire_n} signal" + ("" if wire_n == 1 else "s"), GUI_INFO))
+        _chip_row(body_l2, chips).pack(anchor="w", pady=(10, 0))
 
         if t.expected_fire:
-            tk.Label(body_l2, text=t.expected_fire, fg=GUI_DIM, bg=GUI_SURFACE, font=(GUI_MONO, 9),
-                     anchor="w", justify="left", wraplength=820).pack(fill="x", pady=(8, 0))
+            lbl = _label(body_l2, t.expected_fire, GUI_DIM, (GUI_MONO, 9))
+            lbl.pack(fill="x", pady=(10, 0))
+            wraps.append(lbl)
         if t.talking_point:
-            tk.Label(body_l2, text=t.talking_point, fg=GUI_FAINT, bg=GUI_SURFACE, font=(GUI_FONT, 9),
-                     anchor="w", justify="left", wraplength=820).pack(fill="x", pady=(4, 0))
+            lbl = _label(body_l2, t.talking_point, GUI_FAINT, (GUI_FONT, 9))
+            lbl.pack(fill="x", pady=(5, 0))
+            wraps.append(lbl)
         hint = t.console_hint_text()
         if hint:
-            tk.Label(body_l2, text="↳ " + hint, fg=GUI_INFO, bg=GUI_SURFACE, font=(GUI_FONT, 9),
-                     anchor="w", justify="left", wraplength=820).pack(fill="x", pady=(4, 0))
+            lbl = _label(body_l2, "↳ " + hint, GUI_INFO, (GUI_FONT, 9))
+            lbl.pack(fill="x", pady=(5, 0))
+            wraps.append(lbl)
 
-        actions = tk.Frame(body_l2, bg=GUI_SURFACE)
-        actions.pack(fill="x", pady=(10, 0))
-        fire_btn = _gui_button(actions, "Fire", lambda tid=t.id: fire(tid), primary=True)
+        actions = tk.Frame(body_l2, bg=frost)
+        actions.pack(fill="x", pady=(12, 0))
+        fire_btn = _gui_button(actions, "Fire", lambda tid=t.id: fire(tid), primary=True,
+                               anim=anim)
         if disabled:
             fire_btn.configure(state="disabled",
                                text="Disabled (live)" if gated_live else "Not configured")
         fire_btn.pack(side="left")
         copy_btn = _gui_button(actions, "Copy verification key",
-                               lambda tid=t.id: copy_text(cards[tid].get("verify_key"), tid))
+                               lambda tid=t.id: copy_text(cards[tid].get("verify_key"), tid),
+                               anim=anim)
         # The presenter's own read of the customer's console. Deliberately a SEPARATE
         # record from what this host observed — the two are different kinds of evidence
         # and the report keeps them in different columns.
         confirm_btn = _gui_button(actions, CONFIRM_CYCLE_LABEL[CONFIRMED_UNSET],
-                                  lambda tid=t.id: cycle_confirmed(tid))
-        kv = tk.Label(actions, text="", fg=GUI_DIM, bg=GUI_SURFACE, font=(GUI_MONO, 9))
-        kv.pack(side="left", padx=12)
+                                  lambda tid=t.id: cycle_confirmed(tid), anim=anim)
+        kv = tk.Label(actions, text="", fg=GUI_DIM, bg=frost, font=(GUI_MONO, 9))
+        kv.pack(side="right", padx=(10, 2))
 
-        reason = tk.Label(body_l2, text="", fg=GUI_INK, bg=GUI_SURFACE, font=(GUI_FONT, 9),
-                          anchor="w", justify="left", wraplength=860)
+        reason = _label(body_l2, "", GUI_INK, (GUI_FONT, 9))
+        wraps.append(reason)
 
         # ---- L3: detail panes, each disclosed on demand -------------------
-        set_cmd, reset_cmd = _make_pane(body_l2, "command/payload details")
-        set_flow, reset_flow = _make_pane(body_l2, "5-tuple details")
-        set_verify, reset_verify = _make_pane(body_l2, "verification key (paste into the console)")
+        set_cmd, _r1 = _make_pane(body_l2, "command/payload details")
+        set_flow, _r2 = _make_pane(body_l2, "5-tuple details")
+        set_verify, _r3 = _make_pane(body_l2, "verification key (paste into the console)")
         panes = {"cmd": set_cmd, "flow": set_flow, "verify": set_verify}
 
         def set_pane(which, text):
@@ -3429,38 +4648,241 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
         if disabled:
             reason.configure(text=("Reaches live suspect infrastructure — enable "
                                    "enable_live_suspect_hosts in a controlled lab to run it."
-                                   if gated_live else unavailable),
-                             fg=GUI_GOLD)
-            reason.pack(anchor="w", fill="x", pady=(6, 0))
+                                   if gated_live else unavailable), fg=GUI_GOLD)
+            reason.pack(anchor="w", fill="x", pady=(8, 0))
 
         def toggle_expand(_e=None):
             expand["open"] = not expand["open"]
             caret.configure(text="▾" if expand["open"] else "▸")
             if expand["open"]:
-                body_l2.pack(fill="x", pady=(0, 10))
+                body_l2.pack(fill="x", pady=(0, 4))
             else:
                 body_l2.pack_forget()
-        for w in (head, caret):
+            relayout()
+            if expand["open"]:
+                reveal(t.id)
+        for w in (head_row, caret, bead, title, status):
             w.bind("<Button-1>", toggle_expand)
-        # Clicking the label/status also toggles (they cover most of the row).
-        for child in head.winfo_children():
-            child.bind("<Button-1>", toggle_expand)
+        bind_hover(frame, t.id)
 
         cards[t.id] = {"status": status, "reason": reason, "kv": kv, "fire": fire_btn,
                        "copy": copy_btn, "confirm": confirm_btn, "set_pane": set_pane,
-                       "runs": 0, "verify_key": "", "seq": None,
-                       "confirmed": CONFIRMED_UNSET}
+                       "runs": 0, "verify_key": "", "seq": None, "lane": lane,
+                       "confirmed": CONFIRMED_UNSET, "frame": frame, "win": win,
+                       "frost": frost, "behind": behind, "sev": sev, "wraps": wraps,
+                       "disabled": disabled, "y": 0, "h": 0, "tag": "pane-" + t.id,
+                       "hover": 0.0, "hover_to": 0.0, "hover_job": None, "box": None}
 
+    # ---- pointer response: the pane under the cursor lights its own edge ---
+    def draw_pane(card):
+        """Redraw one card's surface. The content frame covers the pane's middle, so
+        what the pointer actually lights is the rim: the stroke picks up the trigger's
+        severity colour and the pane starts throwing a little of it onto the backdrop."""
+        box = card.get("box")
+        if not box:
+            return
+        x0, top, x1, bottom = box
+        k = card["hover"]
+        try:
+            stage.delete(card["tag"])
+        except Exception:
+            return
+        tags = ("chrome", card["tag"])
+        _glass(stage, x0, top, x1, bottom, card["frost"], card["behind"], radius=15,
+               shadow=4, glow=(card["sev"] if k > 0.02 else None), glow_k=k,
+               stroke=_mix(_lift(card["frost"], 0.20 + 0.26 * k), card["sev"], 0.5 * k),
+               tags=tags)
+        rail = _round_pts(x0 + 4, top + 11, x0 + 7, bottom - 11, 1.5)
+        stage.create_polygon(rail, smooth=True, splinesteps=4, outline="", tags=tags,
+                             fill=(_mix(card["frost"], card["sev"], 0.45)
+                                   if card["disabled"] else card["sev"]))
+
+    def set_hover(tid, target):
+        card = cards.get(tid)
+        if not card or card["hover_to"] == target:
+            return
+        card["hover_to"] = target
+
+        def frame(dt, _elapsed):
+            step = min(1.0, dt * 9.0)
+            card["hover"] += (card["hover_to"] - card["hover"]) * step
+            if abs(card["hover_to"] - card["hover"]) < 0.02:
+                card["hover"] = card["hover_to"]
+                card["hover_job"] = None
+                draw_pane(card)
+                return False
+            draw_pane(card)
+            return True
+        if card["hover_job"] is None:
+            card["hover_job"] = anim.add(frame)
+
+    def bind_hover(widget, tid):
+        """Enter/Leave fire on every descendant, so a leave is only believed once the
+        pointer is genuinely outside the card's rectangle."""
+        def enter(_e=None):
+            set_hover(tid, 1.0)
+
+        def leave(_e=None):
+            def settle():
+                card = cards.get(tid)
+                if not card:
+                    return
+                try:
+                    px, py = root.winfo_pointerxy()
+                    f = card["frame"]
+                    fx, fy = f.winfo_rootx(), f.winfo_rooty()
+                    inside = (fx <= px < fx + _num(f.winfo_width(), 0)
+                              and fy <= py < fy + _num(f.winfo_height(), 0))
+                except Exception:
+                    inside = False
+                if not inside:
+                    set_hover(tid, 0.0)
+            try:
+                root.after(40, settle)
+            except Exception:
+                pass
+        for w in _descendants(widget):
+            try:
+                w.bind("<Enter>", enter, add="+")
+                w.bind("<Leave>", leave, add="+")
+            except Exception:
+                pass
+
+    # ---- stack the cards on the stage ------------------------------------
     order, seen = [], set()
     for t in triggers:
         if t.cls not in seen:
             seen.add(t.cls)
             order.append(t.cls)
-    for cls in order:
-        tk.Label(inner, text=CLASS_LABEL.get(cls, cls), fg=GUI_ACCENT, bg=GUI_BG,
-                 font=(GUI_MONO, 9, "bold")).pack(anchor="w", padx=10, pady=(14, 2))
-        for t in [x for x in triggers if x.cls == cls]:
-            build_card(t)
+    layout = []
+    for si, cls in enumerate(order):
+        members = [x for x in triggers if x.cls == cls]
+        layout.append(("section", (CLASS_LABEL.get(cls, cls), len(members))))
+        fy = 0.10 + 0.74 * (si / max(1.0, len(order) - 1.0))
+        for t in members:
+            build_card(t, fy)
+            layout.append(("card", cards[t.id]))
+
+    content = {"h": 0}                          # laid-out height, = the scroll region
+
+    def relayout(_e=None):
+        """Position every card on the stage and draw the glass under it.
+
+        The frames are real widgets (so text, focus and clipboard all behave), but the
+        surface they sit on is drawn — which is the only way to get a rounded, lit pane
+        in Tk. Tk always paints embedded windows above canvas items, so the glass can be
+        redrawn freely without ever covering the content."""
+        w = _num(stage.winfo_width(), 0)
+        if w < 200:
+            w = _num(root.winfo_width(), 1140) - 4
+        x0, x1 = SIDE, w - SIDE - 12
+        inner = int(x1 - x0 - 2 * CARD_PAD)
+        for kind, obj in layout:
+            if kind != "card":
+                continue
+            for lbl in obj["wraps"]:
+                try:
+                    lbl.configure(wraplength=max(200, inner - 20))
+                except Exception:
+                    pass
+            try:
+                stage.itemconfigure(obj["win"], width=inner)
+            except Exception:
+                pass
+            obj["lane"].resize(232 if inner > 620 else 140)
+        try:
+            stage.update_idletasks()
+        except Exception:
+            pass
+        try:
+            stage.delete("chrome")
+        except Exception:
+            return
+        img = art["img"]
+        if img is not None:
+            stage.create_image(0, 0, anchor="nw", image=img, tags=("chrome", "bg"))
+        y = 12
+        for kind, obj in layout:
+            if kind == "section":
+                text, n = obj
+                head_item = stage.create_text(x0 + 6, y + 16, anchor="w", text=text,
+                                              fill=GUI_ACCENT, font=(GUI_MONO, 9, "bold"),
+                                              tags="chrome")
+                item = stage.create_text(x1, y + 16, anchor="e", text=f"{n} triggers",
+                                         fill=GUI_FAINT, font=(GUI_MONO, 9), tags="chrome")
+                try:
+                    left = stage.bbox(item)[0] - 12
+                    right = stage.bbox(head_item)[2] + 12
+                except Exception:
+                    left, right = x1 - 70, x0 + 6 + 7.2 * len(text)
+                if left > right:
+                    stage.create_line(right, y + 16, left, y + 16,
+                                      fill=_lift(GUI_BG, 0.13), tags="chrome")
+                y += 34
+                continue
+            card = obj
+            h = _num(card["frame"].winfo_reqheight(), 40)
+            top, bottom = y, y + h + 2 * CARD_PAD
+            card["box"] = (x0, top, x1, bottom)
+            draw_pane(card)
+            stage.coords(card["win"], x0 + CARD_PAD + 4, top + CARD_PAD)
+            card["y"], card["h"] = top, bottom - top
+            y = bottom + CARD_GAP
+        content["h"] = y + 16
+        try:
+            stage.configure(scrollregion=(0, 0, w, content["h"]))
+        except Exception:
+            pass
+        pin_backdrop()
+
+    def reveal(tid):
+        """Scroll just enough to bring a freshly expanded card into view — an expand
+        that pushes its own actions off-screen is worse than no animation at all."""
+        card = cards.get(tid)
+        if not card:
+            return
+        try:
+            top = stage.canvasy(0)
+            vh = _num(stage.winfo_height(), 0)
+            total = content["h"]                  # NOT bbox("all"): the backdrop image is
+            if not vh or not total:               # pinned to the viewport and would skew it
+                return
+            bottom = card["y"] + card["h"] + 16
+            if bottom > top + vh:
+                target = min(card["y"] - 12, bottom - vh)
+                stage.yview_moveto(max(0.0, target / float(total)))
+        except Exception:
+            pass
+
+    # ---- resize ----------------------------------------------------------
+    resize = {"job": None, "size": (0, 0)}
+
+    def on_root_configure(event=None):
+        if event is not None and getattr(event, "widget", None) is not root:
+            return
+        size = (_num(root.winfo_width(), 0), _num(root.winfo_height(), 0))
+        if size == resize["size"] or size[0] < 100:
+            return
+        resize["size"] = size
+        try:
+            if resize["job"] is not None:
+                root.after_cancel(resize["job"])
+            resize["job"] = root.after(90, repaint_all)
+        except Exception:
+            repaint_all()
+
+    def repaint_all():
+        resize["job"] = None
+        w = _num(root.winfo_width(), 1140)
+        h = _num(root.winfo_height(), 820)
+        ensure_backdrop(w, h)
+        paint_head(w)
+        relayout()
+
+    try:
+        root.bind("<Configure>", on_root_configure)
+    except Exception:
+        pass
 
     def on_close():
         run_state["stop"] = True
@@ -3470,6 +4892,8 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
             pass
     root.protocol("WM_DELETE_WINDOW", on_close)
 
+    paint_head(_num(root.winfo_width(), 1140) or 1140)
+    relayout()
     pump()
     if os.environ.get("SECV_RENDER_ONCE"):        # headless smoke/CI test: lay out, then exit
         shot = os.environ.get("SECV_SHOT")
@@ -3490,10 +4914,14 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
                     break
         root.update_idletasks()
         root.update()
+        repaint_all()
         root.after(int(os.environ.get("SECV_RENDER_MS", "300")), _finish)
     root.mainloop()
 
 
+# ---------------------------------------------------------------------------
+# presenter mode
+# ---------------------------------------------------------------------------
 def open_presenter_picker(root, app, triggers, settings, profiles):
     """Choose what to present: a curated profile, or everything enabled.
 
@@ -3510,52 +4938,45 @@ def open_presenter_picker(root, app, triggers, settings, profiles):
             pass
 
     by_id = {t.id: t for t in triggers}
-    dlg = tk.Toplevel(root)
-    root._secv_presenter_picker = dlg
-    dlg.title(f"{APP_NAME} — presenter mode")
-    dlg.configure(bg=GUI_BG, padx=18, pady=14)
-    dlg.transient(root)
+    dlg = _GlassDialog(root, f"{APP_NAME} — presenter mode", min_width=560, fy=0.35)
+    root._secv_presenter_picker = dlg.win
+    body = dlg.body
 
-    tk.Label(dlg, text="What are we presenting?", fg=GUI_INK, bg=GUI_BG,
-             font=(GUI_FONT, 14, "bold")).pack(anchor="w")
-    tk.Label(dlg, text="Each option runs in its own order and commits to a signal count.",
-             fg=GUI_DIM, bg=GUI_BG, font=(GUI_FONT, 9)).pack(anchor="w", pady=(2, 12))
+    _label(body, "What are we presenting?", GUI_INK, (GUI_FONT, 15, "bold")).pack(anchor="w")
+    dlg.wrap(_label(body, "Each option runs in its own order and commits to a signal count.",
+                    GUI_DIM, (GUI_FONT, 9)), 0).pack(fill="x", pady=(3, 12))
 
     def start(session):
-        try:
-            dlg.destroy()
-        except tk.TclError:
-            pass
+        dlg.destroy()
         open_presenter_window(root, app, session, settings)
 
-    def add_option(label, description, chosen, name=""):
+    def add_option(label, description, chosen):
         signals = sum(t.on_wire_count(settings) for t in chosen)
-        row = tk.Frame(dlg, bg=GUI_SURFACE, padx=12, pady=10,
-                       highlightbackground=GUI_GRID, highlightthickness=1)
-        row.pack(fill="x", pady=3)
-        head = tk.Frame(row, bg=GUI_SURFACE)
+        tile = _Tile(body, pad=13, lift=0.07, glow=(GUI_ACCENT if chosen else None))
+        tile.pack(fill="x", pady=4)
+        head = tk.Frame(tile.body, bg=tile.fill)
         head.pack(fill="x")
-        tk.Label(head, text=label, fg=GUI_INK, bg=GUI_SURFACE,
-                 font=(GUI_FONT, 11, "bold")).pack(side="left")
-        tk.Label(head, text=f"{len(chosen)} triggers · {signals} signals", fg=GUI_ACCENT,
-                 bg=GUI_SURFACE, font=(GUI_MONO, 9)).pack(side="right")
+        _label(head, label, GUI_INK, (GUI_FONT, 11, "bold")).pack(side="left")
+        _label(head, f"{len(chosen)} triggers · {signals} signals", GUI_ACCENT,
+               (GUI_MONO, 9), anchor="e").pack(side="right")
         if description:
-            tk.Label(row, text=description, fg=GUI_FAINT, bg=GUI_SURFACE,
-                     font=(GUI_FONT, 9), anchor="w", justify="left",
-                     wraplength=520).pack(fill="x", pady=(2, 0))
+            dlg.wrap(_label(tile.body, description, GUI_FAINT, (GUI_FONT, 9)),
+                     60).pack(fill="x", pady=(3, 0))
         session = PresenterSession(chosen, settings, label=label, description=description)
-        btn = _gui_button(row, "Present", lambda s=session: start(s), primary=True)
-        btn.pack(anchor="e", pady=(8, 0))
+        btn = _gui_button(tile.body, "Present", lambda s=session: start(s), primary=True)
+        btn.pack(anchor="e", pady=(9, 0))
         if not chosen:
             btn.configure(state="disabled", text="Nothing enabled")
+        tile.sync()
 
     for profile in (profiles or {}).values():
         chosen = [t for t in profile.triggers(by_id) if not t.gated_disabled(settings)]
-        add_option(profile.label, profile.description, chosen, profile.name)
+        add_option(profile.label, profile.description, chosen)
     add_option("All enabled triggers", "The full catalog, in catalog order.",
                [t for t in triggers if not t.gated_disabled(settings)])
 
-    _gui_button(dlg, "Cancel", dlg.destroy).pack(anchor="e", pady=(12, 0))
+    _gui_button(body, "Cancel", dlg.destroy).pack(anchor="e", pady=(13, 0))
+    dlg.show()
 
 
 def open_presenter_window(root, app, session, settings):
@@ -3563,7 +4984,8 @@ def open_presenter_window(root, app, session, settings):
 
     The scoreboard tallies what THIS HOST observed and says so — it is never a claim
     about what the customer's stack did. The presenter still reads the verdict on the
-    customer's console; this just keeps the story moving and the count honest."""
+    customer's console; this just keeps the story moving, the count honest, and puts a
+    picture of the traffic on the wall while it is in flight."""
     existing = getattr(root, "_secv_presenter", None)
     if existing is not None:
         try:
@@ -3574,87 +4996,128 @@ def open_presenter_window(root, app, session, settings):
         except tk.TclError:
             pass
 
-    win = tk.Toplevel(root)
+    dlg = _GlassDialog(root, f"{APP_NAME} — presenter", min_width=900, resizable=True, fy=0.5)
+    win = dlg.win
     root._secv_presenter = win
-    win.title(f"{APP_NAME} — presenter")
-    win.configure(bg=GUI_BG, padx=28, pady=22)
-    win.transient(root)
-    state = {"busy": False, "outcome": None}
+    anim = _Anim(win)
+    body = dlg.body
+    frost = dlg.frost
+    state = {"busy": False, "outcome": None, "reason": "", "reveal": 0.0, "shown": None}
 
-    head = tk.Frame(win, bg=GUI_BG)
+    head = tk.Frame(body, bg=frost)
     head.pack(fill="x")
-    tk.Label(head, text=session.label, fg=GUI_ACCENT, bg=GUI_BG,
-             font=(GUI_FONT, 12, "bold")).pack(side="left")
+    _label(head, session.label, GUI_ACCENT, (GUI_FONT, 12, "bold")).pack(side="left")
     progress_var = tk.StringVar(value="")
-    tk.Label(head, textvariable=progress_var, fg=GUI_DIM, bg=GUI_BG,
-             font=(GUI_MONO, 11)).pack(side="right")
+    tk.Label(head, textvariable=progress_var, fg=GUI_DIM, bg=frost,
+             font=(GUI_MONO, 10), anchor="e").pack(side="right")
 
-    card = tk.Frame(win, bg=GUI_SURFACE, padx=24, pady=20,
-                    highlightbackground=GUI_GRID, highlightthickness=1)
-    card.pack(fill="both", expand=True, pady=(14, 0))
+    track = tk.Canvas(body, bg=frost, highlightthickness=0, bd=0, height=4)
+    track.pack(fill="x", pady=(9, 0))
+
+    def paint_track():
+        try:
+            track.delete("all")
+            w = _num(track.winfo_width(), 0)
+        except Exception:
+            return
+        if w < 20:
+            return
+        pos, total = session.progress()
+        track.create_polygon(_round_pts(0, 0, w, 4, 2), smooth=True, splinesteps=4,
+                             fill=_lift(frost, 0.09), outline="")
+        if total:
+            done = max(6.0, w * (pos / float(total)))
+            track.create_polygon(_round_pts(0, 0, done, 4, 2), smooth=True, splinesteps=4,
+                                 fill=GUI_ACCENT, outline="")
+    track.bind("<Configure>", lambda e: paint_track())
+
+    tile = _Tile(body, pad=20, lift=0.07)
+    tile.pack(fill="x", pady=(13, 0))
+    card = tile.body
 
     title_var = tk.StringVar(value="")
-    tk.Label(card, textvariable=title_var, fg=GUI_INK, bg=GUI_SURFACE,
-             font=(GUI_FONT, 22, "bold"), anchor="w", justify="left",
-             wraplength=780).pack(fill="x")
+    dlg.wrap(tk.Label(card, textvariable=title_var, fg=GUI_INK, bg=tile.fill,
+                      font=(GUI_FONT, 21, "bold"), anchor="w", justify="left"),
+             90).pack(fill="x")
     expect_var = tk.StringVar(value="")
-    tk.Label(card, textvariable=expect_var, fg=GUI_GOLD, bg=GUI_SURFACE,
-             font=(GUI_MONO, 12), anchor="w", justify="left",
-             wraplength=780).pack(fill="x", pady=(10, 0))
+    dlg.wrap(tk.Label(card, textvariable=expect_var, fg=GUI_GOLD, bg=tile.fill,
+                      font=(GUI_MONO, 11), anchor="w", justify="left"), 90).pack(fill="x", pady=(9, 0))
     talk_var = tk.StringVar(value="")
-    tk.Label(card, textvariable=talk_var, fg=GUI_DIM, bg=GUI_SURFACE,
-             font=(GUI_FONT, 13), anchor="w", justify="left",
-             wraplength=780).pack(fill="x", pady=(12, 0))
+    dlg.wrap(tk.Label(card, textvariable=talk_var, fg=GUI_DIM, bg=tile.fill,
+                      font=(GUI_FONT, 12), anchor="w", justify="left"), 90).pack(fill="x", pady=(10, 0))
     hint_var = tk.StringVar(value="")
-    tk.Label(card, textvariable=hint_var, fg=GUI_INFO, bg=GUI_SURFACE,
-             font=(GUI_FONT, 10), anchor="w", justify="left",
-             wraplength=780).pack(fill="x", pady=(10, 0))
+    dlg.wrap(tk.Label(card, textvariable=hint_var, fg=GUI_INFO, bg=tile.fill,
+                      font=(GUI_FONT, 10), anchor="w", justify="left"), 90).pack(fill="x", pady=(8, 0))
+
+    # The stage: the same emission lane the cards use, at wall size.
+    lane = _Lane(card, anim, width=760, height=74, behind=tile.fill)
+    lane.cv.pack(fill="x", pady=(16, 2))
 
     result_var = tk.StringVar(value="")
-    result_lbl = tk.Label(card, textvariable=result_var, fg=GUI_INK, bg=GUI_SURFACE,
-                          font=(GUI_FONT, 26, "bold"), anchor="w")
-    result_lbl.pack(fill="x", pady=(18, 0))
+    result_lbl = tk.Label(card, textvariable=result_var, fg=GUI_INK, bg=tile.fill,
+                          font=(GUI_FONT, 25, "bold"), anchor="w")
+    result_lbl.pack(fill="x", pady=(10, 0))
     reason_var = tk.StringVar(value="")
-    tk.Label(card, textvariable=reason_var, fg=GUI_DIM, bg=GUI_SURFACE,
-             font=(GUI_FONT, 10), anchor="w", justify="left",
-             wraplength=780).pack(fill="x", pady=(4, 0))
+    dlg.wrap(tk.Label(card, textvariable=reason_var, fg=GUI_DIM, bg=tile.fill,
+                      font=(GUI_FONT, 10), anchor="w", justify="left"), 90).pack(fill="x", pady=(4, 0))
 
     board_var = tk.StringVar(value="")
-    tk.Label(win, textvariable=board_var, fg=GUI_INK, bg=GUI_BG, font=(GUI_MONO, 13),
-             anchor="w", justify="left").pack(fill="x", pady=(16, 0))
-    tk.Label(win, text="Observed locally by this host — the inline stack's console is "
-                       "authoritative.", fg=GUI_FAINT, bg=GUI_BG,
-             font=(GUI_FONT, 9)).pack(anchor="w")
+    tk.Label(body, textvariable=board_var, fg=GUI_INK, bg=frost, font=(GUI_MONO, 12),
+             anchor="w", justify="left").pack(fill="x", pady=(14, 0))
+    _label(body, "Observed locally by this host — the inline stack's console is "
+                 "authoritative.", GUI_FAINT, (GUI_FONT, 9)).pack(anchor="w", pady=(2, 0))
 
-    bar = tk.Frame(win, bg=GUI_BG)
-    bar.pack(fill="x", pady=(16, 0))
+    bar = tk.Frame(body, bg=frost)
+    bar.pack(fill="x", pady=(14, 0))
 
     def render():
         pos, total = session.progress()
         progress_var.set(f"{pos} / {total}   ·   {session.summary_line()}")
         board_var.set(_presenter_board(session))
+        paint_track()
         trigger = session.current
         if trigger is None:
             title_var.set("Done.")
-            expect_var.set("")
-            talk_var.set("")
-            hint_var.set("")
-            result_var.set("")
-            reason_var.set("")
+            for var in (expect_var, talk_var, hint_var, result_var, reason_var):
+                var.set("")
+            lane.clear()
             fire_btn.configure(state="disabled", text="Finished")
+            tile.sync()
             return
         title_var.set(trigger.label)
         expect_var.set(f"Expect: {trigger.expected_fire}" if trigger.expected_fire else "")
         talk_var.set(trigger.talking_point)
         hint_var.set("↳ " + trigger.console_hint_text() if trigger.console_hint_text() else "")
         seen = session.results.get(trigger.id)
+        if seen != state["shown"]:
+            state["shown"] = seen
+            state["reveal"] = 0.0
+            if seen:
+                _reveal_result(seen)
+            else:
+                result_var.set("")
+                lane.clear()
         result_var.set(seen.upper() if seen else "")
-        result_lbl.configure(fg=PRESENTER_STATE_FG.get(seen, GUI_INK))
         reason_var.set(state.get("reason", "") if seen else "")
         wire = trigger.on_wire_count(settings)
         fire_btn.configure(state=("disabled" if state["busy"] else "normal"),
                            text=("Firing…" if state["busy"]
                                  else f"Fire  ({wire} signal" + ("" if wire == 1 else "s") + ")"))
+        tile.sync()
+
+    def _reveal_result(seen):
+        """Let the verdict arrive rather than blink into existence — the word lights up
+        as the lane resolves, so the room's eye follows the traffic to the answer."""
+        colour = PRESENTER_STATE_FG.get(seen, GUI_INK)
+
+        def frame(dt, _elapsed):
+            state["reveal"] = min(1.0, state["reveal"] + dt * 3.6)
+            try:
+                result_lbl.configure(fg=_mix(tile.fill, colour, _ease(state["reveal"])))
+            except Exception:
+                return False
+            return state["reveal"] < 1.0
+        anim.add(frame)
 
     def poll():
         outcome = state.get("outcome")
@@ -3664,6 +5127,10 @@ def open_presenter_window(root, app, session, settings):
             tid, out = outcome
             session.record(tid, out.get("state", ERROR))
             state["reason"] = out.get("reason", "")
+            ratio = out.get("ratio") or {}
+            lane.resolve(out.get("state", ERROR), passes=ratio.get("reached"),
+                         label=(f"{ratio['blocked']}/{ratio['total']} blocked" if ratio
+                                else out.get("state", ERROR)))
             render()
         try:
             win.after(150, poll)
@@ -3676,7 +5143,9 @@ def open_presenter_window(root, app, session, settings):
             return
         state["busy"] = True
         state["reason"] = ""
+        state["shown"] = None
         result_var.set("")
+        lane.fire(trigger.on_wire_count(settings), label="in flight")
         render()
 
         def work():
@@ -3692,17 +5161,18 @@ def open_presenter_window(root, app, session, settings):
             return
         session.goto(session.index + delta)
         state["reason"] = ""
+        state["shown"] = None
+        lane.clear()
         render()
 
-    back_btn = _gui_button(bar, "◀  Back", lambda: step(-1))
-    back_btn.pack(side="left")
-    fire_btn = _gui_button(bar, "Fire", fire, primary=True)
-    fire_btn.pack(side="left", padx=8)
-    next_btn = _gui_button(bar, "Next  ▶", lambda: step(1))
-    next_btn.pack(side="left")
-    _gui_button(bar, "Close", win.destroy).pack(side="right")
+    _gui_button(bar, "◀   Back", lambda: step(-1), anim=anim).pack(side="left")
+    fire_btn = _gui_button(bar, "Fire", fire, primary=True, anim=anim)
+    fire_btn.pack(side="left", padx=9)
+    _gui_button(bar, "Next   ▶", lambda: step(1), anim=anim).pack(side="left")
+    _gui_button(bar, "Close", dlg.destroy, anim=anim).pack(side="right")
 
     render()
+    dlg.show(height=560)
     poll()
 
 
@@ -3723,6 +5193,9 @@ def _presenter_board(session):
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# evidence, manifest and update windows
+# ---------------------------------------------------------------------------
 def open_report_dialog(root, app, triggers, settings):
     """Write this session's evidence to local disk and say exactly where it went.
 
@@ -3739,18 +5212,16 @@ def open_report_dialog(root, app, triggers, settings):
             pass
 
     ledger = app.ledger
-    dlg = tk.Toplevel(root)
-    root._secv_report_dialog = dlg
-    dlg.title(f"{APP_NAME} — save report")
-    dlg.configure(bg=GUI_BG, padx=18, pady=14)
-    dlg.transient(root)
+    dlg = _GlassDialog(root, f"{APP_NAME} — save report", min_width=560, fy=0.3)
+    root._secv_report_dialog = dlg.win
+    body = dlg.body
 
     if not ledger.records:
-        tk.Label(dlg, text="Nothing to report yet", fg=GUI_INK, bg=GUI_BG,
-                 font=(GUI_FONT, 13, "bold")).pack(anchor="w")
-        tk.Label(dlg, text="Fire at least one trigger first.", fg=GUI_DIM, bg=GUI_BG,
-                 font=(GUI_FONT, 10)).pack(anchor="w", pady=(4, 12))
-        _gui_button(dlg, "Close", dlg.destroy).pack(anchor="e")
+        _label(body, "Nothing to report yet", GUI_INK, (GUI_FONT, 14, "bold")).pack(anchor="w")
+        _label(body, "Fire at least one trigger first.", GUI_DIM,
+               (GUI_FONT, 10)).pack(anchor="w", pady=(5, 13))
+        _gui_button(body, "Close", dlg.destroy).pack(anchor="e")
+        dlg.show()
         return
 
     stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
@@ -3764,25 +5235,27 @@ def open_report_dialog(root, app, triggers, settings):
         failed = str(e)
 
     chain_ok, bad_seq = ledger.verify_chain()
-    tk.Label(dlg, text=f"{len(ledger.records)} triggers · {ledger.signals_fired()} signals",
-             fg=GUI_ACCENT, bg=GUI_BG, font=(GUI_FONT, 14, "bold")).pack(anchor="w")
+    _label(body, f"{len(ledger.records)} triggers · {ledger.signals_fired()} signals",
+           GUI_ACCENT, (GUI_FONT, 15, "bold")).pack(anchor="w")
     if failed:
-        tk.Label(dlg, text=f"Could not write the report: {failed}", fg=GUI_CRIT, bg=GUI_BG,
-                 font=(GUI_FONT, 10), wraplength=520, justify="left").pack(anchor="w", pady=(6, 0))
+        dlg.wrap(_label(body, f"Could not write the report: {failed}", GUI_CRIT,
+                        (GUI_FONT, 10)), 0).pack(fill="x", pady=(7, 0))
     else:
-        tk.Label(dlg, text="Written to local disk (nothing was uploaded):",
-                 fg=GUI_DIM, bg=GUI_BG, font=(GUI_FONT, 10)).pack(anchor="w", pady=(6, 2))
+        _label(body, "Written to local disk (nothing was uploaded):", GUI_DIM,
+               (GUI_FONT, 10)).pack(anchor="w", pady=(7, 4))
+        tile = _Tile(body, pad=11, lift=0.05)
+        tile.pack(fill="x")
         for path in written:
-            tk.Label(dlg, text=path, fg=GUI_INK, bg=GUI_BG, font=(GUI_MONO, 9),
-                     wraplength=560, justify="left").pack(anchor="w")
-    tk.Label(dlg,
-             text=("Evidence chain verified." if chain_ok
-                   else f"Evidence chain BROKEN at record {bad_seq}."),
-             fg=(GUI_ACCENT if chain_ok else GUI_CRIT), bg=GUI_BG,
-             font=(GUI_MONO, 9)).pack(anchor="w", pady=(8, 0))
+            dlg.wrap(tk.Label(tile.body, text=path, fg=GUI_INK, bg=tile.fill,
+                              font=(GUI_MONO, 9), anchor="w", justify="left"),
+                     70).pack(fill="x")
+        tile.sync()
+    _label(body, ("Evidence chain verified." if chain_ok
+                  else f"Evidence chain BROKEN at record {bad_seq}."),
+           (GUI_ACCENT if chain_ok else GUI_CRIT), (GUI_MONO, 9)).pack(anchor="w", pady=(9, 0))
 
-    btns = tk.Frame(dlg, bg=GUI_BG)
-    btns.pack(anchor="e", fill="x", pady=(14, 0))
+    btns = tk.Frame(body, bg=dlg.frost)
+    btns.pack(fill="x", pady=(15, 0))
 
     def copy_path():
         try:
@@ -3793,7 +5266,8 @@ def open_report_dialog(root, app, triggers, settings):
 
     _gui_button(btns, "Close", dlg.destroy).pack(side="right")
     if written:
-        _gui_button(btns, "Copy path", copy_path).pack(side="right", padx=6)
+        _gui_button(btns, "Copy path", copy_path).pack(side="right", padx=(0, 8))
+    dlg.show()
 
 
 def open_manifest_dialog(root, triggers, settings):
@@ -3811,40 +5285,37 @@ def open_manifest_dialog(root, triggers, settings):
             pass
 
     manifest = signal_manifest(triggers, settings)
-    body = format_signal_manifest(manifest, verbose=True)
+    text = format_signal_manifest(manifest, verbose=True)
     totals = manifest["totals"]
 
-    dlg = tk.Toplevel(root)
-    root._secv_manifest_dialog = dlg
-    dlg.title(f"{APP_NAME} — signal manifest")
-    dlg.configure(bg=GUI_BG, padx=16, pady=12)
-    dlg.transient(root)
+    dlg = _GlassDialog(root, f"{APP_NAME} — signal manifest", min_width=880, resizable=True,
+                       fy=0.4)
+    root._secv_manifest_dialog = dlg.win
+    body = dlg.body
 
-    tk.Label(dlg, text=f"{totals['signals']} signals across "
-                       f"{totals['triggers_enabled']} enabled triggers",
-             fg=GUI_ACCENT, bg=GUI_BG, font=(GUI_FONT, 14, "bold")).pack(anchor="w")
-    tk.Label(dlg, text="Nothing has been sent — this is the plan.",
-             fg=GUI_DIM, bg=GUI_BG, font=(GUI_FONT, 9)).pack(anchor="w", pady=(2, 8))
+    _label(body, f"{totals['signals']} signals across {totals['triggers_enabled']} "
+                 "enabled triggers", GUI_ACCENT, (GUI_FONT, 15, "bold")).pack(anchor="w")
+    _label(body, "Nothing has been sent — this is the plan.", GUI_DIM,
+           (GUI_FONT, 9)).pack(anchor="w", pady=(3, 10))
 
-    box = tk.Text(dlg, width=104, height=26, bg=GUI_BG, fg=GUI_INK, font=(GUI_MONO, 9),
-                  relief="flat", highlightthickness=1, highlightbackground=GUI_GRID,
-                  wrap="none", padx=8, pady=6)
-    box.insert("1.0", body)
+    box = _well(body, height=26)
+    box.insert("1.0", text)
     box.configure(state="disabled")
     box.pack(fill="both", expand=True)
 
-    btns = tk.Frame(dlg, bg=GUI_BG)
-    btns.pack(anchor="e", fill="x", pady=(10, 0))
+    btns = tk.Frame(body, bg=dlg.frost)
+    btns.pack(fill="x", pady=(12, 0))
 
     def copy_all():
         try:
             root.clipboard_clear()
-            root.clipboard_append(body)
+            root.clipboard_append(text)
         except tk.TclError:
             pass
 
     _gui_button(btns, "Close", dlg.destroy).pack(side="right")
-    _gui_button(btns, "Copy", copy_all).pack(side="right", padx=6)
+    _gui_button(btns, "Copy", copy_all).pack(side="right", padx=(0, 8))
+    dlg.show(width=880, height=540)
 
 
 def open_update_dialog(root):
@@ -3861,21 +5332,19 @@ def open_update_dialog(root):
         except tk.TclError:
             pass
 
-    dlg = tk.Toplevel(root)
-    root._secv_update_dialog = dlg
-    dlg.title(f"{APP_NAME} update")
-    dlg.configure(bg=GUI_BG, padx=18, pady=14)
-    dlg.resizable(False, False)
-    dlg.transient(root)
+    dlg = _GlassDialog(root, f"{APP_NAME} update", min_width=460, fy=0.25)
+    root._secv_update_dialog = dlg.win
+    body = dlg.body
 
-    tk.Label(dlg, text=f"Installed version: {__version__}", fg=GUI_INK, bg=GUI_BG,
-             font=(GUI_FONT, 11, "bold")).pack(anchor="w")
+    _label(body, f"Installed version: {__version__}", GUI_INK,
+           (GUI_FONT, 12, "bold")).pack(anchor="w")
     status_var = tk.StringVar(value="Checking …")
-    tk.Label(dlg, textvariable=status_var, fg=GUI_DIM, bg=GUI_BG, font=(GUI_FONT, 10),
-             wraplength=440, justify="left").pack(anchor="w", pady=(6, 12))
+    dlg.wrap(tk.Label(body, textvariable=status_var, fg=GUI_DIM, bg=dlg.frost,
+                      font=(GUI_FONT, 10), anchor="w", justify="left"),
+             0).pack(fill="x", pady=(7, 14))
 
-    btns = tk.Frame(dlg, bg=GUI_BG)
-    btns.pack(anchor="e", fill="x")
+    btns = tk.Frame(body, bg=dlg.frost)
+    btns.pack(fill="x")
     state = {"manifest": None, "vstr": None}
     outcome = {}
 
@@ -3907,9 +5376,8 @@ def open_update_dialog(root):
 
     check_btn = _gui_button(btns, "Check again", do_check)
     install_btn = _gui_button(btns, "Install", do_install, primary=True)
-    close_btn = _gui_button(btns, "Close", dlg.destroy)
-    close_btn.pack(side="right")
-    check_btn.pack(side="right", padx=(0, 6))
+    _gui_button(btns, "Close", dlg.destroy).pack(side="right")
+    check_btn.pack(side="right", padx=(0, 8))
 
     def poll():
         if "check" in outcome:
@@ -3922,7 +5390,7 @@ def open_update_dialog(root):
                 status_var.set(f"Version {state['vstr']} is available — signature verified. "
                                "Install swaps this file (previous kept as .bak).")
                 install_btn.configure(state="normal")
-                install_btn.pack(side="right", padx=(0, 6))
+                install_btn.pack(side="right", padx=(0, 8))
             else:
                 status_var.set(f"Update check failed: {val}")
         if "install" in outcome:
@@ -3935,10 +5403,11 @@ def open_update_dialog(root):
             check_btn.configure(state="normal")
             install_btn.configure(state="normal")
         try:
-            dlg.after(150, poll)
+            dlg.win.after(150, poll)
         except tk.TclError:
             pass
 
+    dlg.show()
     do_check()
     poll()
 

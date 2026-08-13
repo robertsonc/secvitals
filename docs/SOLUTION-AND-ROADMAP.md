@@ -46,7 +46,8 @@ reputation, and DLP / content inspection); east–west is deferred (see §1.9).
 
 | Property | Choice | Why it matters for a demo |
 |---|---|---|
-| **Form factor** | Single‑file, stdlib‑only **Tkinter window** (`secvitals.py`, ~4,400 lines). No browser, no server. | Nothing to stand up on the SE laptop; opens in its own window with its own taskbar icon. |
+| **Form factor** | Single‑file, stdlib‑only **Tkinter window** (`secvitals.py`, ~6,000 lines). No browser, no server. | Nothing to stand up on the SE laptop; opens in its own window with its own taskbar icon. |
+| **The console surface** | Frosted panels floating on one lit backdrop, drawn on canvas — rounded, shadowed, and animated. Every trigger carries an **emission lane**: one dot per on‑wire signal, held at the inline stack until the verdict returns, then passed, broken or scattered. | The room can *see* the traffic leave and what happened to it. The lane only ever animates the state the console observed — an environment failure scatters, and never draws a block. |
 | **Execution** | **Native** — `curl.exe` (Windows 10 1803+) for HTTP; built‑in stdlib probes for DNS and TCP; a built‑in IP‑reputation probe. **No WSL, no shell, no download‑and‑execute.** | Windows‑origin traffic (representative); the same IDS signatures trip without shipping a third‑party binary. |
 | **What fires** | A **fixed catalog** (`config/catalog.yaml`). Commands are argv lists, never built from free text; optional params are allowlist/pattern‑validated. | The signal set is auditable and repeatable — a *known quantity*, not ad‑hoc traffic. |
 | **What it reports** | A **three‑state classifier** where `blocked` and `error` never collapse. | A broken environment is reported as `error`, never a false `blocked` that would misrepresent the customer's product. |

@@ -43,7 +43,7 @@ import time
 import urllib.error
 import urllib.request
 
-__version__ = "0.8.1"
+__version__ = "0.8.2"
 APP_NAME = "Security Vitals"
 
 log = logging.getLogger("secvitals")

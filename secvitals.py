@@ -3100,27 +3100,35 @@ _AURORA = (
 )
 
 
+# Parsed once. This function is called per cell of the backdrop — tens of thousands of
+# times per generation — and re-parsing seven hex constants inside that loop was 60% of
+# the paint. The unpacked forms below are the same values, resolved at import.
+_BG_TOP_RGB = _rgb(GUI_BG_TOP)
+_BG_BOT_RGB = _rgb(GUI_BG_BOT)
+_AURORA_RGB = tuple((cx, cy, 1.0 / (rad * rad), _rgb(colour), strength)
+                    for cx, cy, rad, colour, strength in _AURORA)
+
+
 def _backdrop_rgb(fx, fy, aspect=1.45):
     """The backdrop colour at fractional position (fx, fy) of the window.
 
     Single source of truth: the painted image, every panel's frost tint and every
     drop shadow are derived from this one function, which is what keeps a "translucent"
     surface consistent with what is actually behind it."""
-    tr, tg, tb = _rgb(GUI_BG_TOP)
-    dr, dg, db = _rgb(GUI_BG_BOT)
+    tr, tg, tb = _BG_TOP_RGB
+    dr, dg, db = _BG_BOT_RGB
     e = fy ** 0.72                      # ease the horizon high in the frame
     r = tr + (dr - tr) * e
     g = tg + (dg - tg) * e
     b = tb + (db - tb) * e
-    for cx, cy, rad, colour, strength in _AURORA:
+    for cx, cy, inv_rad2, (lr, lg, lb), strength in _AURORA_RGB:
         dx = fx - cx
         dy = (fy - cy) * aspect         # the light pools are wider than they are tall
-        d2 = (dx * dx + dy * dy) / (rad * rad)
+        d2 = (dx * dx + dy * dy) * inv_rad2
         if d2 >= 1.0:
             continue
         k = (1.0 - d2)
         k = k * k * strength
-        lr, lg, lb = _rgb(colour)
         r += (lr - r) * k
         g += (lg - g) * k
         b += (lb - b) * k
@@ -3142,21 +3150,27 @@ def _frost_at(fx, fy, lift=0.13, pickup=0.28, base="#141c2e", tint="#cfe0ff"):
     return _mix(_mix(base, sample, pickup), tint, lift)
 
 
-def _backdrop_image(w, h):
-    """Render the light field as a PhotoImage.
+def _backdrop_image(w, h, fy0=0.0, fy1=1.0):
+    """Render a slice of the light field as a PhotoImage.
 
     Generated at a fraction of the window's resolution and zoomed back up: the field is
     smooth by construction, so the upscale costs nothing visually and the whole paint is
-    one Tcl call instead of a million. Returns (image, source) — the caller must keep
-    BOTH alive or Tk garbage-collects the pixels out from under the canvas."""
+    one Tcl call instead of a million. `fy0`/`fy1` select the vertical slice of the field
+    to draw, so a caller that only shows a strip pays only for that strip.
+
+    Returns (image, source) — the caller must keep BOTH alive or Tk garbage-collects the
+    pixels out from under the canvas."""
     w, h = max(16, int(w)), max(16, int(h))
-    cell = max(3, int(math.sqrt(w * h / 45000.0)))
+    # The floor is 8, not 3. The field is smooth enough that at cell=8 the largest colour
+    # step between adjacent source cells is 1/255 — below what an eye can resolve — while
+    # the cell=3 floor made a header strip cost six times as much to paint.
+    cell = max(8, int(math.sqrt(w * h / 45000.0)))
     cw, ch = int(w // cell) + 2, int(h // cell) + 2
     src = tk.PhotoImage(width=cw, height=ch)
     cache, rows = {}, []
     xs = [(i + 0.5) / cw for i in range(cw)]
     for j in range(ch):
-        fy = (j + 0.5) / ch
+        fy = fy0 + (fy1 - fy0) * ((j + 0.5) / ch)
         row = []
         for fx in xs:
             r, g, b = _backdrop_rgb(fx, fy)
@@ -3224,10 +3238,21 @@ class _Anim:
         self.jobs = []
         self._pending = None
         self._last = time.monotonic()
+        self._ambient = True
         self._schedule(80)
 
+    def set_ambient(self, on):
+        """Ambient motion is the heartbeat: nice while someone is looking at it, pure
+        waste while the console sits behind another window. Jobs that carry state (a
+        lane resolving, a hover settling) are never paused — only the decoration is."""
+        on = bool(on)
+        if on != self._ambient:
+            self._ambient = on
+            self._schedule(16 if on else 90)
+
     def add(self, fn, ambient=False):
-        """Register fn(dt, elapsed); return False from it to unregister.
+        """Register fn(dt, elapsed); return False from it to unregister. Adding always
+        restarts the clock, because _tick stops it outright when nothing is moving.
 
         `ambient` marks a job that is always running and never urgent (the header's
         heartbeat): the clock runs at half rate while only those are registered, so a
@@ -3251,10 +3276,13 @@ class _Anim:
             self._pending = None
 
     def _tick(self):
+        self._pending = None                     # this one already fired; nothing to cancel
         now = time.monotonic()
         dt = min(0.05, max(0.001, now - self._last))
         self._last = now
         for job in list(self.jobs):
+            if job[2] and not self._ambient:      # decoration, and nobody is looking
+                continue
             try:
                 alive = job[0](dt, now - job[1])
             except Exception:
@@ -3265,9 +3293,11 @@ class _Anim:
                 except ValueError:
                     pass
         if not self.jobs:
-            self._schedule(90)
+            return                               # nothing moving: stop the clock entirely
+        if any(not job[2] for job in self.jobs):
+            self._schedule(16)
         else:
-            self._schedule(16 if any(not job[2] for job in self.jobs) else 33)
+            self._schedule(33 if self._ambient else 250)
 
 
 def _ease(t):
@@ -3562,6 +3592,7 @@ class _Lane:
         self._job = None
         self._t = 0.0                 # own clock: a re-fire restarts the stream cleanly
         self._label = ""
+        self._draw_static()
         self.redraw()
 
     # -- geometry ---------------------------------------------------------
@@ -3577,6 +3608,7 @@ class _Lane:
             self.cv.configure(width=width)
         except Exception:
             return
+        self._draw_static()
         self.redraw()
 
     # -- driving ----------------------------------------------------------
@@ -3606,10 +3638,20 @@ class _Lane:
         self._start()
 
     def clear(self):
+        """Reset to an unfired lane — and give the clock back.
+
+        This has to unregister explicitly. `_frame` only retires itself once a verdict
+        has finished playing out, and clearing is precisely the act of removing the
+        verdict, so a cleared lane would otherwise animate an empty wire forever and pin
+        the shared clock at 16ms. `run_all_done` clears every lane that never reached a
+        rest state, so the leak fired on every single run-all."""
         self.dots, self.total, self.emitted = [], 0, 0
         self.verdict, self.rest, self.flash = None, None, 0.0
         self._t = 0.0
-        self.redraw()
+        if self._job is not None and self.anim is not None:
+            self.anim.drop(self._job)            # the stored object: `self._frame` builds
+        self._job = None                         # a fresh bound method every access, and
+        self.redraw()                            # drop() matches on identity
 
     def _start(self):
         if self._job is not None or self.anim is None:
@@ -3675,6 +3717,9 @@ class _Lane:
             self._job = None
             self.redraw()
             return False
+        if not self.total and not self.dots:     # armed but never fired (a stopped run,
+            self._job = None                     # a worker that died) — do not spin
+            return False
         return True
 
     def _outcome(self):
@@ -3689,28 +3734,41 @@ class _Lane:
         return "lost"
 
     # -- painting ---------------------------------------------------------
-    def redraw(self, elapsed=0.0):
+    def _draw_static(self):
+        """The wire and the host node never change between frames, so they are laid down
+        once per resize instead of once per frame. This used to be ~30 of the ~40 canvas
+        items the lane destroyed and recreated 56 times a second."""
         cv = self.cv
         try:
-            cv.delete("all")
+            cv.delete("static")
+        except Exception:
+            return
+        x_host, _x_gate, x_end, y = self._geom()
+        s = self.scale
+        wire = _mix(self.behind, GUI_DIM, 0.42)
+        x = x_host + 5 * s                       # the wire out to the world
+        while x < x_end:
+            cv.create_line(x, y, x + 2.6 * s, y, fill=wire, width=max(1, int(1.1 * s)),
+                           tags="static")
+            x += 6.4 * s
+        cv.create_oval(x_host - 4.6 * s, y - 4.6 * s, x_host + 4.6 * s, y + 4.6 * s,
+                       fill=_mix(self.behind, GUI_DIM, 0.22), outline="", tags="static")
+        cv.create_oval(x_host - 2.6 * s, y - 2.6 * s, x_host + 2.6 * s, y + 2.6 * s,
+                       fill=_mix(self.behind, GUI_DIM, 0.85), outline="", tags="static")
+
+    def redraw(self, elapsed=0.0):
+        """Repaint only what moves: the gate, the dots and the caption."""
+        cv = self.cv
+        try:
+            cv.delete("live")
         except Exception:
             return
         x_host, x_gate, x_end, y = self._geom()
         s = self.scale
-        wire = _mix(self.behind, GUI_DIM, 0.42)
         live = self.verdict is None and self.emitted and self.emitted <= self.total \
             and self._job is not None
         state = self.verdict or self.rest
         colour = STATE_COLOR.get(state, GUI_FAINT)
-
-        x = x_host + 5 * s                       # the wire out to the world
-        while x < x_end:
-            cv.create_line(x, y, x + 2.6 * s, y, fill=wire, width=max(1, int(1.1 * s)))
-            x += 6.4 * s
-        cv.create_oval(x_host - 4.6 * s, y - 4.6 * s, x_host + 4.6 * s, y + 4.6 * s,
-                       fill=_mix(self.behind, GUI_DIM, 0.22), outline="")
-        cv.create_oval(x_host - 2.6 * s, y - 2.6 * s, x_host + 2.6 * s, y + 2.6 * s,
-                       fill=_mix(self.behind, GUI_DIM, 0.85), outline="")
 
         gate_h = self.h * 0.36
         gate_c = colour if state else _mix(self.behind, GUI_DIM, 0.62)
@@ -3721,9 +3779,10 @@ class _Lane:
             for i, t in ((5, 0.18), (3, 0.30)):
                 cv.create_rectangle(x_gate - (1.6 + i * 0.5) * s, y - gate_h - i,
                                     x_gate + (1.6 + i * 0.5) * s, y + gate_h + i,
-                                    fill=_mix(self.behind, gate_c, t * halo), outline="")
+                                    fill=_mix(self.behind, gate_c, t * halo), outline="",
+                                    tags="live")
         cv.create_rectangle(x_gate - 1.4 * s, y - gate_h, x_gate + 1.4 * s, y + gate_h,
-                            fill=gate_c, outline="")
+                            fill=gate_c, outline="", tags="live")
 
         for dot in self.dots:
             r = 2.6 * s
@@ -3742,51 +3801,55 @@ class _Lane:
             cx, cy = dot["x"], y + dy
             body = _mix(self.behind, c, max(0.12, fade))
             cv.create_oval(cx - r * 2.1, cy - r * 1.5, cx + r * 2.1, cy + r * 1.5,
-                           fill=_mix(self.behind, c, 0.22 * fade), outline="")
-            cv.create_oval(cx - r, cy - r, cx + r, cy + r, fill=body, outline="")
+                           fill=_mix(self.behind, c, 0.22 * fade), outline="", tags="live")
+            cv.create_oval(cx - r, cy - r, cx + r, cy + r, fill=body, outline="",
+                           tags="live")
 
         # Only the wall-sized lane gets a caption; in a card row the status text to its
         # right already says what happened, and a label here would sit on the wire.
         if self._label and self.h >= 44:
             cv.create_text(x_end, 2, text=self._label, anchor="ne",
                            fill=_mix(self.behind, colour if state else GUI_DIM, 0.85),
-                           font=(GUI_MONO, 10))
+                           font=(GUI_MONO, 10), tags="live")
 
 
 class _Pulse:
     """The header's live wire: a scrolling trace that spikes once for every signal that
-    leaves this host, tinted by the last state the console observed. Idle, it keeps a
-    slow heartbeat — the same EKG the app has always carried, now actually beating."""
+    leaves this host, tinted by the last state the console observed.
+
+    It rests flat when nothing is on the wire, and that is deliberate on two counts. It
+    is honest — the trace then means "traffic", not "the process is alive" — and it is
+    free: an idle console runs no animation at all, instead of redrawing a polyline
+    thirty times a second on a laptop that is doing nothing."""
 
     def __init__(self, canvas, anim, x, y, w, h, behind, tag="pulse"):
         self.cv, self.tag = canvas, tag
         self.x, self.y, self.w, self.h = x, y, w, h
         self.behind = behind
+        self.anim = anim
         self.n = 84
         self.samples = [0.0] * self.n
         self.colour = GUI_ACCENT
         self._acc = 0.0
         self._beat = 0.0
-        self._idle = 0.0
         self._draw_in = 0.0
-        if anim is not None:
-            anim.add(self._frame, ambient=True)
+        self._job = None
 
     def move(self, x, y, w, h, behind=None):
         self.x, self.y, self.w, self.h = x, y, w, h
         if behind:
             self.behind = behind
+        self._render()
 
     def blip(self, colour=None, amp=1.0):
+        """A signal went out. Wake the trace if it was resting."""
         if colour:
             self.colour = colour
         self._beat = max(self._beat, amp)
+        if self._job is None and self.anim is not None:
+            self._job = self.anim.add(self._frame, ambient=True)
 
     def _frame(self, dt, _elapsed):
-        self._idle += dt
-        if self._idle > 2.4:                     # a resting heartbeat, so the wire is alive
-            self._idle = 0.0
-            self._beat = max(self._beat, 0.34)
         self._acc += dt
         step = 1.0 / 45.0
         moved = False
@@ -3799,13 +3862,17 @@ class _Pulse:
                 value = 0.0
             self.samples.append(value)
             moved = True
-        # The trace is the only thing that animates when the console is doing nothing, so
-        # it redraws at ~30 fps rather than on every tick: a window left open on a desk
-        # for an afternoon should not be a busy loop.
+        # Redraw at ~30fps rather than on every tick, and stop entirely once the last
+        # beat has scrolled off the end — a console with nothing on the wire animates
+        # nothing at all.
         self._draw_in -= dt
         if moved and self._draw_in <= 0.0:
             self._draw_in = 1.0 / 30.0
             self._render()
+        if self._beat < 0.02 and not any(self.samples):
+            self._job = None
+            self._render()
+            return False
         return True
 
     def _render(self):
@@ -3827,10 +3894,12 @@ class _Pulse:
             pts.extend((px, py))
             glow.extend((px, py))
         if len(pts) >= 4:
+            # No smooth=True: at 84 samples across ~170px the points are 2px apart, so a
+            # spline through them is invisible — and it is 26% of the render, forever.
             cv.create_line(*glow, fill=_mix(self.behind, self.colour, 0.30), width=5,
-                           capstyle="round", joinstyle="round", smooth=True, tags=self.tag)
+                           capstyle="round", joinstyle="round", tags=self.tag)
             cv.create_line(*pts, fill=_mix(self.behind, self.colour, 0.95), width=1,
-                           capstyle="round", joinstyle="round", smooth=True, tags=self.tag)
+                           capstyle="round", joinstyle="round", tags=self.tag)
         return True
 
 
@@ -4146,6 +4215,7 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
     anim = _Anim(root)
     by_id = {t.id: t for t in triggers}
     cards = {}                                  # trigger id -> widget/var bundle
+    pane_owner = {}                             # widget path -> the card it belongs to
     run_state = {"running": False, "stop": False}
     observed = {}                               # state -> count, this session
     ui_queue = queue.Queue()                    # background run threads -> main thread ONLY
@@ -4174,15 +4244,20 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
         except tk.TclError:
             pass
 
-    # ---- the lit backdrop, shared by the header and the card stage --------
-    art = {"img": None, "src": None, "w": 0, "h": 0}
+    # ---- the lit backdrop --------------------------------------------------
+    # Only the header gets the painted field, and only the strip it actually shows: the
+    # header never scrolls, so its image is laid down once and never moves. The card
+    # stage gets a flat tone instead (see where it is created) — anything covering a
+    # scrolling surface has to be re-rendered on every tick.
+    STAGE_FY0 = 0.12                            # the header shows the field above this
+    art = {"img": None, "src": None, "w": 0}
 
-    def ensure_backdrop(w, h):
-        if art["img"] is not None and abs(art["w"] - w) < 24 and abs(art["h"] - h) < 24:
+    def ensure_backdrop(w):
+        if art["img"] is not None and abs(art["w"] - w) < 24:
             return art["img"]
         try:
-            art["img"], art["src"] = _backdrop_image(w, h)
-            art["w"], art["h"] = w, h
+            art["img"], art["src"] = _backdrop_image(w, HEAD_H, 0.0, STAGE_FY0)
+            art["w"] = w
         except Exception:                        # no PhotoImage (or no memory): flat floor
             art["img"] = None
         return art["img"]
@@ -4201,7 +4276,7 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
             head.delete("chrome")
         except Exception:
             return
-        img = ensure_backdrop(max(w, 400), max(_num(root.winfo_height(), 820), 400))
+        img = ensure_backdrop(max(w, 400))
         if img is not None:
             head.create_image(0, 0, anchor="nw", image=img, tags="chrome")
         _glass(head, SIDE - 2, BAR_Y0, w - SIDE + 2, BAR_Y0 + BAR_H, head_frost,
@@ -4283,20 +4358,58 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
                 cx += 62
 
     # ---- card stage ------------------------------------------------------
-    stage = tk.Canvas(root, bg=GUI_BG, highlightthickness=0, bd=0)
+    # Flat, not a gradient, and deliberately so. Anything that covers the whole scrolling
+    # surface — a pinned image OR a band gradient — has to be re-rendered across the
+    # entire viewport on every scroll tick; measured, either one triples the cost of a
+    # scroll. The canvas background is painted by X once and costs nothing to scroll, and
+    # since cards cover the width, all that is ever visible of it is a 20px gutter and
+    # the 11px gaps between panes — where a gradient is indistinguishable from a tone.
+    stage = tk.Canvas(root, bg=_hx(*_backdrop_rgb(0.5, 0.55)), highlightthickness=0, bd=0)
     stage.pack(fill="both", expand=True)
-    scroll_state = {"first": 0.0, "last": 1.0, "drag": None}
+    scroll_state = {"first": 0.0, "last": 1.0, "drag": None, "settling": False,
+                    "job": None}
 
-    def pin_backdrop():
-        """The backdrop belongs to the window, not to the scrolled content, so it is
-        re-pinned to the viewport on every scroll — the cards slide over a fixed light
-        field instead of dragging it along with them."""
+    def on_scrolled():
+        """Runs on every scroll tick, so it does the least it possibly can: the field is
+        painted in canvas coordinates and scrolls with the content, leaving only the
+        scrollbar to move.
+
+        It also puts hover to sleep for the duration. Scrolling drags whole cards under a
+        stationary pointer, so Tk fires Enter/Leave for each one — without this, a flick
+        of the wheel repaints a dozen panes for a pointer that never moved."""
         try:
-            top = stage.canvasy(0)
-            stage.coords("bg", 0, top - HEAD_H)
-            paint_scrollbar(top)
+            paint_scrollbar(stage.canvasy(0))
         except Exception:
             pass
+        if not scroll_state["settling"]:
+            scroll_state["settling"] = True
+            for card in cards.values():
+                if card["hover"]:
+                    card["hover"] = card["hover_to"] = 0.0
+                    draw_pane(card)
+        try:
+            if scroll_state["job"] is not None:
+                root.after_cancel(scroll_state["job"])
+            scroll_state["job"] = root.after(140, settle_scroll)
+        except Exception:
+            scroll_state["settling"] = False
+
+    def settle_scroll():
+        """The scroll has stopped: light whatever the pointer is genuinely over now."""
+        scroll_state["job"] = None
+        scroll_state["settling"] = False
+        try:
+            widget = root.winfo_containing(*root.winfo_pointerxy())
+        except Exception:
+            return
+        for _ in range(8):                       # walk up to the card that owns it
+            if widget is None:
+                return
+            tid = pane_owner.get(str(widget))
+            if tid:
+                set_hover(tid, 1.0)
+                return
+            widget = getattr(widget, "master", None)
 
     def paint_scrollbar(top=None):
         try:
@@ -4323,7 +4436,7 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
 
     def on_yview(first, last):
         scroll_state["first"], scroll_state["last"] = float(first), float(last)
-        pin_backdrop()
+        on_scrolled()
 
     try:
         stage.configure(yscrollcommand=on_yview)
@@ -4443,7 +4556,7 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
                                    fg=CONFIRM_CYCLE_FG[CONFIRMED_UNSET])
             c["confirm"].pack(side="left", padx=(8, 0))
         c["fire"].configure(state="normal")
-        relayout()
+        reflow(tid)
 
     def fire(tid):
         if run_state["running"]:
@@ -4537,7 +4650,7 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
              font=(GUI_MONO, 9)).pack(side="left", padx=14)
 
     # ---- one card --------------------------------------------------------
-    def _make_pane(parent, title):
+    def _make_pane(parent, title, tid):
         """L3 detail pane: a toggle line + a recessed well that only appears once there
         is content and the presenter opens it. Returns (set_content, reset)."""
         frost = _bg_of(parent)
@@ -4561,7 +4674,7 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
         def toggle(_e=None):
             state["open"] = not state["open"]
             _render()
-            relayout()
+            reflow(tid)
         btn.bind("<Button-1>", toggle)
 
         def set_content(text):
@@ -4671,9 +4784,10 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
         wraps.append(reason)
 
         # ---- L3: detail panes, each disclosed on demand -------------------
-        set_cmd, _r1 = _make_pane(body_l2, "command/payload details")
-        set_flow, _r2 = _make_pane(body_l2, "5-tuple details")
-        set_verify, _r3 = _make_pane(body_l2, "verification key (paste into the console)")
+        set_cmd, _r1 = _make_pane(body_l2, "command/payload details", t.id)
+        set_flow, _r2 = _make_pane(body_l2, "5-tuple details", t.id)
+        set_verify, _r3 = _make_pane(body_l2, "verification key (paste into the console)",
+                                     t.id)
         panes = {"cmd": set_cmd, "flow": set_flow, "verify": set_verify}
 
         def set_pane(which, text):
@@ -4694,7 +4808,7 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
                 body_l2.pack(fill="x", pady=(0, 4))
             else:
                 body_l2.pack_forget()
-            relayout()
+            reflow(t.id)
             if expand["open"]:
                 reveal(t.id)
         for w in (head_row, caret, bead, title, status):
@@ -4707,7 +4821,7 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
                        "confirmed": CONFIRMED_UNSET, "frame": frame, "win": win,
                        "frost": frost, "behind": behind, "sev": sev, "wraps": wraps,
                        "disabled": disabled, "y": 0, "h": 0, "tag": "pane-" + t.id,
-                       "hover": 0.0, "hover_to": 0.0, "hover_job": None, "box": None}
+                       "hover": 0.0, "hover_to": 0.0, "box": None}
 
     # ---- pointer response: the pane under the cursor lights its own edge ---
     def draw_pane(card):
@@ -4723,7 +4837,7 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
             stage.delete(card["tag"])
         except Exception:
             return
-        tags = ("chrome", card["tag"])
+        tags = ("chrome", card["tag"], card.get("row", "row?"))
         _glass(stage, x0, top, x1, bottom, card["frost"], card["behind"], radius=15,
                shadow=4, glow=(card["sev"] if k > 0.02 else None), glow_k=k,
                stroke=_mix(_lift(card["frost"], 0.20 + 0.26 * k), card["sev"], 0.5 * k),
@@ -4734,27 +4848,25 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
                                    if card["disabled"] else card["sev"]))
 
     def set_hover(tid, target):
-        card = cards.get(tid)
-        if not card or card["hover_to"] == target:
-            return
-        card["hover_to"] = target
+        """Light or unlight one pane, in a single redraw.
 
-        def frame(dt, _elapsed):
-            step = min(1.0, dt * 9.0)
-            card["hover"] += (card["hover_to"] - card["hover"]) * step
-            if abs(card["hover_to"] - card["hover"]) < 0.02:
-                card["hover"] = card["hover_to"]
-                card["hover_job"] = None
-                draw_pane(card)
-                return False
-            draw_pane(card)
-            return True
-        if card["hover_job"] is None:
-            card["hover_job"] = anim.add(frame)
+        This used to fade over ~8 frames, which is fine for one card and ruinous while
+        scrolling: cards streaming under a stationary pointer each started their own
+        fade, and every frame of every fade redrew a whole glass stack. Measured, the
+        Enter/Leave events themselves cost 0.27 ms per scroll tick and the redraws they
+        triggered cost 1.84 ms. A rim that lights at once is not worse to look at."""
+        card = cards.get(tid)
+        if not card or card["hover"] == target or scroll_state["settling"]:
+            return
+        card["hover"] = card["hover_to"] = target
+        draw_pane(card)
 
     def bind_hover(widget, tid):
         """Enter/Leave fire on every descendant, so a leave is only believed once the
         pointer is genuinely outside the card's rectangle."""
+        for w in _descendants(widget):
+            pane_owner[str(w)] = tid             # so a settled scroll can find the card
+
         def enter(_e=None):
             set_hover(tid, 1.0)
 
@@ -4790,16 +4902,29 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
         if t.cls not in seen:
             seen.add(t.cls)
             order.append(t.cls)
+    # Every row — section heading or card — carries its own tag, so a single card's
+    # change can shift everything below it with one canvas `move` per row instead of
+    # re-laying the whole list out. Without a per-section tag the headings strand at
+    # their old y while the cards slide, which is exactly the bug this invites.
     layout = []
     for si, cls in enumerate(order):
         members = [x for x in triggers if x.cls == cls]
-        layout.append(("section", (CLASS_LABEL.get(cls, cls), len(members))))
+        layout.append(["section", (CLASS_LABEL.get(cls, cls), len(members)),
+                       "row%d" % len(layout)])
         fy = 0.10 + 0.74 * (si / max(1.0, len(order) - 1.0))
         for t in members:
             build_card(t, fy)
-            layout.append(("card", cards[t.id]))
+            card = cards[t.id]
+            card["row"] = "row%d" % len(layout)
+            card["index"] = len(layout)
+            try:
+                stage.addtag_withtag(card["row"], card["win"])
+            except Exception:
+                pass
+            layout.append(["card", card, card["row"]])
 
     content = {"h": 0}                          # laid-out height, = the scroll region
+    geom = {"x0": 0, "x1": 0, "w": 0}           # last full layout, reused by reflow()
 
     def relayout(_e=None):
         """Position every card on the stage and draw the glass under it.
@@ -4813,9 +4938,11 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
             w = _num(root.winfo_width(), 1140) - 4
         x0, x1 = SIDE, w - SIDE - 12
         inner = int(x1 - x0 - 2 * CARD_PAD)
-        for kind, obj in layout:
-            if kind != "card":
+        geom["x0"], geom["x1"], geom["w"] = x0, x1, w
+        for row in layout:
+            if row[0] != "card":
                 continue
+            obj = row[1]
             for lbl in obj["wraps"]:
                 try:
                     lbl.configure(wraplength=max(200, inner - 20))
@@ -4834,18 +4961,17 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
             stage.delete("chrome")
         except Exception:
             return
-        img = art["img"]
-        if img is not None:
-            stage.create_image(0, 0, anchor="nw", image=img, tags=("chrome", "bg"))
         y = 12
-        for kind, obj in layout:
+        for row in layout:
+            kind, obj, tag = row
             if kind == "section":
                 text, n = obj
+                tags = ("chrome", tag)
                 head_item = stage.create_text(x0 + 6, y + 16, anchor="w", text=text,
                                               fill=GUI_ACCENT, font=(GUI_MONO, 9, "bold"),
-                                              tags="chrome")
+                                              tags=tags)
                 item = stage.create_text(x1, y + 16, anchor="e", text=f"{n} triggers",
-                                         fill=GUI_FAINT, font=(GUI_MONO, 9), tags="chrome")
+                                         fill=GUI_FAINT, font=(GUI_MONO, 9), tags=tags)
                 try:
                     left = stage.bbox(item)[0] - 12
                     right = stage.bbox(head_item)[2] + 12
@@ -4853,7 +4979,7 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
                     left, right = x1 - 70, x0 + 6 + 7.2 * len(text)
                 if left > right:
                     stage.create_line(right, y + 16, left, y + 16,
-                                      fill=_lift(GUI_BG, 0.13), tags="chrome")
+                                      fill=_lift(GUI_BG, 0.13), tags=tags)
                 y += 34
                 continue
             card = obj
@@ -4869,7 +4995,47 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
             stage.configure(scrollregion=(0, 0, w, content["h"]))
         except Exception:
             pass
-        pin_backdrop()
+        on_scrolled()
+
+    def reflow(tid):
+        """One card changed height — move the rest, don't rebuild them.
+
+        A full relayout re-created 443 canvas items and re-measured all 53 cards to
+        service a change in one of them; for a collapsed card, which is the default
+        state, it re-created all of them to change nothing at all. This measures the one
+        card that moved and slides every row below it by the difference."""
+        card = cards.get(tid)
+        if card is None or not card.get("box") or not geom["w"]:
+            relayout()
+            return
+        try:
+            stage.update_idletasks()             # required: reqheight must be fresh
+        except Exception:
+            pass
+        x0, top, x1, bottom = card["box"]
+        h = _num(card["frame"].winfo_reqheight(), 40)
+        new_bottom = top + h + 2 * CARD_PAD
+        dy = new_bottom - bottom
+        card["box"] = (x0, top, x1, new_bottom)
+        card["h"] = new_bottom - top
+        draw_pane(card)
+        if dy:
+            for row in layout[card["index"] + 1:]:
+                try:
+                    stage.move(row[2], 0, dy)
+                except Exception:
+                    pass
+                if row[0] == "card":
+                    other = row[1]
+                    ox0, otop, ox1, obottom = other["box"] or (x0, 0, x1, 0)
+                    other["box"] = (ox0, otop + dy, ox1, obottom + dy)
+                    other["y"] = otop + dy
+            content["h"] += dy
+            try:
+                stage.configure(scrollregion=(0, 0, geom["w"], content["h"]))
+            except Exception:
+                pass
+        on_scrolled()
 
     def reveal(tid):
         """Scroll just enough to bring a freshly expanded card into view — an expand
@@ -4910,13 +5076,38 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
     def repaint_all():
         resize["job"] = None
         w = _num(root.winfo_width(), 1140)
-        h = _num(root.winfo_height(), 820)
-        ensure_backdrop(w, h)
+        ensure_backdrop(w)                      # width only: the header strip is fixed
         paint_head(w)
         relayout()
 
     try:
         root.bind("<Configure>", on_root_configure)
+    except Exception:
+        pass
+
+    # ---- stop decorating a window nobody is looking at --------------------
+    focus_state = {"job": None}
+
+    def _focus_check():
+        focus_state["job"] = None
+        try:                                     # None only when focus left the app
+            anim.set_ambient(root.focus_displayof() is not None)
+        except Exception:
+            pass
+
+    def on_focus(_e=None):
+        # FocusOut also fires when focus moves to a child (the buttons take focus), so
+        # settle first and then ask who actually holds it.
+        try:
+            if focus_state["job"] is not None:
+                root.after_cancel(focus_state["job"])
+            focus_state["job"] = root.after(120, _focus_check)
+        except Exception:
+            pass
+
+    try:
+        root.bind("<FocusIn>", on_focus, add="+")
+        root.bind("<FocusOut>", on_focus, add="+")
     except Exception:
         pass
 
@@ -4928,6 +5119,14 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
             pass
     root.protocol("WM_DELETE_WINDOW", on_close)
 
+    # Settle the geometry BEFORE the first paint. Without this, winfo_width() is still 1,
+    # so the header painted itself 400px wide and relayout laid all 53 panes out at a
+    # negative width — roughly twice as many canvas items created as the settled window
+    # needs, and a visibly wrong frame on screen until the first <Configure> repaired it.
+    try:
+        root.update_idletasks()
+    except tk.TclError:
+        pass
     paint_head(_num(root.winfo_width(), 1140) or 1140)
     relayout()
     pump()

@@ -4090,6 +4090,43 @@ def _well(parent, height=8):
 # ---------------------------------------------------------------------------
 # the console window
 # ---------------------------------------------------------------------------
+def _fit_to_work_area(root, want_w, want_h):
+    """Open at the requested size, or as much of it as the screen can actually show.
+
+    A hard-coded geometry is a bug waiting for a 1366x768 laptop: the window opens taller
+    than the desktop, the bottom of the card list is unreachable and the window sits over
+    the taskbar — you cannot get to the Start button. Windows can report the work area
+    (the desktop minus the taskbar) exactly, so ask it; elsewhere take the screen less a
+    rough allowance for a panel."""
+    sw = _num(root.winfo_screenwidth(), want_w)
+    sh = _num(root.winfo_screenheight(), want_h)
+    x0, y0 = 0, 0
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            class _RECT(ctypes.Structure):
+                _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                            ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+            rect = _RECT()
+            if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
+                x0, y0 = int(rect.left), int(rect.top)
+                sw, sh = int(rect.right - rect.left), int(rect.bottom - rect.top)
+        except Exception:                        # fall back to the raw screen size
+            pass
+    else:
+        sh = max(240, sh - 60)
+    w = max(560, min(want_w, sw - 40))
+    h = max(400, min(want_h, sh - 40))
+    try:
+        root.geometry("%dx%d+%d+%d" % (w, h, x0 + max(0, (sw - w) // 2),
+                                       y0 + max(0, (sh - h) // 3)))
+        root.minsize(min(760, w), min(520, h))
+    except Exception:
+        pass
+    return w, h
+
+
 def run_gui(settings, triggers, app, config_dir=None, profiles=None):
     """Build and run the console window. Raises RuntimeError when no display is
     available (headless without Xvfb / no X server)."""
@@ -4102,8 +4139,7 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
     except tk.TclError as e:
         raise RuntimeError(f"no display available: {e}") from e
     root.title(f"{APP_NAME} {__version__}")
-    root.geometry("1140x820")
-    root.minsize(760, 520)
+    _fit_to_work_area(root, 1140, 820)
     root.configure(bg=GUI_BG)
     _set_window_icon(root)
 

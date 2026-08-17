@@ -3724,6 +3724,14 @@ class _Lane:
             cv.create_text(x_end, 2, text=self._label, anchor="ne",
                            fill=_mix(self.behind, colour if state else GUI_DIM, 0.85),
                            font=(GUI_MONO, 10), tags="live")
+        if self.h >= 64:                         # wall-sized lane: name the three nodes
+            cap = _mix(self.behind, GUI_FAINT, 0.95)
+            cv.create_text(x_host, self.h - 2, text="host", anchor="s",
+                           fill=cap, font=(GUI_MONO, 8), tags="live")
+            cv.create_text(x_gate, self.h - 2, text="gate", anchor="s",
+                           fill=cap, font=(GUI_MONO, 8), tags="live")
+            cv.create_text(x_end, self.h - 2, text="internet", anchor="se",
+                           fill=cap, font=(GUI_MONO, 8), tags="live")
 
 
 class _Pulse:
@@ -5067,7 +5075,7 @@ def open_presenter_picker(root, app, triggers, settings, profiles):
     """Choose what to present: a curated profile, or everything enabled.
 
     Each option states its exact signal count up front, so the presenter commits to a
-    number before the room sees any traffic."""
+    number before the room sees any traffic. This is a setlist, not a wall of cards."""
     existing = getattr(root, "_secv_presenter_picker", None)
     if existing is not None:
         try:
@@ -5079,13 +5087,17 @@ def open_presenter_picker(root, app, triggers, settings, profiles):
             pass
 
     by_id = {t.id: t for t in triggers}
-    dlg = _GlassDialog(root, f"{APP_NAME} — presenter mode", min_width=560, fy=0.35)
+    dlg = _GlassDialog(root, f"{APP_NAME} — presenter", min_width=640, fy=0.35)
     root._secv_presenter_picker = dlg.win
     body = dlg.body
+    frost = dlg.frost
 
-    _label(body, "What are we presenting?", GUI_INK, (GUI_FONT, 15, "bold")).pack(anchor="w")
-    dlg.wrap(_label(body, "Each option runs in its own order and commits to a signal count.",
-                    GUI_DIM, (GUI_FONT, 9)), 0).pack(fill="x", pady=(3, 12))
+    _label(body, "PRESENTER", GUI_FAINT, (GUI_MONO, 8)).pack(anchor="w")
+    _label(body, "What are we presenting?", GUI_INK, (GUI_FONT, 16)).pack(anchor="w",
+                                                                        pady=(4, 0))
+    dlg.wrap(_label(body, "Each option commits to a signal count before anything leaves "
+                          "this host.", GUI_DIM, (GUI_FONT, 10)), 0).pack(fill="x",
+                                                                        pady=(4, 16))
 
     def start(session):
         dlg.destroy()
@@ -5093,22 +5105,66 @@ def open_presenter_picker(root, app, triggers, settings, profiles):
 
     def add_option(label, description, chosen):
         signals = sum(t.on_wire_count(settings) for t in chosen)
-        tile = _Tile(body, pad=12, lift=0.04)
-        tile.pack(fill="x", pady=4)
-        head = tk.Frame(tile.body, bg=tile.fill)
-        head.pack(fill="x")
-        _label(head, label, GUI_INK, (GUI_FONT, 11, "bold")).pack(side="left")
-        _label(head, f"{len(chosen)} triggers · {signals} signals", GUI_ACCENT,
-               (GUI_MONO, 9), anchor="e").pack(side="right")
+        enabled = bool(chosen)
+        row = tk.Frame(body, bg=frost, cursor=("hand2" if enabled else "arrow"))
+        row.pack(fill="x", pady=2)
+        left = tk.Frame(row, bg=frost)
+        left.pack(side="left", fill="x", expand=True)
+        _label(left, label, (GUI_INK if enabled else GUI_FAINT),
+               (GUI_FONT, 12)).pack(anchor="w")
         if description:
-            dlg.wrap(_label(tile.body, description, GUI_FAINT, (GUI_FONT, 9)),
-                     60).pack(fill="x", pady=(3, 0))
+            dlg.wrap(_label(left, description, GUI_FAINT, (GUI_FONT, 9)),
+                     140).pack(fill="x", pady=(2, 0))
+        right = tk.Frame(row, bg=frost)
+        right.pack(side="right", padx=(16, 0))
+        _label(right, str(signals) if enabled else "—",
+               (GUI_INK if enabled else GUI_FAINT), (GUI_MONO, 18),
+               anchor="e").pack(anchor="e")
+        _label(right, (f"{len(chosen)} triggers" if enabled else "nothing enabled"),
+               GUI_FAINT, (GUI_MONO, 8), anchor="e").pack(anchor="e")
+        rule = tk.Frame(body, bg=GUI_GRID, height=1)
+        rule.pack(fill="x", pady=(8, 6))
         session = PresenterSession(chosen, settings, label=label, description=description)
-        btn = _gui_button(tile.body, "Present", lambda s=session: start(s), primary=True)
-        btn.pack(anchor="e", pady=(9, 0))
-        if not chosen:
-            btn.configure(state="disabled", text="Nothing enabled")
-        tile.sync()
+        if not enabled:
+            return
+
+        def go(_e=None, s=session):
+            start(s)
+
+        def enter(_e=None):
+            for w in _descendants(row):
+                try:
+                    w.configure(bg=GUI_PANEL)
+                except Exception:
+                    pass
+
+        def leave(_e=None):
+            def settle():
+                try:
+                    px, py = dlg.win.winfo_pointerxy()
+                    fx, fy = row.winfo_rootx(), row.winfo_rooty()
+                    inside = (fx <= px < fx + _num(row.winfo_width(), 0)
+                              and fy <= py < fy + _num(row.winfo_height(), 0))
+                except Exception:
+                    inside = False
+                if not inside:
+                    for w in _descendants(row):
+                        try:
+                            w.configure(bg=frost)
+                        except Exception:
+                            pass
+            try:
+                dlg.win.after(40, settle)
+            except Exception:
+                pass
+
+        for w in _descendants(row):
+            try:
+                w.bind("<Button-1>", go, add="+")
+                w.bind("<Enter>", enter, add="+")
+                w.bind("<Leave>", leave, add="+")
+            except Exception:
+                pass
 
     for profile in (profiles or {}).values():
         chosen = [t for t in profile.triggers(by_id) if not t.gated_disabled(settings)]
@@ -5116,12 +5172,12 @@ def open_presenter_picker(root, app, triggers, settings, profiles):
     add_option("All enabled triggers", "The full catalog, in catalog order.",
                [t for t in triggers if not t.gated_disabled(settings)])
 
-    _gui_button(body, "Cancel", dlg.destroy).pack(anchor="e", pady=(13, 0))
+    _gui_button(body, "Cancel", dlg.destroy).pack(anchor="e", pady=(8, 0))
     dlg.show()
 
 
 def open_presenter_window(root, app, session, settings):
-    """Big-type, one-trigger-at-a-time presentation with a live scoreboard.
+    """Wall-readable, one-trigger-at-a-time stage with a live scoreboard.
 
     The scoreboard tallies what THIS HOST observed and says so — it is never a claim
     about what the customer's stack did. The presenter still reads the verdict on the
@@ -5137,7 +5193,7 @@ def open_presenter_window(root, app, session, settings):
         except tk.TclError:
             pass
 
-    dlg = _GlassDialog(root, f"{APP_NAME} — presenter", min_width=900, resizable=True, fy=0.5)
+    dlg = _GlassDialog(root, f"{APP_NAME} — presenter", min_width=960, resizable=True, fy=0.5)
     win = dlg.win
     root._secv_presenter = win
     anim = _Anim(win)
@@ -5147,13 +5203,25 @@ def open_presenter_window(root, app, session, settings):
 
     head = tk.Frame(body, bg=frost)
     head.pack(fill="x")
-    _label(head, session.label, GUI_ACCENT, (GUI_FONT, 12, "bold")).pack(side="left")
-    progress_var = tk.StringVar(value="")
-    tk.Label(head, textvariable=progress_var, fg=GUI_DIM, bg=frost,
-             font=(GUI_MONO, 10), anchor="e").pack(side="right")
+    ident = tk.Frame(head, bg=frost)
+    ident.pack(side="left", fill="x", expand=True)
+    _label(ident, "PRESENTER  ·  " + session.label.upper(), GUI_FAINT,
+           (GUI_MONO, 8)).pack(anchor="w")
+    title_var = tk.StringVar(value="")
+    dlg.wrap(tk.Label(ident, textvariable=title_var, fg=GUI_INK, bg=frost,
+                      font=(GUI_FONT, 20), anchor="w", justify="left"),
+             220).pack(fill="x", pady=(4, 0))
+    count = tk.Frame(head, bg=frost)
+    count.pack(side="right", padx=(16, 0))
+    step_var = tk.StringVar(value="")
+    tk.Label(count, textvariable=step_var, fg=GUI_INK, bg=frost,
+             font=(GUI_MONO, 18), anchor="e").pack(anchor="e")
+    plan_var = tk.StringVar(value="")
+    tk.Label(count, textvariable=plan_var, fg=GUI_FAINT, bg=frost,
+             font=(GUI_MONO, 8), anchor="e").pack(anchor="e")
 
-    track = tk.Canvas(body, bg=frost, highlightthickness=0, bd=0, height=4)
-    track.pack(fill="x", pady=(9, 0))
+    track = tk.Canvas(body, bg=frost, highlightthickness=0, bd=0, height=2)
+    track.pack(fill="x", pady=(12, 0))
 
     def paint_track():
         try:
@@ -5164,58 +5232,83 @@ def open_presenter_window(root, app, session, settings):
         if w < 20:
             return
         pos, total = session.progress()
-        track.create_polygon(_round_pts(0, 0, w, 4, 2), smooth=True, splinesteps=4,
-                             fill=_lift(frost, 0.09), outline="")
+        track.create_rectangle(0, 0, w, 2, fill=GUI_GRID, outline="")
         if total:
-            done = max(6.0, w * (pos / float(total)))
-            track.create_polygon(_round_pts(0, 0, done, 4, 2), smooth=True, splinesteps=4,
-                                 fill=GUI_ACCENT, outline="")
+            done = max(4.0, w * (pos / float(total)))
+            track.create_rectangle(0, 0, done, 2, fill=GUI_ACCENT, outline="")
     track.bind("<Configure>", lambda e: paint_track())
 
-    tile = _Tile(body, pad=18, lift=0.04)
-    tile.pack(fill="x", pady=(13, 0))
-    card = tile.body
-
-    title_var = tk.StringVar(value="")
-    dlg.wrap(tk.Label(card, textvariable=title_var, fg=GUI_INK, bg=tile.fill,
-                      font=(GUI_FONT, 21, "bold"), anchor="w", justify="left"),
-             90).pack(fill="x")
     expect_var = tk.StringVar(value="")
-    dlg.wrap(tk.Label(card, textvariable=expect_var, fg=GUI_GOLD, bg=tile.fill,
-                      font=(GUI_MONO, 11), anchor="w", justify="left"), 90).pack(fill="x", pady=(9, 0))
+    dlg.wrap(tk.Label(body, textvariable=expect_var, fg=GUI_GOLD, bg=frost,
+                      font=(GUI_MONO, 11), anchor="w", justify="left"),
+             40).pack(fill="x", pady=(16, 0))
     talk_var = tk.StringVar(value="")
-    dlg.wrap(tk.Label(card, textvariable=talk_var, fg=GUI_DIM, bg=tile.fill,
-                      font=(GUI_FONT, 12), anchor="w", justify="left"), 90).pack(fill="x", pady=(10, 0))
+    dlg.wrap(tk.Label(body, textvariable=talk_var, fg=GUI_INK, bg=frost,
+                      font=(GUI_FONT, 14), anchor="w", justify="left"),
+             40).pack(fill="x", pady=(8, 0))
     hint_var = tk.StringVar(value="")
-    dlg.wrap(tk.Label(card, textvariable=hint_var, fg=GUI_INFO, bg=tile.fill,
-                      font=(GUI_FONT, 10), anchor="w", justify="left"), 90).pack(fill="x", pady=(8, 0))
+    dlg.wrap(tk.Label(body, textvariable=hint_var, fg=GUI_DIM, bg=frost,
+                      font=(GUI_FONT, 10), anchor="w", justify="left"),
+             40).pack(fill="x", pady=(8, 0))
 
-    # The stage: the same emission lane the cards use, at wall size.
-    lane = _Lane(card, anim, width=760, height=74, behind=tile.fill)
-    lane.cv.pack(fill="x", pady=(16, 2))
+    lane = _Lane(body, anim, width=820, height=84, behind=frost)
+    lane.cv.pack(fill="x", pady=(18, 2))
 
     result_var = tk.StringVar(value="")
-    result_lbl = tk.Label(card, textvariable=result_var, fg=GUI_INK, bg=tile.fill,
-                          font=(GUI_FONT, 25, "bold"), anchor="w")
-    result_lbl.pack(fill="x", pady=(10, 0))
+    result_lbl = tk.Label(body, textvariable=result_var, fg=GUI_INK, bg=frost,
+                          font=(GUI_FONT, 22), anchor="w")
+    result_lbl.pack(fill="x", pady=(12, 0))
     reason_var = tk.StringVar(value="")
-    dlg.wrap(tk.Label(card, textvariable=reason_var, fg=GUI_DIM, bg=tile.fill,
-                      font=(GUI_FONT, 10), anchor="w", justify="left"), 90).pack(fill="x", pady=(4, 0))
+    dlg.wrap(tk.Label(body, textvariable=reason_var, fg=GUI_DIM, bg=frost,
+                      font=(GUI_FONT, 10), anchor="w", justify="left"),
+             40).pack(fill="x", pady=(4, 0))
 
-    board_var = tk.StringVar(value="")
-    tk.Label(body, textvariable=board_var, fg=GUI_INK, bg=frost, font=(GUI_MONO, 12),
-             anchor="w", justify="left").pack(fill="x", pady=(14, 0))
-    _label(body, "Observed locally by this host — the inline stack's console is "
-                 "authoritative.", GUI_FAINT, (GUI_FONT, 9)).pack(anchor="w", pady=(2, 0))
+    tk.Frame(body, bg=GUI_GRID, height=1).pack(fill="x", pady=(16, 10))
+    board = tk.Frame(body, bg=frost)
+    board.pack(fill="x")
 
     bar = tk.Frame(body, bg=frost)
-    bar.pack(fill="x", pady=(14, 0))
+    bar.pack(fill="x", pady=(16, 0))
+
+    def paint_scoreboard():
+        for child in list(board.winfo_children()):
+            try:
+                child.destroy()
+            except Exception:
+                pass
+        data = session.scoreboard()
+        _label(board, "Observed locally", GUI_FAINT, (GUI_MONO, 8)).pack(anchor="w")
+        row = tk.Frame(board, bg=frost)
+        row.pack(fill="x", pady=(4, 0))
+        if not data["states"]:
+            _label(row, "Nothing fired yet", GUI_FAINT, (GUI_MONO, 10)).pack(side="left")
+        else:
+            for st in (BLOCKED, ALLOWED, RATIO, ERROR, INVALID):
+                n = data["states"].get(st)
+                if not n:
+                    continue
+                colour = STATE_COLOR.get(st, GUI_DIM)
+                bead = tk.Canvas(row, width=8, height=8, bg=frost, highlightthickness=0,
+                                 bd=0, takefocus=0)
+                bead.create_oval(1, 1, 7, 7, fill=colour, outline="")
+                bead.pack(side="left")
+                _label(row, f"{n} {st}", colour, (GUI_MONO, 11)).pack(side="left",
+                                                                     padx=(5, 14))
+        for cls, slot in data["classes"].items():
+            if not slot["fired"]:
+                continue
+            detail = "  ".join(f"{n} {s}" for s, n in sorted(slot["states"].items()))
+            _label(board, f"{slot['label']}    {slot['fired']}/{slot['total']}    {detail}",
+                   GUI_DIM, (GUI_MONO, 9)).pack(anchor="w", pady=(5, 0))
+        _label(board, "This host's read — the inline stack's console is authoritative.",
+               GUI_FAINT, (GUI_FONT, 9)).pack(anchor="w", pady=(6, 0))
 
     def render():
         pos, total = session.progress()
-        progress_var.set(f"{pos} / {total}   ·   {session.summary_line()}")
-        board_var.set(_presenter_board(session))
+        step_var.set(f"{pos} / {total}" if total else "0 / 0")
+        plan_var.set(f"{session.planned_signals()} signals committed")
         paint_track()
+        paint_scoreboard()
         trigger = session.current
         if trigger is None:
             title_var.set("Done.")
@@ -5223,12 +5316,12 @@ def open_presenter_window(root, app, session, settings):
                 var.set("")
             lane.clear()
             fire_btn.configure(state="disabled", text="Finished")
-            tile.sync()
             return
         title_var.set(trigger.label)
-        expect_var.set(f"Expect: {trigger.expected_fire}" if trigger.expected_fire else "")
+        expect_var.set(("Expect    " + trigger.expected_fire) if trigger.expected_fire else "")
         talk_var.set(trigger.talking_point)
-        hint_var.set("↳ " + trigger.console_hint_text() if trigger.console_hint_text() else "")
+        hint = trigger.console_hint_text()
+        hint_var.set(("Look     " + hint) if hint else "")
         seen = session.results.get(trigger.id)
         if seen != state["shown"]:
             state["shown"] = seen
@@ -5244,7 +5337,6 @@ def open_presenter_window(root, app, session, settings):
         fire_btn.configure(state=("disabled" if state["busy"] else "normal"),
                            text=("Firing…" if state["busy"]
                                  else f"Fire  ({wire} signal" + ("" if wire == 1 else "s") + ")"))
-        tile.sync()
 
     def _reveal_result(seen):
         """Let the verdict arrive rather than blink into existence — the word lights up
@@ -5254,7 +5346,7 @@ def open_presenter_window(root, app, session, settings):
         def frame(dt, _elapsed):
             state["reveal"] = min(1.0, state["reveal"] + dt * 3.6)
             try:
-                result_lbl.configure(fg=_mix(tile.fill, colour, _ease(state["reveal"])))
+                result_lbl.configure(fg=_mix(frost, colour, _ease(state["reveal"])))
             except Exception:
                 return False
             return state["reveal"] < 1.0
@@ -5306,6 +5398,16 @@ def open_presenter_window(root, app, session, settings):
         lane.clear()
         render()
 
+    def on_lane_size(_e=None):
+        w = _num(lane.cv.winfo_width(), 0)
+        if w > 80:
+            lane.resize(w)
+
+    try:
+        lane.cv.bind("<Configure>", on_lane_size)
+    except Exception:
+        pass
+
     _gui_button(bar, "Back", lambda: step(-1), anim=anim).pack(side="left")
     fire_btn = _gui_button(bar, "Fire", fire, primary=True, anim=anim)
     fire_btn.pack(side="left", padx=9)
@@ -5313,7 +5415,7 @@ def open_presenter_window(root, app, session, settings):
     _gui_button(bar, "Close", dlg.destroy, anim=anim).pack(side="right")
 
     render()
-    dlg.show(height=560)
+    dlg.show(height=620)
     poll()
 
 

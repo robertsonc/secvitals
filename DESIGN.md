@@ -99,6 +99,15 @@ Idle is a flat hairline. That honesty is the product.
 
 **Dialog.** Same lacquer, one raised pane, no backdrop photograph.
 
+**Presenter picker.** A setlist, not a wall of cards. Each row is the profile
+name, one-line story, and the committed signal count as the hero number.
+Click the row to open the stage. No per-row Present button.
+
+**Presenter stage.** Wall-readable instrument: tracked eyebrow (profile),
+20px trigger title, expect / talk / look as a three-line brief, the emission
+lane named host · gate · internet, the verdict at 22px, then a bead
+scoreboard of what this host observed. Back / Fire / Next hold the pace.
+
 ## 7. Motion
 
 One shared clock (`_Anim`). Ease is smoothstep. No bounce, no elastic.

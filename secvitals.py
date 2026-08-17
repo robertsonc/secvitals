@@ -43,7 +43,7 @@ import time
 import urllib.error
 import urllib.request
 
-__version__ = "0.8.2"
+__version__ = "0.9.0"
 APP_NAME = "Security Vitals"
 
 log = logging.getLogger("secvitals")
@@ -2096,29 +2096,32 @@ _CONFIRMED_LABEL = {CONFIRMED_UNSET: "—", CONFIRMED_YES: "confirmed on console
 
 _REPORT_CSS = """
 :root { color-scheme: dark; }
-body { background:#1a1d21; color:#f2f4f5; font-family:'Segoe UI',system-ui,sans-serif;
-       margin:0; padding:32px; line-height:1.5; }
-h1,h2 { margin:0 0 8px; } h1 { font-size:24px; } h2 { font-size:15px; margin-top:32px;
-       text-transform:uppercase; letter-spacing:.08em; color:#01A982; }
-.sub { color:#9aa3ad; font-size:13px; margin-bottom:24px; }
+body { background:#0c1210; color:#e6eee8;
+       font-family:'Source Sans 3','Bahnschrift','Segoe UI',system-ui,sans-serif;
+       margin:0; padding:32px; line-height:1.55; }
+h1,h2 { margin:0 0 8px; font-weight:500; } h1 { font-size:24px; letter-spacing:.02em; }
+h2 { font-size:12px; margin-top:32px; text-transform:uppercase; letter-spacing:.14em;
+     color:#8a9a91; }
+.sub { color:#8a9a91; font-size:13px; margin-bottom:24px; }
 table { border-collapse:collapse; width:100%; font-size:13px; margin-top:8px; }
-th,td { text-align:left; padding:7px 10px; border-bottom:1px solid #363b44;
+th,td { text-align:left; padding:8px 10px; border-bottom:1px solid #2a3530;
         vertical-align:top; }
-th { color:#9aa3ad; font-weight:600; font-size:11px; text-transform:uppercase;
-     letter-spacing:.06em; }
-code,.mono { font-family:Consolas,ui-monospace,monospace; font-size:12px; }
+th { color:#6b7a72; font-weight:500; font-size:11px; text-transform:uppercase;
+     letter-spacing:.08em; }
+code,.mono { font-family:'JetBrains Mono','Cascadia Mono',Consolas,ui-monospace,monospace;
+             font-size:12px; }
 .badge { display:inline-block; padding:1px 8px; border-radius:3px; font-size:11px;
-         font-family:Consolas,monospace; border:1px solid; }
-.st-allowed { color:#00B0E6; border-color:#00B0E6; }
+         font-family:'JetBrains Mono',Consolas,monospace; border:1px solid; }
+.st-allowed { color:#7eb8c9; border-color:#7eb8c9; }
 .st-blocked { color:#01A982; border-color:#01A982; }
-.st-error   { color:#E0574a; border-color:#E0574a; }
-.st-invalid { color:#FEC901; border-color:#FEC901; }
-.st-ratio   { color:#FF8300; border-color:#FF8300; }
-.card { background:#23272e; border:1px solid #363b44; border-radius:6px; padding:14px 18px;
+.st-error   { color:#d45a4c; border-color:#d45a4c; }
+.st-invalid { color:#c9a84a; border-color:#c9a84a; }
+.st-ratio   { color:#d4923a; border-color:#d4923a; }
+.card { background:#151c19; border:1px solid #2a3530; border-radius:6px; padding:14px 18px;
         margin-bottom:10px; }
-.kv { display:flex; flex-wrap:wrap; gap:24px; font-size:12px; color:#9aa3ad; }
-.gap { color:#FEC901; } .ok { color:#01A982; } .bad { color:#E0574a; }
-.note { color:#6f787c; font-size:12px; margin-top:6px; }
+.kv { display:flex; flex-wrap:wrap; gap:24px; font-size:12px; color:#8a9a91; }
+.gap { color:#c9a84a; } .ok { color:#01A982; } .bad { color:#d45a4c; }
+.note { color:#6b7a72; font-size:12px; margin-top:6px; }
 .wrap { overflow-x:auto; }
 """
 
@@ -2970,41 +2973,36 @@ class PresenterSession:
 
 
 # ===========================================================================
-# Tkinter console  —  a self-contained spatial window (no browser, no server)
+# Tkinter console  —  a self-contained instrument window (no browser, no server)
 # ===========================================================================
-# The console keeps netvitals' identity — the lock-and-EKG mark, the HPE green, the
-# dark surface — but renders it as a spatial workspace: one lit backdrop, and frosted
-# glass panels floating over it. Tk has no compositor and no alpha channel, so every
-# "translucent" effect here is a colour computed against the exact backdrop pixel it
-# sits on (see _backdrop_rgb / _frost_at). That is why the backdrop is an analytic
-# field rather than an image file: a panel can ask what is behind it.
+# Visual language: "the bench" (see DESIGN.md). Dark lacquer, one green filament,
+# hairline rules, small radii. The lock-and-EKG and HPE green stay — they mean
+# something — but the 0.8.x aurora, frost, drop shadows and emoji chrome do not.
 #
-# Trigger cards are still rendered from the fixed local catalog and a click still fires
-# in-process (App.run on a background thread), reporting the three honest states
-# (allowed / blocked / error, plus the iprep ratio). What is new is that a click also
-# *shows* the traffic: each on-wire signal leaves the host as a dot, holds at the
-# inline stack, and then passes, breaks, or scatters — animation driven only by what
-# the console actually observed, never by what it hopes happened.
-GUI_BG = "#070a12"            # the window's floor, behind everything
-GUI_BG_TOP = "#101c38"        # backdrop gradient — horizon
-GUI_BG_BOT = "#05070f"        # backdrop gradient — deep
-GUI_SURFACE = "#182033"       # nominal frost (real panels compute their own)
-GUI_PANEL = "#1d2639"
-GUI_PANEL_HI = "#27324a"
-GUI_GRID = "#2a3450"
-GUI_INK = "#eef2f8"
-GUI_DIM = "#9fadc6"
-GUI_FAINT = "#7d8ca9"
-GUI_ACCENT = "#01A982"
+# Trigger cards still fire in-process (App.run on a background thread) and still
+# report the three honest states. A click still *shows* the traffic: each on-wire
+# signal leaves the host as a dot, holds at the inline stack, and then passes,
+# breaks, or scatters — animation driven only by what the console observed.
+GUI_BG = "#0c1210"            # window floor — green-black lacquer, not navy night
+GUI_BG_TOP = "#121a17"        # quiet vertical falloff (no coloured lights)
+GUI_BG_BOT = "#0a0f0d"
+GUI_SURFACE = "#151c19"       # raised pane
+GUI_PANEL = "#1a2320"         # command strip / inset chrome
+GUI_PANEL_HI = "#222c28"
+GUI_GRID = "#2a3530"          # hairline
+GUI_INK = "#e6eee8"
+GUI_DIM = "#8a9a91"
+GUI_FAINT = "#6b7a72"
+GUI_ACCENT = "#01A982"        # brand + blocked — the money shot
 GUI_ACCENT_DK = "#017a5e"
 GUI_ACCENT_LT = "#3ee6b4"
-GUI_INFO = "#00B0E6"
-GUI_WARN = "#FF8300"
-GUI_CRIT = "#E0574a"
-GUI_GOLD = "#FEC901"
-GUI_VIOLET = "#7a6cf0"
-GUI_FONT = "Segoe UI"
-GUI_MONO = "Consolas"
+GUI_INFO = "#7eb8c9"          # allowed — steel, not electric cyan
+GUI_WARN = "#d4923a"          # ratio / live-suspect caution
+GUI_CRIT = "#d45a4c"          # error
+GUI_GOLD = "#c9a84a"          # invalid / not configured
+GUI_ON_ACCENT = "#04140f"     # ink on a filled primary control
+GUI_FONT = "Source Sans 3"    # rebound to an installed face in run_gui
+GUI_MONO = "JetBrains Mono"
 
 SEV_COLOR = {"info": GUI_INFO, "warn": GUI_WARN, "crit": GUI_CRIT}
 
@@ -3018,7 +3016,7 @@ STATE_COLOR = {ALLOWED: GUI_INFO, BLOCKED: GUI_ACCENT, ERROR: GUI_CRIT,
 CONFIRM_CYCLE = {CONFIRMED_UNSET: CONFIRMED_YES, CONFIRMED_YES: CONFIRMED_NO,
                  CONFIRMED_NO: CONFIRMED_UNSET}
 CONFIRM_CYCLE_LABEL = {CONFIRMED_UNSET: "Console: not marked",
-                       CONFIRMED_YES: "Console: confirmed ✓",
+                       CONFIRMED_YES: "Console: confirmed",
                        CONFIRMED_NO: "Console: not seen"}
 CONFIRM_CYCLE_FG = {CONFIRMED_UNSET: GUI_INK, CONFIRMED_YES: GUI_ACCENT, CONFIRMED_NO: GUI_WARN}
 
@@ -3029,12 +3027,21 @@ CONFIRM_CYCLE_FG = {CONFIRMED_UNSET: GUI_INK, CONFIRMED_YES: GUI_ACCENT, CONFIRM
 # gated off), because that is an environment problem the presenter needs to see at a glance.
 STATE_FG = {ERROR: GUI_CRIT, INVALID: GUI_GOLD}
 CLASS_LABEL = {
-    "ns-ids":   "NORTH-SOUTH · IDS / IPS",
-    "ns-webcc": "NORTH-SOUTH · WEB CATEGORIES & REPUTATION  (SWG)",
-    "ns-iprep": "NORTH-SOUTH · IP REPUTATION",
-    "ns-dlp":   "NORTH-SOUTH · DATA LOSS PREVENTION  (content inspection)",
-    "ew":       "EAST-WEST",
+    "ns-ids":   "North–south  ·  IDS / IPS",
+    "ns-webcc": "North–south  ·  Web categories & reputation",
+    "ns-iprep": "North–south  ·  IP reputation",
+    "ns-dlp":   "North–south  ·  Data loss prevention",
+    "ew":       "East–west  ·  Segmentation",
 }
+
+# Chrome copy — words, not emoji. Tests pin these so a "friendly" icon cannot
+# sneak back onto a button a presenter has to read from across the table.
+UI_RUN_ALL = "Run all enabled"
+UI_STOP = "Stop"
+UI_MANIFEST = "Signal manifest"
+UI_PRESENTER = "Presenter"
+UI_REPORT = "Save report"
+UI_UPDATES = "Updates"
 
 
 # ---------------------------------------------------------------------------
@@ -3088,100 +3095,27 @@ def _bg_of(widget, default=GUI_SURFACE):
 
 
 # ---------------------------------------------------------------------------
-# the backdrop: one analytic light field, painted once and sampled forever
+# the floor: a quiet vertical falloff, sampled when a pane asks what is behind it
 # ---------------------------------------------------------------------------
-# fx, fy, radius, colour, strength — soft light sources sitting behind the glass.
-_AURORA = (
-    (0.02, -0.10, 0.80, GUI_ACCENT, 0.58),
-    (1.00, -0.02, 0.66, GUI_INFO, 0.40),
-    (0.78, 1.10, 0.88, GUI_VIOLET, 0.52),
-    (0.30, 0.58, 0.60, "#0d6a92", 0.22),
-    (0.55, 0.24, 0.34, "#123a6e", 0.20),
-)
-
-
-# Parsed once. This function is called per cell of the backdrop — tens of thousands of
-# times per generation — and re-parsing seven hex constants inside that loop was 60% of
-# the paint. The unpacked forms below are the same values, resolved at import.
 _BG_TOP_RGB = _rgb(GUI_BG_TOP)
 _BG_BOT_RGB = _rgb(GUI_BG_BOT)
-_AURORA_RGB = tuple((cx, cy, 1.0 / (rad * rad), _rgb(colour), strength)
-                    for cx, cy, rad, colour, strength in _AURORA)
 
 
 def _backdrop_rgb(fx, fy, aspect=1.45):
-    """The backdrop colour at fractional position (fx, fy) of the window.
+    """The floor colour at fractional position (fx, fy).
 
-    Single source of truth: the painted image, every panel's frost tint and every
-    drop shadow are derived from this one function, which is what keeps a "translucent"
-    surface consistent with what is actually behind it."""
+    A single ease from the header tone to the deep floor — no coloured lights.
+    Callers that still sample a position get a consistent instrument tone."""
     tr, tg, tb = _BG_TOP_RGB
     dr, dg, db = _BG_BOT_RGB
-    e = fy ** 0.72                      # ease the horizon high in the frame
-    r = tr + (dr - tr) * e
-    g = tg + (dg - tg) * e
-    b = tb + (db - tb) * e
-    for cx, cy, inv_rad2, (lr, lg, lb), strength in _AURORA_RGB:
-        dx = fx - cx
-        dy = (fy - cy) * aspect         # the light pools are wider than they are tall
-        d2 = (dx * dx + dy * dy) * inv_rad2
-        if d2 >= 1.0:
-            continue
-        k = (1.0 - d2)
-        k = k * k * strength
-        r += (lr - r) * k
-        g += (lg - g) * k
-        b += (lb - b) * k
-    vx, vy = (fx - 0.5) * 2.0, (fy - 0.5) * 2.0     # corners fall away
-    v = 1.0 - 0.26 * min(1.0, (vx * vx + vy * vy) * 0.5)
-    return (r * v, g * v, b * v)
+    e = max(0.0, min(1.0, fy)) ** 0.85
+    return (tr + (dr - tr) * e, tg + (dg - tg) * e, tb + (db - tb) * e)
 
 
-def _frost_at(fx, fy, lift=0.13, pickup=0.28, base="#141c2e", tint="#cfe0ff"):
-    """The colour of a frosted pane sitting at (fx, fy).
-
-    Real frosted glass is mostly its own material: it picks up some of the light behind
-    it, blurred to a local average, and scatters the rest back as white. Taking the
-    backdrop wholesale would tint every panel bright teal under the aurora and leave no
-    contrast for the state colours, so the pane keeps a cool base and only *some* of
-    what is behind it — which is also what makes two panes at different heights read as
-    the same material rather than two different ones."""
-    sample = _hx(*_backdrop_rgb(fx, fy))
-    return _mix(_mix(base, sample, pickup), tint, lift)
-
-
-def _backdrop_image(w, h, fy0=0.0, fy1=1.0):
-    """Render a slice of the light field as a PhotoImage.
-
-    Generated at a fraction of the window's resolution and zoomed back up: the field is
-    smooth by construction, so the upscale costs nothing visually and the whole paint is
-    one Tcl call instead of a million. `fy0`/`fy1` select the vertical slice of the field
-    to draw, so a caller that only shows a strip pays only for that strip.
-
-    Returns (image, source) — the caller must keep BOTH alive or Tk garbage-collects the
-    pixels out from under the canvas."""
-    w, h = max(16, int(w)), max(16, int(h))
-    # The floor is 8, not 3. The field is smooth enough that at cell=8 the largest colour
-    # step between adjacent source cells is 1/255 — below what an eye can resolve — while
-    # the cell=3 floor made a header strip cost six times as much to paint.
-    cell = max(8, int(math.sqrt(w * h / 45000.0)))
-    cw, ch = int(w // cell) + 2, int(h // cell) + 2
-    src = tk.PhotoImage(width=cw, height=ch)
-    cache, rows = {}, []
-    xs = [(i + 0.5) / cw for i in range(cw)]
-    for j in range(ch):
-        fy = fy0 + (fy1 - fy0) * ((j + 0.5) / ch)
-        row = []
-        for fx in xs:
-            r, g, b = _backdrop_rgb(fx, fy)
-            key = (int(r), int(g), int(b))
-            colour = cache.get(key)
-            if colour is None:
-                colour = cache[key] = _hx(key[0], key[1], key[2])
-            row.append(colour)
-        rows.append("{" + " ".join(row) + "}")
-    src.put(" ".join(rows))
-    return src.zoom(cell), src
+def _frost_at(fx, fy, lift=0.0, pickup=0.0, base=None, tint=None):
+    """A raised instrument pane. Position no longer tints the family — every
+    card is the same material, so state colour is the only colour that moves."""
+    return _lift(base or GUI_SURFACE, lift)
 
 
 def _round_pts(x0, y0, x1, y1, r):
@@ -3195,31 +3129,19 @@ def _round_pts(x0, y0, x1, y1, r):
             x0, y1 - r, x0, y1 - r, x0, y0 + r, x0, y0 + r, x0, y0]
 
 
-def _glass(cv, x0, y0, x1, y1, fill, behind, radius=16, stroke=None, shadow=4,
+def _glass(cv, x0, y0, x1, y1, fill, behind, radius=6, stroke=None, shadow=0,
            glow=None, glow_k=1.0, tags=()):
-    """Draw one frosted surface: a soft drop shadow that fades into `behind`, the pane
-    itself, and a specular hairline along the top edge where the light catches it."""
-    ids = []
-    for i in range(shadow, 0, -1):
-        t = i / float(shadow)
-        col = _mix(behind, "#000000", 0.30 * (1.0 - t) + 0.08)
-        ids.append(cv.create_polygon(
-            _round_pts(x0 - i * 0.6, y0 + i * 0.7, x1 + i * 0.6, y1 + i * 1.3, radius + i),
-            smooth=True, splinesteps=10, fill=col, outline="", tags=tags))
-    if glow and glow_k > 0.01:                 # a lit pane throws colour onto the backdrop
-        for i in (7, 5, 3):
-            ids.append(cv.create_polygon(
-                _round_pts(x0 - i, y0 - i, x1 + i, y1 + i, radius + i),
-                smooth=True, splinesteps=10, outline="",
-                fill=_mix(behind, glow, (0.19 - i * 0.02) * glow_k), tags=tags))
-    ids.append(cv.create_polygon(_round_pts(x0, y0, x1, y1, radius), smooth=True,
-                                 splinesteps=12, fill=fill,
-                                 outline=(stroke or _lift(fill, 0.20)), width=1, tags=tags))
-    ids.append(cv.create_line(x0 + radius * 0.9, y0 + 1.5, x1 - radius * 0.9, y0 + 1.5,
-                              fill=_lift(fill, 0.34), width=1, tags=tags))
-    ids.append(cv.create_line(x0 + radius * 0.5, y1 - 1, x1 - radius * 0.5, y1 - 1,
-                              fill=_sink(fill, 0.22), width=1, tags=tags))
-    return ids
+    """Draw one instrument surface: a flat pane, a hairline, a tight radius.
+
+    `shadow` and `glow` are accepted so existing callers stay stable, but they
+    are not painted — elevation is a tint and a rule, not a drop shadow."""
+    r = max(2.0, min(float(radius), 8.0))
+    edge = stroke or _lift(fill, 0.14)
+    if glow and glow_k > 0.35:                 # hover: the hairline picks up the rail
+        edge = _mix(edge, glow, 0.45 * min(1.0, glow_k))
+    return [cv.create_polygon(_round_pts(x0, y0, x1, y1, r), smooth=True,
+                              splinesteps=8, fill=fill, outline=edge, width=1,
+                              tags=tags)]
 
 
 # ---------------------------------------------------------------------------
@@ -3310,21 +3232,21 @@ def _ease(t):
 # controls
 # ---------------------------------------------------------------------------
 class _Pill:
-    """A button drawn on a canvas: rounded, frosted, lit from within on hover.
+    """A button drawn on a canvas: tight radius, hairline, no platform chrome.
 
     Tk's Button is a hard-edged platform rectangle that would break the surface
-    everywhere it appeared, so the console draws its own — which also gives the press
-    somewhere to put a little physicality."""
+    everywhere it appeared, so the console draws its own — and keeps takefocus,
+    Return/Space and a visible focus ring, because it replaces a tk.Button."""
 
     def __init__(self, parent, text, command, kind="ghost", anim=None,
-                 font=None, padx=15, pady=8):
+                 font=None, padx=14, pady=7):
         self.behind = _bg_of(parent)
         self.kind = kind
         self.command = command
         self.text = text
         self.enabled = True
         self.anim = anim
-        self.font = font or (GUI_FONT, 9, "bold")
+        self.font = font or (GUI_FONT, 9)
         self.padx, self.pady = padx, pady
         self.glow = 0.0
         self.target = 0.0
@@ -3369,15 +3291,15 @@ class _Pill:
     def _colours(self):
         g = self.glow
         if not self.enabled:
-            return (_lift(self.behind, 0.05), _lift(self.behind, 0.10), GUI_FAINT, None)
+            return (_lift(self.behind, 0.04), _lift(self.behind, 0.10), GUI_FAINT)
         if self.kind == "primary":
             fill = _mix(GUI_ACCENT_DK, GUI_ACCENT, 0.55 + 0.45 * g)
-            return (fill, _mix(GUI_ACCENT_LT, "#ffffff", 0.15 * g), "#04140f", GUI_ACCENT)
+            return (fill, _lift(fill, 0.18), GUI_ON_ACCENT)
         if self.kind == "danger":
-            fill = _mix(_lift(self.behind, 0.06), GUI_CRIT, 0.55 + 0.4 * g)
-            return (fill, GUI_CRIT, "#160707", GUI_CRIT)
-        fill = _lift(self.behind, 0.07 + 0.09 * g)
-        return (fill, _lift(self.behind, 0.20 + 0.22 * g), GUI_INK, None)
+            fill = _mix(_lift(self.behind, 0.04), GUI_CRIT, 0.50 + 0.3 * g)
+            return (fill, GUI_CRIT, GUI_INK)
+        fill = _lift(self.behind, 0.04 + 0.08 * g)
+        return (fill, _lift(self.behind, 0.16 + 0.14 * g), GUI_INK)
 
     def _render(self):
         cv = self.cv
@@ -3385,24 +3307,15 @@ class _Pill:
             cv.delete("all")
         except Exception:
             return
-        fill, stroke, ink, halo = self._colours()
+        fill, stroke, ink = self._colours()
         dy = 1.0 * self.press
-        r = self.h / 2.0
-        if halo and self.enabled:                 # a lit control spills onto its surround
-            for i, t in ((4, 0.16), (2, 0.26)):
-                cv.create_polygon(_round_pts(1 - i * 0.5, 1 - i * 0.5 + dy,
-                                             self.w - 1 + i * 0.5, self.h - 2 + i * 0.5 + dy, r + i),
-                                  smooth=True, splinesteps=8, outline="",
-                                  fill=_mix(self.behind, halo, t * (0.35 + 0.65 * self.glow)))
-        cv.create_polygon(_round_pts(1, 2 + dy, self.w - 1, self.h - 1 + dy, r),
-                          smooth=True, splinesteps=10, fill=_sink(self.behind, 0.25),
-                          outline="")
+        r = 4.0
         cv.create_polygon(_round_pts(1, 1 + dy, self.w - 1, self.h - 2 + dy, r),
-                          smooth=True, splinesteps=10, fill=fill, outline=stroke, width=1)
+                          smooth=True, splinesteps=8, fill=fill, outline=stroke, width=1)
         if self.focused and self.enabled:          # keyboard focus has to be visible
-            cv.create_polygon(_round_pts(3, 3 + dy, self.w - 3, self.h - 4 + dy, r - 2),
-                              smooth=True, splinesteps=10, fill="", width=1,
-                              outline=_lift(fill, 0.55))
+            cv.create_polygon(_round_pts(3, 3 + dy, self.w - 3, self.h - 4 + dy, r - 1),
+                              smooth=True, splinesteps=8, fill="", width=1,
+                              outline=_lift(fill, 0.45))
         cv.create_text(self.w / 2.0, self.h / 2.0 + dy, text=self.text, fill=ink,
                        font=self.font)
 
@@ -3545,10 +3458,10 @@ def _chip_row(parent, items, font=None, pad=7, gap=6, height=19):
         except Exception:
             pass
         w = tw + pad * 2
-        cv.create_polygon(_round_pts(x, 1, x + w, height - 1, (height - 2) / 2.0),
-                          smooth=True, splinesteps=8,
-                          fill=_mix(behind, colour, 0.13), outline=_mix(behind, colour, 0.55))
-        cv.create_text(x + w / 2.0, height / 2.0, text=text, fill=_lift(colour, 0.25),
+        cv.create_polygon(_round_pts(x, 1, x + w, height - 1, 3),
+                          smooth=True, splinesteps=6,
+                          fill=_mix(behind, colour, 0.10), outline=_mix(behind, colour, 0.40))
+        cv.create_text(x + w / 2.0, height / 2.0, text=text, fill=_lift(colour, 0.18),
                        font=font)
         x += w + gap
     try:
@@ -3811,6 +3724,14 @@ class _Lane:
             cv.create_text(x_end, 2, text=self._label, anchor="ne",
                            fill=_mix(self.behind, colour if state else GUI_DIM, 0.85),
                            font=(GUI_MONO, 10), tags="live")
+        if self.h >= 64:                         # wall-sized lane: name the three nodes
+            cap = _mix(self.behind, GUI_FAINT, 0.95)
+            cv.create_text(x_host, self.h - 2, text="host", anchor="s",
+                           fill=cap, font=(GUI_MONO, 8), tags="live")
+            cv.create_text(x_gate, self.h - 2, text="gate", anchor="s",
+                           fill=cap, font=(GUI_MONO, 8), tags="live")
+            cv.create_text(x_end, self.h - 2, text="internet", anchor="se",
+                           fill=cap, font=(GUI_MONO, 8), tags="live")
 
 
 class _Pulse:
@@ -3904,15 +3825,11 @@ class _Pulse:
 
 
 def _draw_logo(cv, x=0, y=0, scale=1.0, behind=GUI_BG, tags=()):
-    """Padlock silhouette crossed by a green EKG pulse — the same mark as the web
-    build's SVG, now lit: a soft halo behind the shackle and a bright core on the
-    pulse, so the identity reads as a light source rather than a line drawing."""
+    """Padlock silhouette crossed by a green EKG pulse — the same mark, drawn
+    as a line rather than a glowing orb."""
     def p(*vals):
         return [(x + v * scale) if i % 2 == 0 else (y + v * scale) for i, v in enumerate(vals)]
 
-    ring = _mix(behind, GUI_ACCENT, 0.16)
-    cv.create_oval(*p(2, 4, 38, 40), fill=ring, outline="", tags=tags)
-    cv.create_oval(*p(6, 8, 34, 36), fill=_mix(behind, GUI_ACCENT, 0.10), outline="", tags=tags)
     edge = _mix(behind, GUI_DIM, 0.75)
     cv.create_arc(*p(13, 9, 27, 23), start=0, extent=180, style="arc", outline=edge,
                   width=max(1, int(2 * scale)), tags=tags)
@@ -3951,14 +3868,14 @@ def _set_window_icon(root):
 # a secondary window that lives in the same space as the console
 # ---------------------------------------------------------------------------
 class _GlassDialog:
-    """A Toplevel with the console's backdrop and a single frosted panel on it.
+    """A Toplevel on the same lacquer as the console, with one raised pane.
 
-    Content goes into `self.body`, a plain Frame whose background is already the frost
-    colour, so ordinary Labels blend into the pane. Call `show()` once the content is
-    packed: it measures, sizes the window to fit, and paints the backdrop behind it."""
+    Content goes into `self.body`, a plain Frame whose background is already the
+    pane colour, so ordinary Labels blend into it. Call `show()` once the content
+    is packed: it measures, sizes the window to fit, and draws the pane."""
 
-    PAD = 16          # backdrop margin around the pane
-    INSET = 18        # pane margin around the content
+    PAD = 14          # floor margin around the pane
+    INSET = 16        # pane margin around the content
 
     def __init__(self, root, title, min_width=520, resizable=False, fy=0.42):
         self.root = root
@@ -3967,14 +3884,13 @@ class _GlassDialog:
         self.win.configure(bg=GUI_BG)
         self.win.transient(root)
         self.min_width = min_width
-        self.behind = _hx(*_backdrop_rgb(0.5, fy))
-        self.frost = _frost_at(0.5, fy, lift=0.15)
+        self.behind = GUI_BG
+        self.frost = GUI_SURFACE
         self.cv = tk.Canvas(self.win, bg=GUI_BG, highlightthickness=0, bd=0)
         self.cv.pack(fill="both", expand=True)
         self.body = tk.Frame(self.cv, bg=self.frost)
         self.item = self.cv.create_window(self.PAD + self.INSET, self.PAD + self.INSET,
                                           anchor="nw", window=self.body)
-        self._img = self._src = None
         self._wraps = []
         self._size = (0, 0)
         self._pending = None
@@ -4033,13 +3949,9 @@ class _GlassDialog:
             self.cv.delete("chrome")
         except Exception:
             return
-        try:
-            self._img, self._src = _backdrop_image(w, h)
-            self.cv.create_image(0, 0, anchor="nw", image=self._img, tags="chrome")
-        except Exception:
-            pass
+        self.cv.create_rectangle(0, 0, w, h, fill=GUI_BG, outline="", tags="chrome")
         _glass(self.cv, self.PAD, self.PAD, w - self.PAD, h - self.PAD, self.frost,
-               self.behind, radius=18, shadow=5, tags="chrome")
+               self.behind, radius=8, tags="chrome")
         inner = w - 2 * (self.PAD + self.INSET)
         try:
             self.cv.itemconfigure(self.item, width=inner,
@@ -4077,7 +3989,7 @@ class _Tile:
     items). It re-measures itself whenever its width changes or its content moves, so
     callers only have to remember `sync()` after they finish packing into `body`."""
 
-    def __init__(self, parent, pad=13, lift=0.06, radius=13, glow=None):
+    def __init__(self, parent, pad=12, lift=0.04, radius=6, glow=None):
         self.behind = _bg_of(parent)
         self.fill = _lift(self.behind, lift)
         self.pad, self.radius, self.glow = pad, radius, glow
@@ -4112,8 +4024,8 @@ class _Tile:
         except Exception:
             return
         if w > 40:
-            _glass(self.cv, 1, 1, w - 2, h - 4, self.fill, self.behind, radius=self.radius,
-                   shadow=2, glow=self.glow, tags="chrome")
+            _glass(self.cv, 1, 1, w - 2, h - 2, self.fill, self.behind, radius=self.radius,
+                   glow=self.glow, tags="chrome")
 
     def pack(self, **kw):
         self.cv.pack(**kw)
@@ -4196,6 +4108,27 @@ def _fit_to_work_area(root, want_w, want_h):
     return w, h
 
 
+def _bind_fonts(root):
+    """Pick an installed face that matches DESIGN.md. Falls back silently — a
+    missing family must not take the window down, and the fake-tk smoke test
+    has no font catalog at all."""
+    global GUI_FONT, GUI_MONO
+    try:
+        import tkinter.font as tkfont
+        families = set(tkfont.families(root))
+    except Exception:
+        return
+    for name in ("Source Sans 3", "Noto Sans Display", "Bahnschrift",
+                 "DejaVu Sans", "Segoe UI"):
+        if name in families:
+            GUI_FONT = name
+            break
+    for name in ("JetBrains Mono", "Cascadia Mono", "DejaVu Sans Mono", "Consolas"):
+        if name in families:
+            GUI_MONO = name
+            break
+
+
 def run_gui(settings, triggers, app, config_dir=None, profiles=None):
     """Build and run the console window. Raises RuntimeError when no display is
     available (headless without Xvfb / no X server)."""
@@ -4211,6 +4144,7 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
     _fit_to_work_area(root, 1140, 820)
     root.configure(bg=GUI_BG)
     _set_window_icon(root)
+    _bind_fonts(root)
 
     anim = _Anim(root)
     by_id = {t.id: t for t in triggers}
@@ -4224,10 +4158,11 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
     enabled_triggers = [t for t in triggers if not t.unavailable_reason(settings)]
     planned_signals = sum(t.on_wire_count(settings) for t in enabled_triggers)
 
-    HEAD_H = 200 if gated else 150
-    BAR_Y0, BAR_H = 14, 118
-    SIDE = 20                                   # card gutter
-    CARD_PAD, CARD_GAP = 13, 11
+    IDENTITY_H, BAR_H = 70, 42
+    BANNER_H = 36 if gated else 0
+    HEAD_H = IDENTITY_H + BAR_H + BANNER_H
+    SIDE = 18                                   # card gutter
+    CARD_PAD, CARD_GAP = 10, 5
 
     def pump():
         try:
@@ -4244,76 +4179,56 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
         except tk.TclError:
             pass
 
-    # ---- the lit backdrop --------------------------------------------------
-    # Only the header gets the painted field, and only the strip it actually shows: the
-    # header never scrolls, so its image is laid down once and never moves. The card
-    # stage gets a flat tone instead (see where it is created) — anything covering a
-    # scrolling surface has to be re-rendered on every tick.
-    STAGE_FY0 = 0.12                            # the header shows the field above this
-    art = {"img": None, "src": None, "w": 0}
-
-    def ensure_backdrop(w):
-        if art["img"] is not None and abs(art["w"] - w) < 24:
-            return art["img"]
-        try:
-            art["img"], art["src"] = _backdrop_image(w, HEAD_H, 0.0, STAGE_FY0)
-            art["w"] = w
-        except Exception:                        # no PhotoImage (or no memory): flat floor
-            art["img"] = None
-        return art["img"]
-
     # ---- header ----------------------------------------------------------
-    head = tk.Canvas(root, bg=GUI_BG, highlightthickness=0, bd=0, height=HEAD_H)
+    head = tk.Canvas(root, bg=GUI_SURFACE, highlightthickness=0, bd=0, height=HEAD_H)
     head.pack(fill="x", side="top")
-    head_frost = _frost_at(0.5, 0.05, lift=0.16)
-    head_behind = _hx(*_backdrop_rgb(0.5, 0.06))
-    bar = tk.Frame(head, bg=head_frost)
-    bar_item = head.create_window(34, BAR_Y0 + 72, anchor="nw", window=bar, height=34)
-    pulse = _Pulse(head, anim, 0, 0, 10, 10, head_frost)
+    bar = tk.Frame(head, bg=GUI_PANEL)
+    bar_item = head.create_window(SIDE, IDENTITY_H, anchor="nw", window=bar, height=BAR_H)
+    pulse = _Pulse(head, anim, 0, 0, 10, 10, GUI_SURFACE)
 
     def paint_head(w):
         try:
             head.delete("chrome")
         except Exception:
             return
-        img = ensure_backdrop(max(w, 400))
-        if img is not None:
-            head.create_image(0, 0, anchor="nw", image=img, tags="chrome")
-        _glass(head, SIDE - 2, BAR_Y0, w - SIDE + 2, BAR_Y0 + BAR_H, head_frost,
-               head_behind, radius=20, shadow=5, tags="chrome")
-        _draw_logo(head, 34, BAR_Y0 + 15, 1.0, behind=head_frost, tags="chrome")
-        head.create_text(86, BAR_Y0 + 24, text=APP_NAME, anchor="w", fill=GUI_INK,
-                         font=(GUI_FONT, 19, "bold"), tags="chrome")
-        head.create_text(88, BAR_Y0 + 48, anchor="w", fill=GUI_FAINT, font=(GUI_FONT, 9),
-                         text="inline security-stack console  ·  local result only, nothing uploaded",
+        head.create_rectangle(0, 0, w, HEAD_H, fill=GUI_SURFACE, outline="", tags="chrome")
+        head.create_rectangle(0, 0, w, 2, fill=GUI_ACCENT, outline="", tags="chrome")
+        head.create_line(0, IDENTITY_H, w, IDENTITY_H, fill=GUI_GRID, tags="chrome")
+        head.create_line(0, IDENTITY_H + BAR_H, w, IDENTITY_H + BAR_H,
+                         fill=GUI_GRID, tags="chrome")
+        _draw_logo(head, 16, 16, 0.92, behind=GUI_SURFACE, tags="chrome")
+        head.create_text(60, 22, text=APP_NAME.upper(), anchor="w", fill=GUI_INK,
+                         font=(GUI_FONT, 15), tags="chrome")
+        head.create_text(60, 46, anchor="w", fill=GUI_FAINT, font=(GUI_FONT, 9),
+                         text="Inline stack console  ·  local result only",
                          tags="chrome")
-        head.create_text(w - SIDE - 20, BAR_Y0 + 24, anchor="e", fill=GUI_ACCENT,
-                         font=(GUI_MONO, 10, "bold"), tags="chrome",
-                         text=f"{planned_signals} signals · {len(enabled_triggers)} triggers")
-        head.create_text(w - SIDE - 20, BAR_Y0 + 46, anchor="e", fill=GUI_FAINT,
-                         font=(GUI_MONO, 9), text=f"v{__version__}", tags="chrome")
+        head.create_text(w - SIDE, 20, anchor="e", fill=GUI_INK,
+                         font=(GUI_MONO, 20), tags="chrome",
+                         text=str(planned_signals))
+        head.create_text(w - SIDE, 46, anchor="e", fill=GUI_FAINT,
+                         font=(GUI_MONO, 8), tags="chrome",
+                         text=f"signals  ·  {len(enabled_triggers)} triggers  ·  v{__version__}")
         if w > 940:                              # the live wire needs room; small windows drop it
-            px = w - SIDE - 258
-            pulse.move(px - 176, BAR_Y0 + 10, 176, 34, head_frost)
-            head.create_text(px - 176, BAR_Y0 + 52, anchor="w", fill=GUI_FAINT,
+            px = w - SIDE - 210
+            pulse.move(px - 168, 14, 160, 28, GUI_SURFACE)
+            head.create_text(px - 168, 48, anchor="w", fill=GUI_FAINT,
                              font=(GUI_MONO, 8), text="signal wire",
                              tags=("chrome", "wirecap"))
         else:
-            pulse.move(-500, -500, 10, 10, head_frost)
-        head.coords(bar_item, 34, BAR_Y0 + 72)
-        head.itemconfigure(bar_item, width=w - 68)
+            pulse.move(-500, -500, 10, 10, GUI_SURFACE)
+        head.coords(bar_item, 0, IDENTITY_H)
+        head.itemconfigure(bar_item, width=w)
         if gated:
-            _glass(head, SIDE - 2, BAR_Y0 + BAR_H + 10, w - SIDE + 2, HEAD_H - 8,
-                   _frost_at(0.5, 0.17, lift=0.11), _hx(*_backdrop_rgb(0.5, 0.17)),
-                   radius=14, shadow=3, glow=GUI_WARN, tags="chrome")
-            head.create_rectangle(SIDE + 8, BAR_Y0 + BAR_H + 22, SIDE + 11, HEAD_H - 20,
-                                  fill=GUI_WARN, outline="", tags="chrome")
+            by0 = IDENTITY_H + BAR_H
+            head.create_rectangle(0, by0, w, HEAD_H, fill=GUI_SURFACE, outline="",
+                                  tags="chrome")
+            head.create_rectangle(0, by0 + 8, 3, HEAD_H - 8, fill=GUI_WARN, outline="",
+                                  tags="chrome")
             head.create_text(
-                SIDE + 24, BAR_Y0 + BAR_H + 20, anchor="nw", fill=GUI_DIM,
-                font=(GUI_FONT, 9), width=max(200, w - 2 * SIDE - 60), tags="chrome",
-                text=(f"{len(gated)} trigger(s) reach LIVE suspect infrastructure / live Tor "
-                      "nodes and are disabled (enable_live_suspect_hosts is false in "
-                      "settings.yaml). Enable only in a lab you control."))
+                16, by0 + 10, anchor="nw", fill=GUI_DIM,
+                font=(GUI_FONT, 9), width=max(200, w - 32), tags="chrome",
+                text=(f"{len(gated)} triggers reach live suspect infrastructure and are "
+                      "disabled. Enable only in a lab you control."))
         paint_tally(w)
         try:
             head.tag_raise("pulse")              # the live wire stays above the repaint
@@ -4335,8 +4250,8 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
             head.delete("wirecap")               # the tally takes the caption's line
         except Exception:
             pass
-        cx = w - SIDE - 258 - 176
-        item = head.create_text(cx, BAR_Y0 + 52, anchor="w", fill=GUI_FAINT,
+        cx = w - SIDE - 210 - 168
+        item = head.create_text(cx, 48, anchor="w", fill=GUI_FAINT,
                                 font=(GUI_MONO, 8), text="observed", tags="tally")
         try:
             cx = head.bbox(item)[2] + 9
@@ -4347,9 +4262,9 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
             if not n:
                 continue
             colour = STATE_COLOR.get(state, GUI_DIM)
-            head.create_oval(cx, BAR_Y0 + 49, cx + 6, BAR_Y0 + 55, fill=colour,
+            head.create_oval(cx, 45, cx + 6, 51, fill=colour,
                              outline="", tags="tally")
-            item = head.create_text(cx + 10, BAR_Y0 + 52, anchor="w", fill=_lift(colour, 0.2),
+            item = head.create_text(cx + 10, 48, anchor="w", fill=_lift(colour, 0.2),
                                     font=(GUI_MONO, 8), text=f"{n} {state}", tags="tally")
             try:
                 box = head.bbox(item)
@@ -4364,7 +4279,7 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
     # scroll. The canvas background is painted by X once and costs nothing to scroll, and
     # since cards cover the width, all that is ever visible of it is a 20px gutter and
     # the 11px gaps between panes — where a gradient is indistinguishable from a tone.
-    stage = tk.Canvas(root, bg=_hx(*_backdrop_rgb(0.5, 0.55)), highlightthickness=0, bd=0)
+    stage = tk.Canvas(root, bg=GUI_BG, highlightthickness=0, bd=0)
     stage.pack(fill="both", expand=True)
     scroll_state = {"first": 0.0, "last": 1.0, "drag": None, "settling": False,
                     "job": None}
@@ -4606,7 +4521,7 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
             return
         run_state["running"], run_state["stop"] = True, False
         run_all_btn.pack_forget()
-        stop_btn.pack(side="left", before=manifest_btn.cv)
+        stop_btn.pack(side="left", before=manifest_btn.cv, padx=(18, 0), pady=6)
         for tid in ids:
             c = cards.get(tid)
             if c:
@@ -4617,7 +4532,7 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
     def run_all_done():
         run_state["running"] = False
         stop_btn.pack_forget()
-        run_all_btn.pack(side="left", before=manifest_btn.cv)
+        run_all_btn.pack(side="left", before=manifest_btn.cv, padx=(18, 0), pady=6)
         status_var.set("")
         for tid in cards:
             if not by_id[tid].unavailable_reason(settings):
@@ -4630,24 +4545,24 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
         status_var.set("Stopping after the current trigger…")
 
     # ---- toolbar ---------------------------------------------------------
-    run_all_btn = _gui_button(bar, "▶   Run all enabled", start_run_all, primary=True, anim=anim)
-    run_all_btn.pack(side="left")
-    stop_btn = _gui_button(bar, "■   Stop", stop_run_all, anim=anim)   # only while running
-    manifest_btn = _gui_button(bar, "☰   Signal manifest",
+    run_all_btn = _gui_button(bar, UI_RUN_ALL, start_run_all, primary=True, anim=anim)
+    run_all_btn.pack(side="left", padx=(18, 0), pady=6)
+    stop_btn = _gui_button(bar, UI_STOP, stop_run_all, anim=anim)   # only while running
+    manifest_btn = _gui_button(bar, UI_MANIFEST,
                                lambda: open_manifest_dialog(root, triggers, settings),
                                anim=anim)
-    manifest_btn.pack(side="left", padx=(8, 0))
-    _gui_button(bar, "🎤   Presenter mode",
+    manifest_btn.pack(side="left", padx=(8, 0), pady=6)
+    _gui_button(bar, UI_PRESENTER,
                 lambda: open_presenter_picker(root, app, triggers, settings, profiles),
-                anim=anim).pack(side="left", padx=(8, 0))
-    _gui_button(bar, "⬇   Save report",
+                anim=anim).pack(side="left", padx=(8, 0), pady=6)
+    _gui_button(bar, UI_REPORT,
                 lambda: open_report_dialog(root, app, triggers, settings),
-                anim=anim).pack(side="left", padx=(8, 0))
-    _gui_button(bar, "⟳   Updates", lambda: open_update_dialog(root),
-                anim=anim).pack(side="right")
+                anim=anim).pack(side="left", padx=(8, 0), pady=6)
+    _gui_button(bar, UI_UPDATES, lambda: open_update_dialog(root),
+                anim=anim).pack(side="right", padx=(0, 18), pady=6)
     status_var = tk.StringVar(value="")
-    tk.Label(bar, textvariable=status_var, fg=GUI_DIM, bg=head_frost,
-             font=(GUI_MONO, 9)).pack(side="left", padx=14)
+    tk.Label(bar, textvariable=status_var, fg=GUI_DIM, bg=GUI_PANEL,
+             font=(GUI_MONO, 9)).pack(side="left", padx=14, pady=6)
 
     # ---- one card --------------------------------------------------------
     def _make_pane(parent, title, tid):
@@ -4697,11 +4612,11 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
         # Every card in a class shares one pane tone, sampled from the light at that
         # depth: the families read as families, and the glass still varies down the
         # window instead of stamping one flat colour 53 times.
-        behind = _hx(*_backdrop_rgb(0.5, fy))
+        behind = GUI_BG
         unavailable = t.unavailable_reason(settings)
         disabled = bool(unavailable)
         gated_live = t.gated_disabled(settings)
-        frost = _frost_at(0.5, fy, lift=0.055 if disabled else 0.145)
+        frost = _sink(GUI_SURFACE, 0.12) if disabled else GUI_SURFACE
         sev = SEV_COLOR.get(t.severity, GUI_FAINT)
 
         frame = tk.Frame(stage, bg=frost)
@@ -4838,9 +4753,9 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
         except Exception:
             return
         tags = ("chrome", card["tag"], card.get("row", "row?"))
-        _glass(stage, x0, top, x1, bottom, card["frost"], card["behind"], radius=15,
-               shadow=4, glow=(card["sev"] if k > 0.02 else None), glow_k=k,
-               stroke=_mix(_lift(card["frost"], 0.20 + 0.26 * k), card["sev"], 0.5 * k),
+        _glass(stage, x0, top, x1, bottom, card["frost"], card["behind"], radius=6,
+               glow=(card["sev"] if k > 0.02 else None), glow_k=k,
+               stroke=_mix(_lift(card["frost"], 0.12 + 0.18 * k), card["sev"], 0.35 * k),
                tags=tags)
         rail = _round_pts(x0 + 4, top + 11, x0 + 7, bottom - 11, 1.5)
         stage.create_polygon(rail, smooth=True, splinesteps=4, outline="", tags=tags,
@@ -4968,10 +4883,10 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
                 text, n = obj
                 tags = ("chrome", tag)
                 head_item = stage.create_text(x0 + 6, y + 16, anchor="w", text=text,
-                                              fill=GUI_ACCENT, font=(GUI_MONO, 9, "bold"),
+                                              fill=GUI_FAINT, font=(GUI_MONO, 8),
                                               tags=tags)
                 item = stage.create_text(x1, y + 16, anchor="e", text=f"{n} triggers",
-                                         fill=GUI_FAINT, font=(GUI_MONO, 9), tags=tags)
+                                         fill=GUI_FAINT, font=(GUI_MONO, 8), tags=tags)
                 try:
                     left = stage.bbox(item)[0] - 12
                     right = stage.bbox(head_item)[2] + 12
@@ -5076,7 +4991,6 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
     def repaint_all():
         resize["job"] = None
         w = _num(root.winfo_width(), 1140)
-        ensure_backdrop(w)                      # width only: the header strip is fixed
         paint_head(w)
         relayout()
 
@@ -5161,7 +5075,7 @@ def open_presenter_picker(root, app, triggers, settings, profiles):
     """Choose what to present: a curated profile, or everything enabled.
 
     Each option states its exact signal count up front, so the presenter commits to a
-    number before the room sees any traffic."""
+    number before the room sees any traffic. This is a setlist, not a wall of cards."""
     existing = getattr(root, "_secv_presenter_picker", None)
     if existing is not None:
         try:
@@ -5173,13 +5087,17 @@ def open_presenter_picker(root, app, triggers, settings, profiles):
             pass
 
     by_id = {t.id: t for t in triggers}
-    dlg = _GlassDialog(root, f"{APP_NAME} — presenter mode", min_width=560, fy=0.35)
+    dlg = _GlassDialog(root, f"{APP_NAME} — presenter", min_width=640, fy=0.35)
     root._secv_presenter_picker = dlg.win
     body = dlg.body
+    frost = dlg.frost
 
-    _label(body, "What are we presenting?", GUI_INK, (GUI_FONT, 15, "bold")).pack(anchor="w")
-    dlg.wrap(_label(body, "Each option runs in its own order and commits to a signal count.",
-                    GUI_DIM, (GUI_FONT, 9)), 0).pack(fill="x", pady=(3, 12))
+    _label(body, "PRESENTER", GUI_FAINT, (GUI_MONO, 8)).pack(anchor="w")
+    _label(body, "What are we presenting?", GUI_INK, (GUI_FONT, 16)).pack(anchor="w",
+                                                                        pady=(4, 0))
+    dlg.wrap(_label(body, "Each option commits to a signal count before anything leaves "
+                          "this host.", GUI_DIM, (GUI_FONT, 10)), 0).pack(fill="x",
+                                                                        pady=(4, 16))
 
     def start(session):
         dlg.destroy()
@@ -5187,22 +5105,66 @@ def open_presenter_picker(root, app, triggers, settings, profiles):
 
     def add_option(label, description, chosen):
         signals = sum(t.on_wire_count(settings) for t in chosen)
-        tile = _Tile(body, pad=13, lift=0.07, glow=(GUI_ACCENT if chosen else None))
-        tile.pack(fill="x", pady=4)
-        head = tk.Frame(tile.body, bg=tile.fill)
-        head.pack(fill="x")
-        _label(head, label, GUI_INK, (GUI_FONT, 11, "bold")).pack(side="left")
-        _label(head, f"{len(chosen)} triggers · {signals} signals", GUI_ACCENT,
-               (GUI_MONO, 9), anchor="e").pack(side="right")
+        enabled = bool(chosen)
+        row = tk.Frame(body, bg=frost, cursor=("hand2" if enabled else "arrow"))
+        row.pack(fill="x", pady=2)
+        left = tk.Frame(row, bg=frost)
+        left.pack(side="left", fill="x", expand=True)
+        _label(left, label, (GUI_INK if enabled else GUI_FAINT),
+               (GUI_FONT, 12)).pack(anchor="w")
         if description:
-            dlg.wrap(_label(tile.body, description, GUI_FAINT, (GUI_FONT, 9)),
-                     60).pack(fill="x", pady=(3, 0))
+            dlg.wrap(_label(left, description, GUI_FAINT, (GUI_FONT, 9)),
+                     140).pack(fill="x", pady=(2, 0))
+        right = tk.Frame(row, bg=frost)
+        right.pack(side="right", padx=(16, 0))
+        _label(right, str(signals) if enabled else "—",
+               (GUI_INK if enabled else GUI_FAINT), (GUI_MONO, 18),
+               anchor="e").pack(anchor="e")
+        _label(right, (f"{len(chosen)} triggers" if enabled else "nothing enabled"),
+               GUI_FAINT, (GUI_MONO, 8), anchor="e").pack(anchor="e")
+        rule = tk.Frame(body, bg=GUI_GRID, height=1)
+        rule.pack(fill="x", pady=(8, 6))
         session = PresenterSession(chosen, settings, label=label, description=description)
-        btn = _gui_button(tile.body, "Present", lambda s=session: start(s), primary=True)
-        btn.pack(anchor="e", pady=(9, 0))
-        if not chosen:
-            btn.configure(state="disabled", text="Nothing enabled")
-        tile.sync()
+        if not enabled:
+            return
+
+        def go(_e=None, s=session):
+            start(s)
+
+        def enter(_e=None):
+            for w in _descendants(row):
+                try:
+                    w.configure(bg=GUI_PANEL)
+                except Exception:
+                    pass
+
+        def leave(_e=None):
+            def settle():
+                try:
+                    px, py = dlg.win.winfo_pointerxy()
+                    fx, fy = row.winfo_rootx(), row.winfo_rooty()
+                    inside = (fx <= px < fx + _num(row.winfo_width(), 0)
+                              and fy <= py < fy + _num(row.winfo_height(), 0))
+                except Exception:
+                    inside = False
+                if not inside:
+                    for w in _descendants(row):
+                        try:
+                            w.configure(bg=frost)
+                        except Exception:
+                            pass
+            try:
+                dlg.win.after(40, settle)
+            except Exception:
+                pass
+
+        for w in _descendants(row):
+            try:
+                w.bind("<Button-1>", go, add="+")
+                w.bind("<Enter>", enter, add="+")
+                w.bind("<Leave>", leave, add="+")
+            except Exception:
+                pass
 
     for profile in (profiles or {}).values():
         chosen = [t for t in profile.triggers(by_id) if not t.gated_disabled(settings)]
@@ -5210,12 +5172,12 @@ def open_presenter_picker(root, app, triggers, settings, profiles):
     add_option("All enabled triggers", "The full catalog, in catalog order.",
                [t for t in triggers if not t.gated_disabled(settings)])
 
-    _gui_button(body, "Cancel", dlg.destroy).pack(anchor="e", pady=(13, 0))
+    _gui_button(body, "Cancel", dlg.destroy).pack(anchor="e", pady=(8, 0))
     dlg.show()
 
 
 def open_presenter_window(root, app, session, settings):
-    """Big-type, one-trigger-at-a-time presentation with a live scoreboard.
+    """Wall-readable, one-trigger-at-a-time stage with a live scoreboard.
 
     The scoreboard tallies what THIS HOST observed and says so — it is never a claim
     about what the customer's stack did. The presenter still reads the verdict on the
@@ -5231,7 +5193,7 @@ def open_presenter_window(root, app, session, settings):
         except tk.TclError:
             pass
 
-    dlg = _GlassDialog(root, f"{APP_NAME} — presenter", min_width=900, resizable=True, fy=0.5)
+    dlg = _GlassDialog(root, f"{APP_NAME} — presenter", min_width=960, resizable=True, fy=0.5)
     win = dlg.win
     root._secv_presenter = win
     anim = _Anim(win)
@@ -5241,13 +5203,25 @@ def open_presenter_window(root, app, session, settings):
 
     head = tk.Frame(body, bg=frost)
     head.pack(fill="x")
-    _label(head, session.label, GUI_ACCENT, (GUI_FONT, 12, "bold")).pack(side="left")
-    progress_var = tk.StringVar(value="")
-    tk.Label(head, textvariable=progress_var, fg=GUI_DIM, bg=frost,
-             font=(GUI_MONO, 10), anchor="e").pack(side="right")
+    ident = tk.Frame(head, bg=frost)
+    ident.pack(side="left", fill="x", expand=True)
+    _label(ident, "PRESENTER  ·  " + session.label.upper(), GUI_FAINT,
+           (GUI_MONO, 8)).pack(anchor="w")
+    title_var = tk.StringVar(value="")
+    dlg.wrap(tk.Label(ident, textvariable=title_var, fg=GUI_INK, bg=frost,
+                      font=(GUI_FONT, 20), anchor="w", justify="left"),
+             220).pack(fill="x", pady=(4, 0))
+    count = tk.Frame(head, bg=frost)
+    count.pack(side="right", padx=(16, 0))
+    step_var = tk.StringVar(value="")
+    tk.Label(count, textvariable=step_var, fg=GUI_INK, bg=frost,
+             font=(GUI_MONO, 18), anchor="e").pack(anchor="e")
+    plan_var = tk.StringVar(value="")
+    tk.Label(count, textvariable=plan_var, fg=GUI_FAINT, bg=frost,
+             font=(GUI_MONO, 8), anchor="e").pack(anchor="e")
 
-    track = tk.Canvas(body, bg=frost, highlightthickness=0, bd=0, height=4)
-    track.pack(fill="x", pady=(9, 0))
+    track = tk.Canvas(body, bg=frost, highlightthickness=0, bd=0, height=2)
+    track.pack(fill="x", pady=(12, 0))
 
     def paint_track():
         try:
@@ -5258,58 +5232,83 @@ def open_presenter_window(root, app, session, settings):
         if w < 20:
             return
         pos, total = session.progress()
-        track.create_polygon(_round_pts(0, 0, w, 4, 2), smooth=True, splinesteps=4,
-                             fill=_lift(frost, 0.09), outline="")
+        track.create_rectangle(0, 0, w, 2, fill=GUI_GRID, outline="")
         if total:
-            done = max(6.0, w * (pos / float(total)))
-            track.create_polygon(_round_pts(0, 0, done, 4, 2), smooth=True, splinesteps=4,
-                                 fill=GUI_ACCENT, outline="")
+            done = max(4.0, w * (pos / float(total)))
+            track.create_rectangle(0, 0, done, 2, fill=GUI_ACCENT, outline="")
     track.bind("<Configure>", lambda e: paint_track())
 
-    tile = _Tile(body, pad=20, lift=0.07)
-    tile.pack(fill="x", pady=(13, 0))
-    card = tile.body
-
-    title_var = tk.StringVar(value="")
-    dlg.wrap(tk.Label(card, textvariable=title_var, fg=GUI_INK, bg=tile.fill,
-                      font=(GUI_FONT, 21, "bold"), anchor="w", justify="left"),
-             90).pack(fill="x")
     expect_var = tk.StringVar(value="")
-    dlg.wrap(tk.Label(card, textvariable=expect_var, fg=GUI_GOLD, bg=tile.fill,
-                      font=(GUI_MONO, 11), anchor="w", justify="left"), 90).pack(fill="x", pady=(9, 0))
+    dlg.wrap(tk.Label(body, textvariable=expect_var, fg=GUI_GOLD, bg=frost,
+                      font=(GUI_MONO, 11), anchor="w", justify="left"),
+             40).pack(fill="x", pady=(16, 0))
     talk_var = tk.StringVar(value="")
-    dlg.wrap(tk.Label(card, textvariable=talk_var, fg=GUI_DIM, bg=tile.fill,
-                      font=(GUI_FONT, 12), anchor="w", justify="left"), 90).pack(fill="x", pady=(10, 0))
+    dlg.wrap(tk.Label(body, textvariable=talk_var, fg=GUI_INK, bg=frost,
+                      font=(GUI_FONT, 14), anchor="w", justify="left"),
+             40).pack(fill="x", pady=(8, 0))
     hint_var = tk.StringVar(value="")
-    dlg.wrap(tk.Label(card, textvariable=hint_var, fg=GUI_INFO, bg=tile.fill,
-                      font=(GUI_FONT, 10), anchor="w", justify="left"), 90).pack(fill="x", pady=(8, 0))
+    dlg.wrap(tk.Label(body, textvariable=hint_var, fg=GUI_DIM, bg=frost,
+                      font=(GUI_FONT, 10), anchor="w", justify="left"),
+             40).pack(fill="x", pady=(8, 0))
 
-    # The stage: the same emission lane the cards use, at wall size.
-    lane = _Lane(card, anim, width=760, height=74, behind=tile.fill)
-    lane.cv.pack(fill="x", pady=(16, 2))
+    lane = _Lane(body, anim, width=820, height=84, behind=frost)
+    lane.cv.pack(fill="x", pady=(18, 2))
 
     result_var = tk.StringVar(value="")
-    result_lbl = tk.Label(card, textvariable=result_var, fg=GUI_INK, bg=tile.fill,
-                          font=(GUI_FONT, 25, "bold"), anchor="w")
-    result_lbl.pack(fill="x", pady=(10, 0))
+    result_lbl = tk.Label(body, textvariable=result_var, fg=GUI_INK, bg=frost,
+                          font=(GUI_FONT, 22), anchor="w")
+    result_lbl.pack(fill="x", pady=(12, 0))
     reason_var = tk.StringVar(value="")
-    dlg.wrap(tk.Label(card, textvariable=reason_var, fg=GUI_DIM, bg=tile.fill,
-                      font=(GUI_FONT, 10), anchor="w", justify="left"), 90).pack(fill="x", pady=(4, 0))
+    dlg.wrap(tk.Label(body, textvariable=reason_var, fg=GUI_DIM, bg=frost,
+                      font=(GUI_FONT, 10), anchor="w", justify="left"),
+             40).pack(fill="x", pady=(4, 0))
 
-    board_var = tk.StringVar(value="")
-    tk.Label(body, textvariable=board_var, fg=GUI_INK, bg=frost, font=(GUI_MONO, 12),
-             anchor="w", justify="left").pack(fill="x", pady=(14, 0))
-    _label(body, "Observed locally by this host — the inline stack's console is "
-                 "authoritative.", GUI_FAINT, (GUI_FONT, 9)).pack(anchor="w", pady=(2, 0))
+    tk.Frame(body, bg=GUI_GRID, height=1).pack(fill="x", pady=(16, 10))
+    board = tk.Frame(body, bg=frost)
+    board.pack(fill="x")
 
     bar = tk.Frame(body, bg=frost)
-    bar.pack(fill="x", pady=(14, 0))
+    bar.pack(fill="x", pady=(16, 0))
+
+    def paint_scoreboard():
+        for child in list(board.winfo_children()):
+            try:
+                child.destroy()
+            except Exception:
+                pass
+        data = session.scoreboard()
+        _label(board, "Observed locally", GUI_FAINT, (GUI_MONO, 8)).pack(anchor="w")
+        row = tk.Frame(board, bg=frost)
+        row.pack(fill="x", pady=(4, 0))
+        if not data["states"]:
+            _label(row, "Nothing fired yet", GUI_FAINT, (GUI_MONO, 10)).pack(side="left")
+        else:
+            for st in (BLOCKED, ALLOWED, RATIO, ERROR, INVALID):
+                n = data["states"].get(st)
+                if not n:
+                    continue
+                colour = STATE_COLOR.get(st, GUI_DIM)
+                bead = tk.Canvas(row, width=8, height=8, bg=frost, highlightthickness=0,
+                                 bd=0, takefocus=0)
+                bead.create_oval(1, 1, 7, 7, fill=colour, outline="")
+                bead.pack(side="left")
+                _label(row, f"{n} {st}", colour, (GUI_MONO, 11)).pack(side="left",
+                                                                     padx=(5, 14))
+        for cls, slot in data["classes"].items():
+            if not slot["fired"]:
+                continue
+            detail = "  ".join(f"{n} {s}" for s, n in sorted(slot["states"].items()))
+            _label(board, f"{slot['label']}    {slot['fired']}/{slot['total']}    {detail}",
+                   GUI_DIM, (GUI_MONO, 9)).pack(anchor="w", pady=(5, 0))
+        _label(board, "This host's read — the inline stack's console is authoritative.",
+               GUI_FAINT, (GUI_FONT, 9)).pack(anchor="w", pady=(6, 0))
 
     def render():
         pos, total = session.progress()
-        progress_var.set(f"{pos} / {total}   ·   {session.summary_line()}")
-        board_var.set(_presenter_board(session))
+        step_var.set(f"{pos} / {total}" if total else "0 / 0")
+        plan_var.set(f"{session.planned_signals()} signals committed")
         paint_track()
+        paint_scoreboard()
         trigger = session.current
         if trigger is None:
             title_var.set("Done.")
@@ -5317,12 +5316,12 @@ def open_presenter_window(root, app, session, settings):
                 var.set("")
             lane.clear()
             fire_btn.configure(state="disabled", text="Finished")
-            tile.sync()
             return
         title_var.set(trigger.label)
-        expect_var.set(f"Expect: {trigger.expected_fire}" if trigger.expected_fire else "")
+        expect_var.set(("Expect    " + trigger.expected_fire) if trigger.expected_fire else "")
         talk_var.set(trigger.talking_point)
-        hint_var.set("↳ " + trigger.console_hint_text() if trigger.console_hint_text() else "")
+        hint = trigger.console_hint_text()
+        hint_var.set(("Look     " + hint) if hint else "")
         seen = session.results.get(trigger.id)
         if seen != state["shown"]:
             state["shown"] = seen
@@ -5338,7 +5337,6 @@ def open_presenter_window(root, app, session, settings):
         fire_btn.configure(state=("disabled" if state["busy"] else "normal"),
                            text=("Firing…" if state["busy"]
                                  else f"Fire  ({wire} signal" + ("" if wire == 1 else "s") + ")"))
-        tile.sync()
 
     def _reveal_result(seen):
         """Let the verdict arrive rather than blink into existence — the word lights up
@@ -5348,7 +5346,7 @@ def open_presenter_window(root, app, session, settings):
         def frame(dt, _elapsed):
             state["reveal"] = min(1.0, state["reveal"] + dt * 3.6)
             try:
-                result_lbl.configure(fg=_mix(tile.fill, colour, _ease(state["reveal"])))
+                result_lbl.configure(fg=_mix(frost, colour, _ease(state["reveal"])))
             except Exception:
                 return False
             return state["reveal"] < 1.0
@@ -5400,14 +5398,24 @@ def open_presenter_window(root, app, session, settings):
         lane.clear()
         render()
 
-    _gui_button(bar, "◀   Back", lambda: step(-1), anim=anim).pack(side="left")
+    def on_lane_size(_e=None):
+        w = _num(lane.cv.winfo_width(), 0)
+        if w > 80:
+            lane.resize(w)
+
+    try:
+        lane.cv.bind("<Configure>", on_lane_size)
+    except Exception:
+        pass
+
+    _gui_button(bar, "Back", lambda: step(-1), anim=anim).pack(side="left")
     fire_btn = _gui_button(bar, "Fire", fire, primary=True, anim=anim)
     fire_btn.pack(side="left", padx=9)
-    _gui_button(bar, "Next   ▶", lambda: step(1), anim=anim).pack(side="left")
+    _gui_button(bar, "Next", lambda: step(1), anim=anim).pack(side="left")
     _gui_button(bar, "Close", dlg.destroy, anim=anim).pack(side="right")
 
     render()
-    dlg.show(height=560)
+    dlg.show(height=620)
     poll()
 
 

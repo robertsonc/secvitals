@@ -10,7 +10,7 @@ demo. It fires the traffic and reports what it saw **locally** — `allowed`,
 `blocked`, or `error` — and never pretends to be the authority. The customer
 reads the real verdict on their own management console, already on screen.
 
-Everything in this document is grounded in the code as of version **0.8.2**
+Everything in this document is grounded in the code as of version **0.9.0**
 (`secvitals.py`, `config/catalog.yaml`, `config/settings.yaml`). It is organized
 in three parts:
 
@@ -381,7 +381,7 @@ Five ship in `settings.yaml`: `exec-5min` (6 signals), `ids-story` (21),
 **selects** existing catalog ids — it never defines a command — and every id is
 validated at startup, so a typo fails at launch rather than on stage.
 
-In the window, **🎤 Presenter mode** walks one trigger at a time in large type:
+In the window, **Presenter** walks one trigger at a time in large type:
 expected SID, talking point, where to look on the customer's console, then the
 observed state and a running scoreboard by state and class. The scoreboard counts
 what **this host observed**; it is never a claim about the customer's stack.
@@ -393,7 +393,7 @@ py secvitals.py --run all --export demo.html   # HTML leave-behind (.json / .csv
 py secvitals.py --last-session                 # re-read the last run, fire nothing
 ```
 
-…or click **⬇ Save report**. Every run is recorded in a **hash‑chained ledger**
+…or click **Save report**. Every run is recorded in a **hash‑chained ledger**
 stamped with SHA‑256 digests of the code and catalog that produced it, so a report
 can be shown not to have been quietly edited after the fact.
 

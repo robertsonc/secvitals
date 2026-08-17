@@ -69,14 +69,15 @@ and the profile's signal count reflects that.
 
 ## Presenter mode
 
-Click **🎤 Presenter mode**, pick a profile (or "All enabled triggers"), and present:
+Click **Presenter**, pick a profile (or "All enabled triggers") from the setlist, and present:
 
-- the trigger label in 22pt, the **expected SID** beneath it, then the talking point;
-- the **console hint** — where to look on the customer's stack for this class of signal;
-- after firing, the observed state in 26pt, colour-coded, with the reason underneath;
-- a persistent **scoreboard**: overall tally plus a per-class breakdown, and
-  `n/total triggers · n/total signals` in the header;
-- **◀ Back / Fire / Next ▶** so the presenter controls the pace, not a timer.
+- the trigger label in 20pt, the **expected SID** beneath it, then the talking point;
+- **Look** — where to look on the customer's stack for this class of signal;
+- the emission lane named host · gate · internet, at wall size;
+- after firing, the observed state in 22pt, colour-coded, with the reason underneath;
+- a persistent **scoreboard** of beads by state plus a per-class breakdown, and
+  `n / total` plus the committed signal count in the header;
+- **Back / Fire / Next** so the presenter controls the pace, not a timer.
 
 The picker states each option's trigger and signal count **before** anything runs, so the
 presenter commits to a number in front of the room.

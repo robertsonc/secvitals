@@ -40,10 +40,9 @@ for development.)
 
 ### What you see
 
-The window is a single lit workspace with frosted panels floating on it — trigger cards,
-the presenter stage, every dialog — all drawn rather than assembled from platform
-widgets, so the console looks the same on any Windows theme and needs no toolkit beyond
-tcl/tk.
+The window is a precision instrument bench — lacquer surfaces, one green filament,
+hairline rules — drawn rather than assembled from platform widgets, so the console
+looks the same on any Windows theme and needs no toolkit beyond tcl/tk.
 
 Each trigger carries an **emission lane**: the host on the left, the inline stack's
 inspection gate two-thirds along, the internet on the right. Firing streams **one dot per
@@ -105,7 +104,7 @@ Five ship in `config/settings.yaml` (`exec-5min`, `ids-story`, `swg-story`,
 it never defines a command — and every id is validated at startup, so a typo fails at
 launch rather than on stage.
 
-In the window, **🎤 Presenter mode** walks one trigger at a time in large type: expected
+In the window, **Presenter** walks one trigger at a time in large type: expected
 SID, talking point, where to look on the customer's console, then the observed state and
 a running scoreboard by state and class. See
 [docs/milestones/M2-presenter-experience.md](docs/milestones/M2-presenter-experience.md).
@@ -117,7 +116,7 @@ py secvitals.py --run all --export demo.html   # HTML leave-behind (.json / .csv
 py secvitals.py --last-session                 # re-read the last run, fire nothing
 ```
 
-Or click **⬇ Save report** in the window. Every run is recorded in a **hash-chained
+Or click **Save report** in the window. Every run is recorded in a **hash-chained
 ledger** stamped with digests of the code and catalog that produced it, so a report can
 be shown not to have been quietly edited. The report keeps three columns strictly
 separate — what the catalog **expected** to fire, what this host **observed**, and what
@@ -242,7 +241,7 @@ natively, no Windows required.
 
 Reuses from the `netvitals` app: the **form factor** — a self-contained Tkinter window
 carrying the same identity marks (the lock-and-EKG logo, HPE green, a dark surface), now
-rendered as the spatial console described above — the **installer UI**
+rendered as the instrument bench described above — the **installer UI**
 (the WinForms setup experience: Windows Python + Tkinter, a `pythonw` shortcut, Add/Remove
 Programs), and the **self-update mechanism** (ported and hardened — netvitals' updater had
 no authenticity check). Everything else is new. The original demo scripts and cheatsheets

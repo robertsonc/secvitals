@@ -69,7 +69,7 @@ and the profile's signal count reflects that.
 
 ## Presenter mode
 
-Click **🎤 Presenter mode**, pick a profile (or "All enabled triggers"), and present:
+Click **Presenter**, pick a profile (or "All enabled triggers"), and present:
 
 - the trigger label in 22pt, the **expected SID** beneath it, then the talking point;
 - the **console hint** — where to look on the customer's stack for this class of signal;

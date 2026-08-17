@@ -30,7 +30,7 @@ listening socket, and there is no telemetry of any kind.
 
 ### In the window
 
-- **⬇ Save report** writes `.html`, `.json`, and `.csv` into the evidence directory and
+- **Save report** writes `.html`, `.json`, and `.csv` into the evidence directory and
   tells you exactly where they went. It never opens a browser or uploads anything —
   what happens to the file is the presenter's decision.
 - Each fired card grows a **Console:** button that cycles

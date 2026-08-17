@@ -13,6 +13,33 @@ an observed fact about the source material or a recorded build decision.
 
 ## 0. Revisions (newest first)
 
+### 0d. Instrument bench (supersedes §0c's spatial glass console)
+
+**Date:** 2026-08-17.
+
+The ask: review the UI through Impeccable Design and re-imagine it as a world-class
+security testing tool. The 0.8.x aurora-glass surface had every AI-slop tell at once
+— a teal/violet light field, nested frost cards, pill buttons, emoji chrome, and a
+different colour on every chip. A tool that fires attributable security signals
+should look like a bench, not a dashboard wallpaper.
+
+**Decision:** keep the identity marks that mean something (lock-and-EKG, HPE green
+`#01A982` as the `blocked` / primary-action filament) and replace the surface
+underneath. See `PRODUCT.md` and `DESIGN.md`.
+
+- **Lacquer, not aurora.** The floor is a green-black tinted neutral. No coloured
+  light-field, no PhotoImage backdrop, no drop shadow, no outer glow.
+- **One accent.** Green is brand and enforcement. Allowed is steel. Error is vermilion.
+  Colour names a verdict; it does not decorate.
+- **Hairline geometry.** Radius 4–6px. Elevation is a one-step tint plus a rule.
+- **Words, not emoji.** `Run all enabled`, `Presenter`, `Save report`.
+- **Tracked type.** Source Sans 3 / Bahnschrift + JetBrains Mono / Cascadia Mono,
+  rebound to whatever the host actually has.
+
+Non-negotiables are untouched: no network surface, no shell, fixed catalog, three-state
+classifier, live-suspect gate, signed fail-closed update. The emission lane still
+animates only what the console observed.
+
 ### 0c. Spatial glass console (supersedes §2b's "same palette constants as netvitals")
 
 **Date:** 2026-08-13.

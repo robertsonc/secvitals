@@ -3025,7 +3025,6 @@ CONFIRM_CYCLE_FG = {CONFIRMED_UNSET: GUI_INK, CONFIRMED_YES: GUI_ACCENT, CONFIRM
 # allowed-vs-blocked; the console's own read of the run still shows up in the expanded
 # row and in the details. Colour is used only to flag a run that did NOT fire (error /
 # gated off), because that is an environment problem the presenter needs to see at a glance.
-STATE_FG = {ERROR: GUI_CRIT, INVALID: GUI_GOLD}
 CLASS_LABEL = {
     "ns-ids":   "North–south  ·  IDS / IPS",
     "ns-webcc": "North–south  ·  Web categories & reputation",
@@ -3908,6 +3907,10 @@ class _GlassDialog:
             self.win.protocol("WM_DELETE_WINDOW", self.destroy)
         except Exception:
             pass
+        try:                                     # Escape = the close button
+            self.win.bind("<Escape>", lambda _e: self.destroy())
+        except Exception:
+            pass
 
     def wrap(self, widget, slack=0):
         """Register a label whose wraplength should follow the pane width."""
@@ -4150,7 +4153,7 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
     by_id = {t.id: t for t in triggers}
     cards = {}                                  # trigger id -> widget/var bundle
     pane_owner = {}                             # widget path -> the card it belongs to
-    run_state = {"running": False, "stop": False}
+    run_state = {"running": False, "stop": False, "hint": True}
     observed = {}                               # state -> count, this session
     ui_queue = queue.Queue()                    # background run threads -> main thread ONLY
 
@@ -4482,17 +4485,25 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
         if not c:
             return
         state = out.get("state", ERROR)
+        if run_state["hint"]:                    # the first real result retires the hint
+            run_state["hint"] = False
+            status_var.set("")
         c["runs"] += 1
         observed[state] = observed.get(state, 0) + 1
         paint_tally()
         ratio = out.get("ratio") or {}
-        c["lane"].resolve(state, passes=ratio.get("reached"),
-                          label=(f"{ratio['blocked']}/{ratio['total']} blocked"
-                                 if ratio else state))
+        verdict = (f"{ratio['blocked']}/{ratio['total']} blocked" if ratio else state)
+        c["lane"].resolve(state, passes=ratio.get("reached"), label=verdict)
         pulse.blip(STATE_COLOR.get(state, GUI_ACCENT), 1.0)
         runs = f"{c['runs']} run" + ("" if c["runs"] == 1 else "s")
-        _set_status(tid, f"last run {time.strftime('%H:%M:%S')}  ·  {runs}",
-                    STATE_FG.get(state, GUI_DIM))
+        # The verdict leads and carries its state colour: a run of green "blocked"
+        # down the right edge is readable from the back of the room, which the old
+        # grey "last run HH:MM:SS" never was.
+        _set_status(tid, f"{verdict}  ·  {time.strftime('%H:%M:%S')}  ·  {runs}",
+                    STATE_COLOR.get(state, GUI_DIM))
+        if not c["acted"]:
+            c["acted"] = True
+            c["actions"].pack(fill="x", pady=(12, 0))
         c["reason"].configure(text=out.get("reason", ""))
         c["reason"].pack(anchor="w", fill="x", pady=(8, 0))
         kv = []
@@ -4608,7 +4619,8 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
                 anim=anim).pack(side="left", padx=(8, 0), pady=6)
     _gui_button(bar, UI_UPDATES, lambda: open_update_dialog(root),
                 anim=anim).pack(side="right", padx=(0, 18), pady=6)
-    status_var = tk.StringVar(value="")
+    status_var = tk.StringVar(
+        value="Click a row for context  ·  Fire sends its signals")
     tk.Label(bar, textvariable=status_var, fg=GUI_DIM, bg=GUI_PANEL,
              font=(GUI_MONO, 9)).pack(side="left", padx=14, pady=6)
 
@@ -4732,8 +4744,9 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
             lbl.pack(fill="x", pady=(5, 0))
             wraps.append(lbl)
 
+        # Not packed until the first result: Fire lives on the row, and copy/confirm
+        # only exist after a run — until then this frame is a blank 12px strip.
         actions = tk.Frame(body_l2, bg=frost)
-        actions.pack(fill="x", pady=(12, 0))
         copy_btn = _gui_button(actions, "Copy verification key",
                                lambda tid=t.id: copy_text(cards[tid].get("verify_key"), tid),
                                anim=anim)
@@ -4783,6 +4796,7 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
         cards[t.id] = {"status": status, "reason": reason, "kv": kv, "fire": fire_btn,
                        "copy": copy_btn, "confirm": confirm_btn, "set_pane": set_pane,
                        "runs": 0, "verify_key": "", "seq": None, "lane": lane,
+                       "actions": actions, "acted": False,
                        "confirmed": CONFIRMED_UNSET, "frame": frame, "win": win,
                        "frost": frost, "behind": behind, "sev": sev, "wraps": wraps,
                        "disabled": disabled, "y": 0, "h": 0, "tag": "pane-" + t.id,

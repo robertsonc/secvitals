@@ -50,9 +50,9 @@ Tinted neutrals. One accent. Four state inks, used only on the state they name.
 | `GUI_FAINT` | `#6b7a72` | Meta, idle status |
 | `GUI_ACCENT` | `#01A982` | Brand, primary CTA, **blocked** |
 | `GUI_INFO` | `#7eb8c9` | **allowed** — steel, not electric cyan |
-| `GUI_WARN` | `#d4923a` | **ratio** / live-suspect caution |
-| `GUI_CRIT` | `#d45a4c` | **error** |
-| `GUI_GOLD` | `#c9a84a` | **invalid** / not configured |
+| `GUI_WARN` | `#f2a13c` | **ratio** / live-suspect caution |
+| `GUI_CRIT` | `#f0614f` | **error** |
+| `GUI_GOLD` | `#e9c358` | **invalid** / not configured |
 
 `blocked` is green on purpose: enforcement working is the success state of
 this product, not a generic "go". Do not recolour it red.
@@ -87,8 +87,9 @@ the fill; no halo.
 fill one step. Keyboard focus is a second inner hairline, not a colour ring
 that fights the accent.
 
-**Trigger row.** One surface, left severity rail (2px), title, emission lane,
-status. Expand in place for talking point, Fire, and the three detail wells.
+**Trigger row.** One surface, left severity rail (2px), title, Fire, emission
+lane, status. The primary action lives on the always-visible row; expand in
+place for the talking point and the three detail wells.
 Hover brightens the hairline — it does not throw a coloured glow.
 
 **Emission lane.** Host → gate → internet. One dot per on-wire signal. Hold

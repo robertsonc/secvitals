@@ -2114,13 +2114,13 @@ code,.mono { font-family:'JetBrains Mono','Cascadia Mono',Consolas,ui-monospace,
          font-family:'JetBrains Mono',Consolas,monospace; border:1px solid; }
 .st-allowed { color:#7eb8c9; border-color:#7eb8c9; }
 .st-blocked { color:#01A982; border-color:#01A982; }
-.st-error   { color:#d45a4c; border-color:#d45a4c; }
-.st-invalid { color:#c9a84a; border-color:#c9a84a; }
-.st-ratio   { color:#d4923a; border-color:#d4923a; }
+.st-error   { color:#f0614f; border-color:#f0614f; }
+.st-invalid { color:#e9c358; border-color:#e9c358; }
+.st-ratio   { color:#f2a13c; border-color:#f2a13c; }
 .card { background:#151c19; border:1px solid #2a3530; border-radius:6px; padding:14px 18px;
         margin-bottom:10px; }
 .kv { display:flex; flex-wrap:wrap; gap:24px; font-size:12px; color:#8a9a91; }
-.gap { color:#c9a84a; } .ok { color:#01A982; } .bad { color:#d45a4c; }
+.gap { color:#e9c358; } .ok { color:#01A982; } .bad { color:#f0614f; }
 .note { color:#6b7a72; font-size:12px; margin-top:6px; }
 .wrap { overflow-x:auto; }
 """
@@ -2997,9 +2997,9 @@ GUI_ACCENT = "#01A982"        # brand + blocked — the money shot
 GUI_ACCENT_DK = "#017a5e"
 GUI_ACCENT_LT = "#3ee6b4"
 GUI_INFO = "#7eb8c9"          # allowed — steel, not electric cyan
-GUI_WARN = "#d4923a"          # ratio / live-suspect caution
-GUI_CRIT = "#d45a4c"          # error
-GUI_GOLD = "#c9a84a"          # invalid / not configured
+GUI_WARN = "#f2a13c"          # ratio / live-suspect caution
+GUI_CRIT = "#f0614f"          # error
+GUI_GOLD = "#e9c358"          # invalid / not configured
 GUI_ON_ACCENT = "#04140f"     # ink on a filled primary control
 GUI_FONT = "Source Sans 3"    # rebound to an installed face in run_gui
 GUI_MONO = "JetBrains Mono"
@@ -3460,8 +3460,8 @@ def _chip_row(parent, items, font=None, pad=7, gap=6, height=19):
         w = tw + pad * 2
         cv.create_polygon(_round_pts(x, 1, x + w, height - 1, 3),
                           smooth=True, splinesteps=6,
-                          fill=_mix(behind, colour, 0.10), outline=_mix(behind, colour, 0.40))
-        cv.create_text(x + w / 2.0, height / 2.0, text=text, fill=_lift(colour, 0.18),
+                          fill=_mix(behind, colour, 0.16), outline=_mix(behind, colour, 0.58))
+        cv.create_text(x + w / 2.0, height / 2.0, text=text, fill=_lift(colour, 0.30),
                        font=font)
         x += w + gap
     try:
@@ -4264,7 +4264,7 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
             colour = STATE_COLOR.get(state, GUI_DIM)
             head.create_oval(cx, 45, cx + 6, 51, fill=colour,
                              outline="", tags="tally")
-            item = head.create_text(cx + 10, 48, anchor="w", fill=_lift(colour, 0.2),
+            item = head.create_text(cx + 10, 48, anchor="w", fill=_lift(colour, 0.35),
                                     font=(GUI_MONO, 8), text=f"{n} {state}", tags="tally")
             try:
                 box = head.bbox(item)
@@ -4282,7 +4282,31 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
     stage = tk.Canvas(root, bg=GUI_BG, highlightthickness=0, bd=0)
     stage.pack(fill="both", expand=True)
     scroll_state = {"first": 0.0, "last": 1.0, "drag": None, "settling": False,
-                    "job": None}
+                    "job": None, "sbar": None}
+
+    def cull_cards():
+        """Unmap the card frames far outside the viewport. Tk repositions every embedded
+        window through X on every scroll tick, on-screen or not — 53 windows moved to
+        show the 8 the viewport holds. A hidden window item is skipped entirely, so the
+        scroll only pays for what is visible. The ±300px margin keeps a flick from
+        outrunning the remap and revealing blank panes before the settle."""
+        try:
+            top = stage.canvasy(0)
+            vh = _num(stage.winfo_height(), 0)
+        except Exception:
+            return
+        if not vh:
+            return
+        lo, hi = top - 300, top + vh + 300
+        for card in cards.values():
+            show = bool(card["h"]) and card["y"] + card["h"] >= lo and card["y"] <= hi
+            if show != card.get("mapped", True):
+                card["mapped"] = show
+                try:
+                    stage.itemconfigure(card["win"],
+                                        state="normal" if show else "hidden")
+                except Exception:
+                    pass
 
     def on_scrolled():
         """Runs on every scroll tick, so it does the least it possibly can: the field is
@@ -4292,6 +4316,7 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
         It also puts hover to sleep for the duration. Scrolling drags whole cards under a
         stationary pointer, so Tk fires Enter/Leave for each one — without this, a flick
         of the wheel repaints a dozen panes for a pointer that never moved."""
+        cull_cards()
         try:
             paint_scrollbar(stage.canvasy(0))
         except Exception:
@@ -4327,27 +4352,46 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
             widget = getattr(widget, "master", None)
 
     def paint_scrollbar(top=None):
+        """Reposition the two scrollbar polygons. They are created once and moved with
+        coords() — delete/create of smoothed polygons on every tick was measurable, and
+        a moved item is not."""
         try:
-            stage.delete("sbar")
             w = _num(stage.winfo_width(), 0)
             vh = _num(stage.winfo_height(), 0)
             top = stage.canvasy(0) if top is None else top
         except Exception:
             return
-        if not w or not vh:
-            return
         first, last = scroll_state["first"], scroll_state["last"]
-        if last - first >= 0.999:
+        if not w or not vh or last - first >= 0.999:
+            if scroll_state["sbar"]:
+                try:
+                    stage.delete("sbar")
+                except Exception:
+                    pass
+                scroll_state["sbar"] = None
             return
         x = w - 11
         y0, y1 = top + 8, top + vh - 8
         span = y1 - y0
-        stage.create_polygon(_round_pts(x, y0, x + 5, y1, 2.5), smooth=True, splinesteps=6,
-                             fill=_lift(GUI_BG, 0.09), outline="", tags="sbar")
         ty0 = y0 + span * first
         ty1 = max(ty0 + 26, y0 + span * last)
-        stage.create_polygon(_round_pts(x, ty0, x + 5, ty1, 2.5), smooth=True, splinesteps=6,
-                             fill=_mix(GUI_BG, GUI_ACCENT, 0.42), outline="", tags="sbar")
+        track = _round_pts(x, y0, x + 5, y1, 2.5)
+        thumb = _round_pts(x, ty0, x + 5, ty1, 2.5)
+        try:
+            if scroll_state["sbar"]:
+                stage.coords(scroll_state["sbar"][0], *track)
+                stage.coords(scroll_state["sbar"][1], *thumb)
+            else:
+                scroll_state["sbar"] = (
+                    stage.create_polygon(track, smooth=True, splinesteps=6,
+                                         fill=_lift(GUI_BG, 0.09), outline="",
+                                         tags="sbar"),
+                    stage.create_polygon(thumb, smooth=True, splinesteps=6,
+                                         fill=_mix(GUI_BG, GUI_ACCENT, 0.42), outline="",
+                                         tags="sbar"))
+            stage.tag_raise("sbar")              # relayout draws chrome above it
+        except Exception:
+            scroll_state["sbar"] = None
 
     def on_yview(first, last):
         scroll_state["first"], scroll_state["last"] = float(first), float(last)
@@ -4358,22 +4402,26 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
     except Exception:
         pass
 
-    def wheel(event, delta):
+    def wheel(event, delta, what="units"):
         # bind_all reaches every widget in the application, dialogs included, so the
         # console's own list only scrolls when the pointer is actually over the console.
         try:
             if event is not None and event.widget.winfo_toplevel() is not root:
                 return
-            stage.yview_scroll(delta, "units")
+            stage.yview_scroll(delta, what)
         except Exception:
             pass
 
+    try:
+        stage.configure(yscrollincrement=8)      # a "unit" is 8px, not 10% of the window
+    except Exception:
+        pass
     stage.bind_all("<MouseWheel>",
-                   lambda e: wheel(e, int(-1 * (e.delta / 120)) if e.delta else 0))
-    stage.bind_all("<Button-4>", lambda e: wheel(e, -3))
-    stage.bind_all("<Button-5>", lambda e: wheel(e, 3))
-    stage.bind_all("<Prior>", lambda e: wheel(e, -12))
-    stage.bind_all("<Next>", lambda e: wheel(e, 12))
+                   lambda e: wheel(e, int(-12 * (e.delta / 120)) if e.delta else 0))
+    stage.bind_all("<Button-4>", lambda e: wheel(e, -12))
+    stage.bind_all("<Button-5>", lambda e: wheel(e, 12))
+    stage.bind_all("<Prior>", lambda e: wheel(e, -1, "pages"))
+    stage.bind_all("<Next>", lambda e: wheel(e, 1, "pages"))
 
     def sbar_press(event):
         w = _num(stage.winfo_width(), 0)
@@ -4647,6 +4695,14 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
                      on_emit=lambda: pulse.blip(GUI_ACCENT_LT, 0.85))
         if not disabled:
             lane.cv.pack(side="right", padx=(14, 0))
+        # The primary action sits on the always-visible row — a card should never need
+        # expanding just to be fired. The expand click is bound to the text widgets
+        # only, so the button cannot toggle the card it sits on.
+        fire_btn = _gui_button(head_row, "Fire", lambda tid=t.id: fire(tid), primary=True,
+                               anim=anim)
+        if disabled:
+            fire_btn.configure(state="disabled")
+        fire_btn.pack(side="right", padx=(12, 0), pady=2)
 
         # ---- L2: context + action, hidden until the row is expanded -------
         # NB: a widget's own -pady is a single distance; the (top, bottom) tuple form is
@@ -4678,12 +4734,6 @@ def run_gui(settings, triggers, app, config_dir=None, profiles=None):
 
         actions = tk.Frame(body_l2, bg=frost)
         actions.pack(fill="x", pady=(12, 0))
-        fire_btn = _gui_button(actions, "Fire", lambda tid=t.id: fire(tid), primary=True,
-                               anim=anim)
-        if disabled:
-            fire_btn.configure(state="disabled",
-                               text="Disabled (live)" if gated_live else "Not configured")
-        fire_btn.pack(side="left")
         copy_btn = _gui_button(actions, "Copy verification key",
                                lambda tid=t.id: copy_text(cards[tid].get("verify_key"), tid),
                                anim=anim)

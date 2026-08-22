@@ -10,7 +10,7 @@ demo. It fires the traffic and reports what it saw **locally** — `allowed`,
 `blocked`, or `error` — and never pretends to be the authority. The customer
 reads the real verdict on their own management console, already on screen.
 
-Everything in this document is grounded in the code as of version **0.9.1**
+Everything in this document is grounded in the code as of version **0.9.2**
 (`secvitals.py`, `config/catalog.yaml`, `config/settings.yaml`). It is organized
 in three parts:
 
